@@ -1,0 +1,38 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:theme="@style/AppTheme"
+        android:label="@string/app_name"
+        android:icon="@drawable/lsx4_launcher_icon"
+        android:roundIcon="@drawable/lsx4_launcher_icon"
+        android:localeConfig="@xml/locales_config"
+        android:hardwareAccelerated="true"
+        android:largeHeap="true"
+        android:gwpAsanMode="always"
+        android:resizeableActivity="false">
+        <activity
+            android:name="app.lsx4.android.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name="app.lsx4.android.GameActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:showWhenLocked="true"
+            android:screenOrientation="landscape"
+            android:windowSoftInputMode="stateAlwaysHidden|adjustNothing"
+            android:turnScreenOn="true" />
+        <activity
+            android:name="app.lsx4.android.SettingsActivity"
+            android:exported="false"
+            android:configChanges="keyboardHidden|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:screenOrientation="portrait" />
+    </application>
+</manifest>

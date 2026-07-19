@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LSX4</string><string name="library_scanning">正在扫描已安装游戏…</string><string name="library_found">找到游戏：%1$d</string><string name="library_empty_status">未找到游戏</string><string name="library_empty">没有已安装的游戏。点击 + 导入已解压目录或 PKG。</string>
+    <string name="menu_import_directory">导入目录</string><string name="menu_import_pkg">导入 PKG</string><string name="menu_settings">设置</string><string name="menu_add">添加游戏</string><string name="menu_remove_game">删除所选游戏</string><string name="game_removing">正在删除 %1$s…</string><string name="game_removed">已删除 %1$s</string><string name="game_remove_failed">无法删除 %1$s</string>
+    <string name="metadata_only">仅元数据 · 缺少 eboot</string>
+    <string name="settings_title">设置</string><string name="settings_subtitle">更改会自动保存</string><string name="section_general">通用</string><string name="language">应用语言</string>
+    <string name="category_graphics">图形</string><string name="category_graphics_summary">GPU、分辨率和补丁</string><string name="category_audio">音频</string><string name="category_audio_summary">音频输出</string><string name="category_controls">控制</string><string name="category_controls_summary">屏幕控制</string><string name="category_cache">缓存</string><string name="category_cache_summary">已编译块缓存</string><string name="category_other">其他</string><string name="category_other_summary">调试 HUD</string>
+    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">图形 API 和设备系列</string><string name="graphics_patches">补丁</string><string name="graphics_patches_summary">每款游戏的图形补丁</string><string name="graphics_resolution">输出分辨率</string>
+    <string name="gpu_vulkan">Vulkan（Snapdragon、较强 Mali）</string><string name="gpu_opengl">OpenGL（Mali、其他）</string><string name="gpu_opengl_pending">开发中</string>
+    <string name="audio_enable">启用音频输出</string><string name="controls_enable">显示屏幕控制</string><string name="controls_hint">连接实体手柄时会自动隐藏。</string><string name="controls_opacity">控制透明度</string>
+    <string name="cache_enable">持久化已编译块缓存</string><string name="cache_hint">后续启动时复用已编译块。</string><string name="debug_hud">调试 HUD</string>
+    <string name="patch_select_game">游戏</string><string name="patch_no_games">没有提供内置补丁的游戏。</string><string name="patch_dynamic_shadows">动态阴影</string><string name="patch_ssao">环境光遮蔽（SSAO）</string><string name="patch_motion_blur">运动模糊</string><string name="patch_depth_of_field">景深</string><string name="patch_enabled">已启用</string><string name="patch_disabled">已为性能禁用</string>
+    <string name="back">返回</string><string name="import_cancelled">已取消导入</string><string name="operation_wait">请等待当前操作完成</string><string name="import_wait_before_launch">请等待导入完成后再启动游戏</string><string name="folder_picker_unavailable">系统文件夹选择器不可用</string><string name="file_picker_unavailable">系统文件选择器不可用</string><string name="hud_metrics">指标</string>
+    <string name="import_checking_directory">正在检查已解压游戏…</string><string name="import_copying_pkg">正在复制 PKG…</string><string name="scan_error">无法扫描游戏库</string><string name="import_already_running">另一个导入任务仍在运行</string><string name="import_error">导入失败</string>
+    <string name="import_directory_success">已导入：%1$s（%2$s），%3$d 个文件，%4$s</string><string name="import_pkg_copied">PKG 已复制（%1$s），正在检查…</string><string name="import_pkg_registered">PKG 已注册：%1$s。eboot.bin 可用。</string><string name="import_pkg_metadata_only">已导入 PKG 元数据：%1$s。尚未提取零售版 eboot/PFS，因此当前条目无法启动。</string><string name="import_copy_progress">正在复制：%1$d 个文件，%2$s</string><string name="import_pkg_copy_progress">正在复制 PKG：%1$s</string>
+    <string name="game_activity_unavailable">此版本中游戏界面不可用</string><string name="another_game_active">已有其他游戏正在运行。切换游戏前请将其完全关闭。</string>
+    <string name="hud_external_controller">外接控制器：%1$s | 屏幕控制已隐藏</string><string name="hud_controller_disconnected">外接控制器已断开</string><string name="hud_collapse">收起指标</string><string name="hud_expand">展开指标</string><string name="hud_frame_waiting">画面：等待稳定图像</string><string name="hud_stats_pending">00:00  AArch64 JIT | 等待统计信息</string>
+    <string name="hud_cache_checking">缓存：检查现有数据 / 准备新缓存</string><string name="hud_cache_disabled">缓存已禁用</string><string name="hud_runtime_waiting">块/资源：等待运行时</string><string name="hud_cache_waiting">缓存：等待扩展遥测</string><string name="hud_cache_old_and_new">正在使用现有缓存并构建新发现的缓存</string><string name="hud_cache_old">正在使用现有缓存</string><string name="hud_cache_new">正在构建新缓存</string><string name="hud_frame_verified">已确认稳定游戏画面 @ %1$02d:%2$02d</string>
+    <string name="launching_game">正在启动 AArch64 JIT：%1$s</string>
+    <string name="select_runtime">选择运行时</string>
+    <string name="initialize">初始化</string>
+    <string name="scan_games">扫描游戏</string>
+    <string name="present_test">测试画面</string>
+    <string name="audio_probe">测试音频</string>
+    <string name="runtime_not_loaded">运行时尚未加载。</string>
+    <string name="surface_not_attached">渲染表面尚未连接。</string>
+    <string name="surface_detached">渲染表面已断开。</string>
+    <string name="surface_detach_failed">无法断开渲染表面：%1$s</string>
+    <string name="aarch64_jit">AArch64 JIT</string>
+    <string name="controls_gamepad_hint">连接受支持的游戏手柄后，屏幕控制层会自动隐藏。支持游戏手柄。</string>
+    <string name="resolution_native">原生（设备）</string>
+    <string name="resolution_upscale_150">1.5× 放大（2880×1620）</string>
+</resources>

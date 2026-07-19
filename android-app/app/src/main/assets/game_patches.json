@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "games": [
+    {
+      "name": "Bloodborne",
+      "titleIds": ["CUSA00207", "CUSA00900", "CUSA01363", "CUSA03023", "CUSA03173"],
+      "patches": [
+        {
+          "id": "dynamic_shadows",
+          "title": "patch_dynamic_shadows",
+          "preferenceKey": "disable_dynamic_shadows",
+          "inverted": true
+        },
+        {
+          "id": "ssao",
+          "title": "patch_ssao",
+          "preferenceKey": "disable_ssao",
+          "inverted": true
+        },
+        {
+          "id": "motion_blur",
+          "title": "patch_motion_blur",
+          "preferenceKey": "disable_motion_blur",
+          "inverted": true
+        },
+        {
+          "id": "depth_of_field",
+          "title": "patch_depth_of_field",
+          "preferenceKey": "disable_depth_of_field",
+          "inverted": true
+        }
+      ]
+    }
+  ]
+}

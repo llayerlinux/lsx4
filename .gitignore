@@ -1,0 +1,38 @@
+# Android and Gradle
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+
+# Native builds
+.cxx/
+cmake-build-*/
+CMakeUserPresets.json
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.binlog
+*.log
+*.trace
+*.profraw
+*.tmp
+*.bak
+out/
+.cache/
+
+# Rust
+target/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+*.iml
+*.user
+*.suo
+.DS_Store
+
+# Generated runtime metadata
+src/common/scm_rev.cpp
