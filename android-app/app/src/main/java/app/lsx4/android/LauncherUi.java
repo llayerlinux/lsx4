@@ -642,13 +642,19 @@ public final class LauncherUi {
         if (gameList == null) {
             return;
         }
-        latestGames = new ArrayList<>(games);
-        if (selectedGame != null && !games.contains(selectedGame)) {
+        List<GameEntry> orderedGames = new ArrayList<>(games);
+        orderedGames.sort(Comparator
+                .comparingInt((GameEntry entry) -> compatibilityRepository
+                        .statusOf(entry.titleId).librarySortPriority())
+                .thenComparing(entry -> entry.title.toLowerCase(Locale.ROOT))
+                .thenComparing(entry -> entry.titleId));
+        latestGames = orderedGames;
+        if (selectedGame != null && !orderedGames.contains(selectedGame)) {
             selectedGame = null;
             updateRemoveAction();
         }
         gameList.removeAllViews();
-        if (games.isEmpty()) {
+        if (orderedGames.isEmpty()) {
             TextView empty = label(activity.getString(R.string.library_empty),
                     14, 0xffc5cbd3);
             empty.setGravity(Gravity.CENTER);
@@ -657,7 +663,7 @@ public final class LauncherUi {
             gameList.addView(empty, matchWrap());
             return;
         }
-        for (GameEntry game : games) {
+        for (GameEntry game : orderedGames) {
             gameList.addView(gameRow(game), matchWrapWithMargins(0, 0, 0, 10));
         }
     }
