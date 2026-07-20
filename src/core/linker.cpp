@@ -925,7 +925,14 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         sym_type == Loader::SymbolType::Function &&
         (sr.module == "libc" || sr.module == "libSceLibcInternal" ||
          sr.library == "libc" || sr.library == "libSceLibcInternal");
-    if (is_libc_os_surface) {
+    // A title-supplied libc must resolve calls back into its own exported ABI. Routing those
+    // self-imports through an Executor FILE*/locale/etc. bridge mixes two private libc object
+    // layouts inside one module. The resulting return value may be valid for the HLE contract but
+    // meaningless to the guest implementation (for example, a scalar status subsequently used as
+    // a guest object pointer). External importers keep the existing HLE-first ownership policy.
+    const bool importer_is_guest_libc =
+        m->file.filename() == "libc.prx" || m->file.filename() == "libSceLibcInternal.prx";
+    if (is_libc_os_surface && !importer_is_guest_libc) {
         if (Core::AeroLib::TryGetAndroidX64ExecutorOverride(
                 sr.name.c_str(), &return_info->virtual_address, &return_info->name)) {
             ExecutorAuditLibcFamilyOwner(sr.name.c_str(), m->file.string().c_str(),

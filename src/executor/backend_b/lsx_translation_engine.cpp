@@ -27220,6 +27220,22 @@ bool X87SingleRegisterOperand(const LsxDecodedOp& ir, std::uint8_t& logical) {
            X87DecodeLogicalRegister(ir.operands[0].reg.value, logical);
 }
 
+bool X87ExchangeRegisterOperand(const LsxDecodedOp& ir, std::uint8_t& logical) {
+    if (X87SingleRegisterOperand(ir, logical)) {
+        return true;
+    }
+    // iced-x86 exposes FXCH's implicit ST0 as operand zero and the encoded ST(i) as operand one.
+    // Keep the single-operand form for already persisted legacy IR, while accepting only that exact
+    // two-register architecture shape for newly decoded IR.
+    std::uint8_t implicit_st0 = 0;
+    return ir.operand_count == 2 &&
+           ir.operands[0].type == X86_OPERAND_TYPE_REGISTER &&
+           ir.operands[1].type == X86_OPERAND_TYPE_REGISTER &&
+           X87DecodeLogicalRegister(ir.operands[0].reg.value, implicit_st0) &&
+           implicit_st0 == 0 &&
+           X87DecodeLogicalRegister(ir.operands[1].reg.value, logical);
+}
+
 bool IsX87StateMnemonic(const X86Mnemonic mnemonic) {
     switch (mnemonic) {
     case X86_MNEMONIC_FWAIT:
@@ -27537,9 +27553,14 @@ bool CanExecuteX87Instruction(const LsxDecodedOp& ir) {
         mnemonic == X86_MNEMONIC_FABS || mnemonic == X86_MNEMONIC_FNOP) {
         return ir.operand_count == 0;
     }
-    if (mnemonic == X86_MNEMONIC_FXCH || mnemonic == X86_MNEMONIC_FFREE ||
-        mnemonic == X86_MNEMONIC_FFREEP || mnemonic == X86_MNEMONIC_FST ||
-        mnemonic == X86_MNEMONIC_FSTP) {
+    if (mnemonic == X86_MNEMONIC_FXCH) {
+        std::uint8_t ignored = 0;
+        if (X87ExchangeRegisterOperand(ir, ignored)) {
+            return true;
+        }
+    }
+    if (mnemonic == X86_MNEMONIC_FFREE || mnemonic == X86_MNEMONIC_FFREEP ||
+        mnemonic == X86_MNEMONIC_FST || mnemonic == X86_MNEMONIC_FSTP) {
         std::uint8_t ignored = 0;
         if (X87SingleRegisterOperand(ir, ignored)) {
             return true;
@@ -27621,7 +27642,11 @@ bool ExecuteX87Instruction(LsxMachineImage& state, const LsxDecodedOp& ir) {
         return true;
     }
     std::uint8_t register_logical = 0;
-    if (X87SingleRegisterOperand(ir, register_logical)) {
+    const bool has_register_operand =
+        mnemonic == X86_MNEMONIC_FXCH
+            ? X87ExchangeRegisterOperand(ir, register_logical)
+            : X87SingleRegisterOperand(ir, register_logical);
+    if (has_register_operand) {
         const std::uint8_t physical = X87PhysicalLogicalRegister(state, register_logical);
         if (mnemonic == X86_MNEMONIC_FXCH) {
             const std::uint8_t st0 = X87PhysicalSt0(state);
@@ -34062,7 +34087,7 @@ std::string LsxEngineSelfTestJson() {
             ChainPatchCell taken_slot(taken_rip, &conditional_epoch);
             ChainPatchCell fallthrough_slot(fallthrough_rip, &conditional_epoch);
             constexpr std::uint64_t kTakenMarker = 0x1122334455667788ull;
-            constexpr std::uint64_t kFallthroughMarker = 0x8877665544332211ull;
+            constexpr std::uint64_t kFallthroughMarker = 0x4C53585F4D41524Bull;
             Arm64BlockEntry taken_marker = arena.EmitReturnImmediateBlock(kTakenMarker);
             Arm64BlockEntry fallthrough_marker =
                 arena.EmitReturnImmediateBlock(kFallthroughMarker);
@@ -35022,7 +35047,7 @@ std::string LsxEngineSelfTestJson() {
         constexpr std::uint64_t kSyntheticFaultRecoveryRip =
             0xfeedface01234567ull;
         constexpr std::uint64_t kSyntheticGuestHandlerResult =
-            0x8877665544332211ull;
+            0x4C53585F4D41524Bull;
         LsxMachineImage synthetic_fault_state{};
         LsxMachineImage* const previous_synthetic_state =
             SwapDiagnosticMachineImage(&synthetic_fault_state);
@@ -35335,7 +35360,7 @@ std::string LsxEngineSelfTestJson() {
                 interpreter_memory[i] = static_cast<std::uint8_t>(0xa0u + i);
             }
             std::array<std::uint8_t, 64> native_memory = interpreter_memory;
-            constexpr std::uint64_t kMemoryValue = 0x8877665544332211ull;
+            constexpr std::uint64_t kMemoryValue = 0x4C53585F4D41524Bull;
             std::memcpy(interpreter_memory.data() + 16, &kMemoryValue,
                         sizeof(kMemoryValue));
             std::memcpy(native_memory.data() + 16, &kMemoryValue,
@@ -35670,7 +35695,7 @@ std::string LsxEngineSelfTestJson() {
                                                           kStackOffset));
                 SetGpr64(state, LsxGpr::R8, 0x1020304050607080ull);
                 SetGpr64(state, LsxGpr::R10, 0xfedcba9800000000ull);
-                SetGpr64(state, LsxGpr::R11, 0x8877665544332211ull);
+                SetGpr64(state, LsxGpr::R11, 0x4C53585F4D41524Bull);
                 SetGpr64(state, LsxGpr::R12, 0x1122334455667788ull);
                 SetGpr64(state, LsxGpr::R13, 0x13579bdf2468ace0ull);
                 SetGpr64(state, LsxGpr::R14, 0x0f1e2d3c4b5a6978ull);
@@ -37881,10 +37906,10 @@ std::string LsxEngineSelfTestJson() {
             fast_guest_strcmp_program, 0,
             {'M', 'o', 'n', 'o', 'B', 'e', 'h', 'a', 'v', 'i', 'o', 'u', 'r'},
             {'M', 'o', 'n', 'o', 'B', 'e', 'h', 'a', 'v', 'i', 'o', 'u', 'r'},
-            0x8877665544332211ull);
+            0x4C53585F4D41524Bull);
         const bool fast_guest_strcmp_highbit_ok = fast_guest_compare_case(
             fast_guest_strcmp_program, 0, {'M', 'o', 'n', 'o', 0x80},
-            {'M', 'o', 'n', 'o', 0x7f}, 0x8877665544332211ull);
+            {'M', 'o', 'n', 'o', 0x7f}, 0x4C53585F4D41524Bull);
         const bool fast_guest_strcmp_native_ok =
             fast_guest_strcmp_match_ok && fast_guest_strcmp_highbit_ok;
         const bool fast_guest_strncmp_count_ok = fast_guest_compare_case(
@@ -38040,7 +38065,7 @@ std::string LsxEngineSelfTestJson() {
                 SetGpr64(state, LsxGpr::Rcx,
                          entry_form ? mono_tree_wrong_head : mono_tree_head);
                 SetGpr64(state, LsxGpr::Rdx, 0x1122334455667788ull);
-                SetGpr64(state, LsxGpr::Rsi, 0x8877665544332211ull);
+                SetGpr64(state, LsxGpr::Rsi, 0x4C53585F4D41524Bull);
                 SetGpr64(state, LsxGpr::Rdi, 0x0123456789abcdefull);
                 SetGpr64(state, LsxGpr::Rbp, 0x1020304050607080ull);
                 SetGpr64(state, LsxGpr::Rsp, guest_rsp);
@@ -38287,8 +38312,8 @@ std::string LsxEngineSelfTestJson() {
                      0xdeadbeef00000000ull | hash);
             SetGpr64(interpreter_state, LsxGpr::Rbx, 0xaabbccddeeff0011ull);
             SetGpr64(native_state, LsxGpr::Rbx, 0xaabbccddeeff0011ull);
-            SetGpr64(interpreter_state, LsxGpr::Rdx, 0x8877665544332211ull);
-            SetGpr64(native_state, LsxGpr::Rdx, 0x8877665544332211ull);
+            SetGpr64(interpreter_state, LsxGpr::Rdx, 0x4C53585F4D41524Bull);
+            SetGpr64(native_state, LsxGpr::Rdx, 0x4C53585F4D41524Bull);
             SetGpr64(interpreter_state, LsxGpr::R14,
                      reinterpret_cast<std::uint64_t>(table.data()));
             SetGpr64(native_state, LsxGpr::R14,
@@ -38363,8 +38388,8 @@ std::string LsxEngineSelfTestJson() {
             SetGpr64(native_state, LsxGpr::Rax, 0xdeadbeefcafebabeull);
             SetGpr64(interpreter_state, LsxGpr::Rcx, 0x11223344556677aaull);
             SetGpr64(native_state, LsxGpr::Rcx, 0x11223344556677aaull);
-            SetGpr64(interpreter_state, LsxGpr::Rdx, 0x8877665544332211ull);
-            SetGpr64(native_state, LsxGpr::Rdx, 0x8877665544332211ull);
+            SetGpr64(interpreter_state, LsxGpr::Rdx, 0x4C53585F4D41524Bull);
+            SetGpr64(native_state, LsxGpr::Rdx, 0x4C53585F4D41524Bull);
             SetGpr64(interpreter_state, LsxGpr::Rdi,
                      reinterpret_cast<std::uint64_t>(memory.data()));
             SetGpr64(native_state, LsxGpr::Rdi,
@@ -39576,7 +39601,7 @@ std::string LsxEngineSelfTestJson() {
                 state.rflags = 0xad7u;
                 SetGpr64(state, LsxGpr::Rcx, 0x1020304050607000ull | iteration);
                 SetGpr64(state, LsxGpr::Rdi, 0xfedcba9876543210ull);
-                SetGpr64(state, LsxGpr::Rbx, 0x8877665544332211ull);
+                SetGpr64(state, LsxGpr::Rbx, 0x4C53585F4D41524Bull);
                 SetGpr64(state, LsxGpr::R10, ~std::uint64_t{0});
             });
         // WIDE_HOT_V5_COUNT_DIRECT_DIFFERENTIAL_GATE: cover every architectural width and

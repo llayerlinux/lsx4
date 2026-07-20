@@ -4,7 +4,6 @@ import android.app.Activity;
 import android.app.KeyguardManager;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.content.res.ColorStateList;
 import android.content.pm.ActivityInfo;
 import android.content.Intent;
 import android.database.Cursor;
@@ -56,7 +55,6 @@ import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -1914,21 +1912,18 @@ public class MainActivity extends Activity {
         loadingBlocksText = new TextView(this);
         loadingBlocksText.setText("blocks 0");
         loadingBlocksText.setTextColor(0xff55e37a);
-        loadingBlocksText.setTextSize(10);
-        loadingBlocksText.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        loadingBlocksText.setTextSize(9);
+        loadingBlocksText.setTypeface(Typeface.create("sans-serif", Typeface.NORMAL));
         loadingBlocksText.setGravity(Gravity.CENTER);
         loadingBlocksText.setIncludeFontPadding(false);
         loadingProgressPanel.addView(loadingBlocksText, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
-        ProgressBar progress = new ProgressBar(
-                this, null, android.R.attr.progressBarStyleHorizontal);
-        progress.setIndeterminate(true);
-        progress.setIndeterminateTintList(ColorStateList.valueOf(0xffffffff));
-        progress.setProgressBackgroundTintList(ColorStateList.valueOf(0x33ffffff));
+        ThinSpinnerView progress = new ThinSpinnerView(this);
         LinearLayout.LayoutParams progressParams = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(4));
-        progressParams.topMargin = dp(5);
+                dp(24), dp(24));
+        progressParams.gravity = Gravity.CENTER_HORIZONTAL;
+        progressParams.topMargin = dp(4);
         loadingProgressPanel.addView(progress, progressParams);
 
         FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
@@ -1939,6 +1934,33 @@ public class MainActivity extends Activity {
         loadingProgressPanel.bringToFront();
         resetRuntimeDebugHudForGuestLaunch();
         startRuntimeDebugHud();
+    }
+
+    private static final class ThinSpinnerView extends View {
+        private static final long REVOLUTION_MS = 900;
+        private final Paint arcPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final RectF arcBounds = new RectF();
+
+        ThinSpinnerView(Context context) {
+            super(context);
+            arcPaint.setColor(0xffffffff);
+            arcPaint.setStyle(Paint.Style.STROKE);
+            arcPaint.setStrokeCap(Paint.Cap.ROUND);
+            arcPaint.setStrokeWidth(context.getResources().getDisplayMetrics().density);
+            setClickable(false);
+            setFocusable(false);
+        }
+
+        @Override
+        protected void onDraw(Canvas canvas) {
+            super.onDraw(canvas);
+            final float inset = arcPaint.getStrokeWidth();
+            arcBounds.set(inset, inset, getWidth() - inset, getHeight() - inset);
+            final float start = (SystemClock.uptimeMillis() % REVOLUTION_MS) *
+                    (360f / REVOLUTION_MS);
+            canvas.drawArc(arcBounds, start, 255f, false, arcPaint);
+            postInvalidateOnAnimation();
+        }
     }
 
     private void installDebugHud(FrameLayout renderFrame) {

@@ -175,6 +175,13 @@ static std::unordered_map<u64, u64> g_android_x64_hle_stub_by_native;
 static std::unordered_map<u64, u64> g_android_x64_return_zero_stub_by_native;
 static constexpr u32 AndroidX64FallbackStubSlot = MAX_STUBS - 1;
 static u32 g_android_x64_native_hle_next_slot = AndroidX64FallbackStubSlot;
+// A low stub represents an unresolved semantic import, not one relocation occurrence. PRX
+// relocation can ask for the same NID thousands of times during startup; assigning a fresh slot
+// each time eventually consumed the whole slab and made later, fully resolved HLE imports fall
+// through the zero-return emergency slot. Keep the low allocator independent from the HLE metadata
+// mutex because traceable GPU stubs publish metadata while this lock is held.
+static std::mutex g_android_x64_low_stub_mutex;
+static std::unordered_map<std::string, u64> g_android_x64_low_stub_by_nid;
 
 bool ExecutorRuntimeFlagExists(const char* filename);
 
@@ -10263,6 +10270,13 @@ u64 GetStub(const char* nid) {
     if (const u64 ft = ResolveExecutorFreeTypeHle(nid)) {
         return GetAndroidX64NativeHleStub(nid, ft, "freetype");
     }
+
+    const std::string semantic_nid = nid ? nid : "";
+    std::scoped_lock low_stub_lock(g_android_x64_low_stub_mutex);
+    if (const auto cached = g_android_x64_low_stub_by_nid.find(semantic_nid);
+        cached != g_android_x64_low_stub_by_nid.end()) {
+        return cached->second;
+    }
 #endif
 
     if (
@@ -10273,7 +10287,7 @@ u64 GetStub(const char* nid) {
 #endif
     ) {
 #ifdef __ANDROID__
-        return GetAndroidX64ZeroStub(MAX_STUBS - 1);
+        return GetAndroidX64ZeroStub(AndroidX64FallbackStubSlot);
 #else
         return (u64)&UnknownStub;
 #endif
@@ -10288,9 +10302,10 @@ u64 GetStub(const char* nid) {
     }
 
 #ifdef __ANDROID__
+    u64 address = 0;
     if (entry && IsExecutorTraceableGpuStubName(entry->name)) {
         const u64 native = reinterpret_cast<u64>(stub_handlers[slot]);
-        const u64 address = GetAndroidX64HleStub(slot, native);
+        address = GetAndroidX64HleStub(slot, native);
         {
             std::scoped_lock lock(g_android_x64_hle_names_mutex);
             g_android_x64_hle_names_by_native[native] = entry->name ? entry->name : "";
@@ -10309,20 +10324,23 @@ u64 GetStub(const char* nid) {
                          entry->nid, entry->name, reinterpret_cast<void*>(address));
             std::fclose(f);
         }
+        g_android_x64_low_stub_by_nid.emplace(semantic_nid, address);
         return address;
     }
+    address = GetAndroidX64ZeroStub(slot);
     std::fprintf(stderr, "[EXECUTOR_AEROLIB_X64_STUB] index=%u nid=%s address=%p\n", slot, nid,
-                 reinterpret_cast<void*>(GetAndroidX64ZeroStub(slot)));
+                 reinterpret_cast<void*>(address));
     std::fflush(stderr);
     // Persist slot->nid to a file so a missing import that the guest then calls can be identified
     // by the stub slab offset (slot = (call_addr - slab_base) / AndroidX64StubSize).
     if (std::FILE* f = std::fopen(
             "/data/data/app.lsx4.android/files/executor-stub-nids.log", "a")) {
         std::fprintf(f, "slot=%u nid=%s addr=%p\n", slot, nid ? nid : "<null>",
-                     reinterpret_cast<void*>(GetAndroidX64ZeroStub(slot)));
+                     reinterpret_cast<void*>(address));
         std::fclose(f);
     }
-    return GetAndroidX64ZeroStub(slot);
+    g_android_x64_low_stub_by_nid.emplace(semantic_nid, address);
+    return address;
 #else
     return (u64)stub_handlers[slot];
 #endif
