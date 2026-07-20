@@ -1365,7 +1365,7 @@ void* Linker::TlsGetAddr(u64 module_index, u64 offset) {
         ASSERT_MSG(dest != MAP_FAILED, "Unable to allocate Android dynamic PRX TLS");
         if (executor_lsx4_android_register_guest_gc_sideband_range) {
             executor_lsx4_android_register_guest_gc_sideband_range(
-                dest, alloc_size, "backend_b_dynamic_prx_tls");
+                dest, alloc_size, "jit_dynamic_prx_tls");
         }
         __android_log_print(ANDROID_LOG_INFO, "LSX4Native",
                             "[EXECUTOR_TLS_ALLOC] module=%llu offset=0x%llx size=0x%zx "
@@ -1466,8 +1466,8 @@ void* Linker::AllocateTlsForThread(bool is_primary) {
         if (executor_lsx4_android_register_guest_gc_sideband_range) {
             executor_lsx4_android_register_guest_gc_sideband_range(
                 rooted_base, rooted_size,
-                is_primary ? "backend_b_main_static_tls_tcb"
-                           : "backend_b_worker_static_tls_tcb");
+                is_primary ? "jit_main_static_tls_tcb"
+                           : "jit_worker_static_tls_tcb");
         }
         LOG_INFO(Core_Linker,
                  "Android TLS+TCB allocated primary={} tls_base={} tcb={} prefix={:#x} static_tls={:#x} total={:#x}",

@@ -75,10 +75,10 @@ public class MainActivity extends Activity {
     // logcat (grep EXECUTOR_UI_BUILD_MARKER). Confirms the new APK actually installed, not a stale one.
     private static final String BUILD_MARKER =
             "ps4run-2026-07-18-r26-identity-resolution-aa";
-    private static final String BACKEND_B_PERSISTENT_JIT_CACHE_MARKER =
-            "run-backend-b-persistent-jit-cache";
-    private static final String BACKEND_B_PERSISTENT_JIT_CACHE_FORCE_MARKER =
-            "run-backend-b-persistent-jit-cache-force";
+    private static final String JIT_PERSISTENT_JIT_CACHE_MARKER =
+            "run-jit-persistent-jit-cache";
+    private static final String JIT_PERSISTENT_JIT_CACHE_FORCE_MARKER =
+            "run-jit-persistent-jit-cache-force";
     private static final String DISABLE_DYNAMIC_SHADOWS_MARKER =
             "run-disable-dynamic-shadows";
     private static final String DISABLE_SSAO_MARKER = "run-disable-ssao";
@@ -236,7 +236,7 @@ public class MainActivity extends Activity {
                 }
             };
 
-    // One-Hz, lock-free Backend-B telemetry.  Native returns only relaxed atomic counters; frame
+    // One-Hz, lock-free JIT telemetry.  Native returns only relaxed atomic counters; frame
     // detection samples the SurfaceView (not the host overlay) into a tiny 64x36 bitmap and stops
     // permanently after latching the first detailed non-black frame.
     private final Handler runtimeHudHandler = new Handler(Looper.getMainLooper());
@@ -546,7 +546,7 @@ public class MainActivity extends Activity {
                 // saveLayerAlpha inside the child.
                 inputOverlay.setAlpha((opacity / 100f) * DUALSHOCK_ARTWORK_ALPHA);
             }
-            // Backend B used to force this panel on. The HUD and touch controls are independent:
+            // JIT used to force this panel on. The HUD and touch controls are independent:
             // the HUD now appears only when explicitly requested by intent or preference.
             if (inputDebugHud) {
                 installDebugHud(renderFrame);
@@ -740,13 +740,13 @@ public class MainActivity extends Activity {
         if (backendLabel == null) {
             return;
         }
-        boolean backendBActive = false;
+        boolean jitActive = false;
         String runtimeStatus = "";
         if (runtimeLoaded) {
             try {
-                runtimeStatus = RuntimeBridge.backendBStatus();
-                backendBActive = runtimeStatus != null &&
-                        (runtimeStatus.contains("\"selectedBackend\":\"backend-b") ||
+                runtimeStatus = RuntimeBridge.jitStatus();
+                jitActive = runtimeStatus != null &&
+                        (runtimeStatus.contains("\"selectedBackend\":\"jit") ||
                                 runtimeStatus.contains("\"name\":\"embedded-aarch64-jit-b\""));
             } catch (Throwable e) {
                 Log.w(TAG, "Backend label runtime status unavailable", e);
@@ -754,7 +754,7 @@ public class MainActivity extends Activity {
         }
         backendLabel.setBackgroundColor(0xee1565c0);
         backendLabel.setText(R.string.aarch64_jit);
-        Log.i(TAG, "EXECUTOR_UI_BACKEND_LABEL activeB=" + backendBActive +
+        Log.i(TAG, "EXECUTOR_UI_JIT_LABEL active=" + jitActive +
                 " shown=AArch64 JIT" +
                 " runtimeStatus=" + runtimeStatus);
     }
@@ -832,7 +832,7 @@ public class MainActivity extends Activity {
                 " prepare=" + intentFlag(EXTRA_PREPARE_BOX64_ENTRY_AFTER_RELOCATE) +
                 " validate=" + intentFlag(EXTRA_VALIDATE_EMBEDDED_BOX64_MAPPED_ENTRY) +
                 " run=" + intentFlag(EXTRA_RUN_EMBEDDED_BOX64_MAPPED_ENTRY) +
-                " backendB=" + intentFlag(EXTRA_EMBEDDED_AARCH64_JIT_BACKEND) +
+                " jit=" + intentFlag(EXTRA_EMBEDDED_AARCH64_JIT_BACKEND) +
                 " fullscreen=" + intentFlag(EXTRA_FULLSCREEN_RENDER));
 
         boolean useTranslatorBridge = intentFlag(EXTRA_TRANSLATOR_BRIDGE_LAUNCH) ||
@@ -874,7 +874,7 @@ public class MainActivity extends Activity {
             if (useTranslatorBridge) {
                 prepareTranslatorLaunchPath(launchPath);
             } else {
-                launchGamePathBackendB(launchPath);
+                launchGamePathJit(launchPath);
             }
             if (intentFlag(EXTRA_RELOCATE_IMPORTS_AFTER_LAUNCH) ||
                     intentFlag(EXTRA_PREPARE_BOX64_ENTRY_AFTER_RELOCATE) ||
@@ -2156,7 +2156,7 @@ public class MainActivity extends Activity {
         }
         if (key == null || SettingsActivity.K_PERSISTENT_JIT_CACHE.equals(key)) {
             try {
-                materializeBackendBPersistentJitCacheSetting(
+                materializeJitPersistentJitCacheSetting(
                         new File(getFilesDir(), "lsx4-home"));
             } catch (Exception error) {
                 Log.e(TAG, "Live cache setting could not be published", error);
@@ -3511,7 +3511,7 @@ public class MainActivity extends Activity {
             if (!root.exists() && !root.mkdirs()) {
                 throw new IllegalStateException("Cannot create " + root);
             }
-            materializeBackendBPersistentJitCacheSetting(root);
+            materializeJitPersistentJitCacheSetting(root);
             materializeGraphicsEffectSettings(root);
             materializeRenderResolutionSetting(root);
             writeNativeTranslatorPath(root);
@@ -3575,24 +3575,24 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void launchGamePathBackendB(String path) {
+    private void launchGamePathJit(String path) {
         try {
-            materializeBackendBPersistentJitCacheSetting(
+            materializeJitPersistentJitCacheSetting(
                     new File(getFilesDir(), "lsx4-home"));
             materializeGraphicsEffectSettings(
                     new File(getFilesDir(), "lsx4-home"));
             materializeRenderResolutionSetting(
                     new File(getFilesDir(), "lsx4-home"));
-            append("AArch64 JIT status before launch: " + RuntimeBridge.backendBStatus());
-            int result = RuntimeBridge.launchGameBackendB(path);
+            append("AArch64 JIT status before launch: " + RuntimeBridge.jitStatus());
+            int result = RuntimeBridge.launchGameJit(path);
             append("AArch64 JIT launch result: " + result);
             append("Runtime status: " + RuntimeBridge.status());
-            append("AArch64 JIT status after launch: " + RuntimeBridge.backendBStatus());
+            append("AArch64 JIT status after launch: " + RuntimeBridge.jitStatus());
             runOnUiThread(this::updateBackendLabel);
         } catch (Exception e) {
             append("AArch64 JIT launch failed: " + e.getMessage());
         } finally {
-            // launchGameBackendB is synchronous for the guest lifetime. Once it returns (normal
+            // launchGameJit is synchronous for the guest lifetime. Once it returns (normal
             // exit or -70 frontier fault), the single-task host may accept a deliberate relaunch.
             if (path != null && path.equals(activeGamePath)) {
                 activeGamePath = "";
@@ -3600,16 +3600,16 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void materializeBackendBPersistentJitCacheSetting(File root) throws Exception {
+    private void materializeJitPersistentJitCacheSetting(File root) throws Exception {
         if (!root.isDirectory() && !root.mkdirs()) {
             throw new IllegalStateException("Cannot create compiled-block cache root: " + root);
         }
         final boolean requestedByUser = SettingsActivity.prefs(this).getBoolean(
                 SettingsActivity.K_PERSISTENT_JIT_CACHE, true);
-        final File forceMarker = new File(root, BACKEND_B_PERSISTENT_JIT_CACHE_FORCE_MARKER);
+        final File forceMarker = new File(root, JIT_PERSISTENT_JIT_CACHE_FORCE_MARKER);
         final boolean forcedByAutomation = forceMarker.isFile();
         final boolean enabled = requestedByUser || forcedByAutomation;
-        final File marker = new File(root, BACKEND_B_PERSISTENT_JIT_CACHE_MARKER);
+        final File marker = new File(root, JIT_PERSISTENT_JIT_CACHE_MARKER);
         try {
             if (enabled) {
                 if (marker.exists() && !marker.isFile()) {

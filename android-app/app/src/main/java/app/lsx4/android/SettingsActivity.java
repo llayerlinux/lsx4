@@ -58,7 +58,7 @@ public final class SettingsActivity extends Activity {
     public static final String K_AUTO_LAUNCH_STORE = "auto_launch_store";
     public static final String K_PERSISTENT_JIT_CACHE = "persistent_jit_cache";
     private static final String K_LEGACY_PERSISTENT_JIT_CACHE =
-            "backend_b_persistent_jit_cache";
+            "jit_persistent_jit_cache";
     public static final String K_DISABLE_DYNAMIC_SHADOWS = "disable_dynamic_shadows";
     public static final String K_DISABLE_SSAO = "disable_ssao";
     public static final String K_DISABLE_MOTION_BLUR = "disable_motion_blur";
