@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LSX4</string><string name="library_scanning">Recherche des jeux installés…</string><string name="library_found">Jeux trouvés : %1$d</string><string name="library_empty_status">Aucun jeu trouvé</string><string name="library_empty">Aucun jeu installé. Utilisez + pour importer un dossier extrait ou un PKG.</string>
+    <string name="menu_import_directory">Importer un dossier</string><string name="menu_import_pkg">Importer un PKG</string><string name="menu_settings">Paramètres</string><string name="menu_add">Ajouter un jeu</string><string name="menu_remove_game">Supprimer le jeu sélectionné</string><string name="game_removing">Suppression de %1$s…</string><string name="game_removed">%1$s supprimé</string><string name="game_remove_failed">Impossible de supprimer %1$s</string>
+    <string name="game_selected_for_removal">%1$s sélectionné pour suppression</string><string name="game_selection_cleared">Sélection de %1$s annulée</string><string name="game_marked_unsupported">%1$s ajouté aux jeux non pris en charge</string><string name="game_marked_supported">%1$s ajouté aux jeux pris en charge</string>
+    <string name="game_status_unclassified">Non classé</string><string name="game_status_unsupported">Non pris en charge</string><string name="game_status_supported">Pris en charge</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s. Maintenez 2 secondes pour sélectionner la suppression, 4 secondes pour marquer non pris en charge ou 8 secondes pour marquer pris en charge.</string>
+    <string name="metadata_only">Métadonnées uniquement · eboot absent</string>
+    <string name="settings_title">Paramètres</string><string name="settings_subtitle">Les modifications sont enregistrées automatiquement</string><string name="section_general">Général</string><string name="language">Langue de l’application</string>
+    <string name="category_graphics">Graphismes</string><string name="category_graphics_summary">GPU, résolution et correctifs</string><string name="category_audio">Audio</string><string name="category_audio_summary">Sortie audio</string><string name="category_controls">Commandes</string><string name="category_controls_summary">Commandes à l’écran</string><string name="category_cache">Cache</string><string name="category_cache_summary">Cache des blocs compilés</string><string name="category_other">Autre</string><string name="category_other_summary">HUD de débogage</string>
+    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">API graphique et famille de l’appareil</string><string name="graphics_patches">Correctifs</string><string name="graphics_patches_summary">Correctifs graphiques par jeu</string><string name="graphics_resolution">Résolution de sortie</string>
+    <string name="gpu_vulkan">Vulkan (Snapdragon, Mali puissant)</string><string name="gpu_opengl">OpenGL (Mali, autre)</string><string name="gpu_opengl_pending">En développement</string>
+    <string name="audio_enable">Activer la sortie audio</string><string name="controls_enable">Afficher les commandes à l’écran</string><string name="controls_hint">Elles sont masquées lorsqu’une manette physique est connectée.</string><string name="controls_opacity">Opacité des commandes</string>
+    <string name="cache_enable">Cache persistant des blocs compilés</string><string name="cache_hint">Réutilise les blocs compilés lors des lancements suivants.</string><string name="debug_hud">HUD de débogage</string>
+    <string name="patch_select_game">Jeu</string><string name="patch_no_games">Aucun jeu avec des correctifs intégrés n’est disponible.</string><string name="patch_dynamic_shadows">Ombres dynamiques</string><string name="patch_ssao">Occlusion ambiante (SSAO)</string><string name="patch_motion_blur">Flou de mouvement</string><string name="patch_depth_of_field">Profondeur de champ</string><string name="patch_enabled">Activé</string><string name="patch_disabled">Désactivé pour les performances</string>
+    <string name="back">Retour</string><string name="import_cancelled">Importation annulée</string><string name="operation_wait">Attendez la fin de l’opération en cours</string><string name="import_wait_before_launch">Attendez la fin de l’importation avant de lancer</string><string name="folder_picker_unavailable">Le sélecteur de dossier est indisponible</string><string name="file_picker_unavailable">Le sélecteur de fichier est indisponible</string><string name="hud_metrics">métriques</string>
+    <string name="import_checking_directory">Vérification du jeu extrait…</string><string name="import_copying_pkg">Copie du PKG…</string><string name="scan_error">Impossible d’analyser la bibliothèque de jeux</string><string name="import_already_running">Une autre importation est en cours</string><string name="import_error">Échec de l’importation</string>
+    <string name="import_directory_success">Importé : %1$s (%2$s), %3$d fichiers, %4$s</string><string name="import_pkg_copied">PKG copié (%1$s), vérification…</string><string name="import_pkg_registered">PKG enregistré : %1$s. eboot.bin est disponible.</string><string name="import_pkg_metadata_only">Métadonnées PKG importées : %1$s. Le eboot/PFS retail n’est pas encore extrait, cette entrée ne peut donc pas être lancée.</string><string name="import_copy_progress">Copie : %1$d fichiers, %2$s</string><string name="import_pkg_copy_progress">Copie du PKG : %1$s</string>
+    <string name="game_activity_unavailable">L’écran du jeu n’est pas disponible dans cette version</string><string name="another_game_active">Un autre jeu est déjà lancé. Fermez-le complètement avant de changer de jeu.</string>
+    <string name="hud_external_controller">Manette externe : %1$s | commandes à l’écran masquées</string><string name="hud_controller_disconnected">Manette externe déconnectée</string><string name="hud_collapse">Réduire les métriques</string><string name="hud_expand">Développer les métriques</string><string name="hud_frame_waiting">Image : attente d’une image stable</string><string name="hud_stats_pending">00:00  AArch64 JIT | statistiques en attente</string>
+    <string name="hud_cache_checking">Cache : vérification des données existantes / préparation d’un nouveau cache</string><string name="hud_cache_disabled">Cache désactivé</string><string name="hud_runtime_waiting">blocs/ressources : attente du moteur</string><string name="hud_cache_waiting">Cache : attente de la télémétrie étendue</string><string name="hud_cache_old_and_new">Utilisation du cache existant et création d’un nouveau cache détecté</string><string name="hud_cache_old">Utilisation du cache existant</string><string name="hud_cache_new">Création d’un nouveau cache</string><string name="hud_frame_verified">Image de jeu stable vérifiée @ %1$02d:%2$02d</string>
+    <string name="launching_game">Lancement AArch64 JIT : %1$s</string>
+    <string name="select_runtime">Sélectionner le moteur d’exécution</string>
+    <string name="initialize">Initialiser</string>
+    <string name="scan_games">Rechercher des jeux</string>
+    <string name="present_test">Tester l’affichage</string>
+    <string name="audio_probe">Tester l’audio</string>
+    <string name="runtime_not_loaded">Le moteur d’exécution n’est pas chargé.</string>
+    <string name="surface_not_attached">La surface n’est pas connectée.</string>
+    <string name="surface_detached">Surface déconnectée.</string>
+    <string name="surface_detach_failed">Échec de la déconnexion de la surface : %1$s</string>
+    <string name="aarch64_jit">JIT AArch64</string>
+    <string name="controls_gamepad_hint">Lorsqu’une manette compatible est connectée, les commandes à l’écran se masquent automatiquement. Les manettes sont prises en charge.</string>
+    <string name="resolution_native">Native (appareil)</string>
+    <string name="resolution_upscale_150">Mise à l’échelle 1,5× (2880×1620)</string>
+    <string name="audio_ngs2_module_ready">Module audio NGS2 installé. Il sera utilisé au prochain lancement d’un jeu.</string>
+    <string name="audio_ngs2_module_missing">Le module audio NGS2 est absent. Les jeux utilisant NGS2 resteront muets.</string>
+    <string name="audio_import_ngs2_module">Importer libSceNgs2.sprx</string>
+    <string name="audio_ngs2_module_hint">Importez uniquement un module de firmware déchiffré provenant de votre propre PlayStation 4. Relancez ensuite le jeu ; l’application elle-même ne doit pas être redémarrée.</string>
+    <string name="audio_ngs2_import_success">Module audio NGS2 importé. Relancez le jeu pour activer le son.</string>
+    <string name="audio_ngs2_import_failed">Impossible d’importer le module audio NGS2 : %1$s</string>
+    <string name="audio_ngs2_error_directory">Impossible de créer le dossier des modules système</string>
+    <string name="audio_ngs2_error_open">Impossible d’ouvrir le fichier sélectionné</string>
+    <string name="audio_ngs2_error_size">Le module sélectionné est trop volumineux</string>
+    <string name="audio_ngs2_error_name">Sélectionnez le module de firmware nommé %1$s</string>
+    <string name="audio_ngs2_error_format">Le fichier sélectionné n’est pas un module PS4 déchiffré</string>
+    <string name="game_hold_waiting">Maintenez : 2 s supprimer · 4 s non pris en charge · 8 s pris en charge</string>
+    <string name="game_hold_release_remove">Relâchez : sélectionner pour suppression</string>
+    <string name="game_hold_release_unsupported">Relâchez : marquer non pris en charge</string>
+    <string name="game_hold_release_supported">Relâchez : marquer pris en charge</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
+    <string name="game_menu_title">Commandes rapides</string>
+    <string name="game_menu_hint">Balayez vers la droite ou touchez à l’extérieur pour fermer</string>
+    <string name="game_menu_open">Ouvrir les commandes rapides</string>
+    <string name="game_menu_close">Fermer les commandes rapides</string>
+    <string name="game_menu_overlay">Commandes à l’écran</string>
+    <string name="game_menu_opacity">Opacité des commandes</string>
+    <string name="game_menu_opacity_value">%1$d%%</string>
+    <string name="game_menu_exit">Quitter vers la bibliothèque</string>
+</resources>

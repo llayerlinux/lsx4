@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LSX4</string><string name="library_scanning">Поиск установленных игр…</string><string name="library_found">Найдено игр: %1$d</string><string name="library_empty_status">Игры не найдены</string><string name="library_empty">Нет установленных игр. Нажмите +, чтобы импортировать извлечённый каталог или PKG.</string>
+    <string name="menu_import_directory">Импортировать каталог</string><string name="menu_import_pkg">Импортировать PKG</string><string name="menu_settings">Настройки</string><string name="menu_add">Добавить игру</string><string name="menu_remove_game">Удалить выбранную игру</string><string name="game_removing">Удаление %1$s…</string><string name="game_removed">%1$s удалена</string><string name="game_remove_failed">Не удалось удалить %1$s</string>
+    <string name="game_selected_for_removal">%1$s выбрана для удаления</string><string name="game_selection_cleared">Выделение %1$s снято</string><string name="game_marked_unsupported">%1$s добавлена в список неподдерживаемых</string><string name="game_marked_supported">%1$s добавлена в список поддерживаемых</string>
+    <string name="game_status_unclassified">Не распределена</string><string name="game_status_unsupported">Не поддерживается</string><string name="game_status_supported">Поддерживается</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s. Удерживайте 2 секунды для выбора на удаление, 4 секунды для отметки как неподдерживаемой или 8 секунд для отметки как поддерживаемой.</string>
+    <string name="metadata_only">Только метаданные · eboot отсутствует</string>
+    <string name="settings_title">Настройки</string><string name="settings_subtitle">Изменения сохраняются автоматически</string><string name="section_general">Общие</string><string name="language">Язык приложения</string>
+    <string name="category_graphics">Графика</string><string name="category_graphics_summary">GPU, разрешение и патчи</string><string name="category_audio">Аудио</string><string name="category_audio_summary">Вывод звука</string><string name="category_controls">Управление</string><string name="category_controls_summary">Экранное управление</string><string name="category_cache">Кэширование</string><string name="category_cache_summary">Кэш скомпилированных блоков</string><string name="category_other">Другое</string><string name="category_other_summary">Отладочный HUD</string>
+    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">Графический API и семейство устройства</string><string name="graphics_patches">Патчи</string><string name="graphics_patches_summary">Графические патчи для каждой игры</string><string name="graphics_resolution">Выходное разрешение</string>
+    <string name="gpu_vulkan">Vulkan (Snapdragon, мощные Mali)</string><string name="gpu_opengl">OpenGL (Mali, другие)</string><string name="gpu_opengl_pending">В разработке</string>
+    <string name="audio_enable">Включить вывод звука</string><string name="controls_enable">Показывать экранное управление</string><string name="controls_hint">Управление автоматически скрывается при подключении физического геймпада.</string><string name="controls_opacity">Прозрачность управления</string>
+    <string name="cache_enable">Постоянный кэш скомпилированных блоков</string><string name="cache_hint">Повторно использует блоки при следующих запусках. После обновления игры или движка автоматически выбирается новый кэш.</string><string name="debug_hud">Отладочный HUD</string>
+    <string name="patch_select_game">Игра</string><string name="patch_no_games">Нет игр со встроенными в приложение патчами.</string><string name="patch_dynamic_shadows">Динамические тени</string><string name="patch_ssao">Фоновое затенение (SSAO)</string><string name="patch_motion_blur">Размытие в движении</string><string name="patch_depth_of_field">Глубина резкости</string><string name="patch_enabled">Включено</string><string name="patch_disabled">Отключено для производительности</string>
+    <string name="back">Назад</string><string name="import_cancelled">Импорт отменён</string><string name="operation_wait">Дождитесь завершения текущей операции</string><string name="import_wait_before_launch">Дождитесь завершения импорта перед запуском игры</string><string name="folder_picker_unavailable">Системный выбор папки недоступен</string><string name="file_picker_unavailable">Системный выбор файла недоступен</string><string name="hud_metrics">метрики</string>
+    <string name="import_checking_directory">Проверка извлечённой игры…</string><string name="import_copying_pkg">Копирование PKG…</string><string name="scan_error">Не удалось просканировать библиотеку игр</string><string name="import_already_running">Другая операция импорта ещё выполняется</string><string name="import_error">Ошибка импорта</string>
+    <string name="import_directory_success">Импортировано: %1$s (%2$s), файлов: %3$d, %4$s</string><string name="import_pkg_copied">PKG скопирован (%1$s), проверка…</string><string name="import_pkg_registered">PKG зарегистрирован: %1$s. eboot.bin доступен.</string><string name="import_pkg_metadata_only">Метаданные PKG импортированы: %1$s. eboot/PFS из retail PKG пока не извлечены, поэтому запись нельзя запустить.</string><string name="import_copy_progress">Копирование: файлов %1$d, %2$s</string><string name="import_pkg_copy_progress">Копирование PKG: %1$s</string>
+    <string name="game_activity_unavailable">Экран игры недоступен в этой сборке</string><string name="another_game_active">Уже запущена другая игра. Полностью закройте её перед сменой игры.</string>
+    <string name="hud_external_controller">Внешний контроллер: %1$s | экранное управление скрыто</string><string name="hud_controller_disconnected">Внешний контроллер отключён</string><string name="hud_collapse">Свернуть метрики</string><string name="hud_expand">Развернуть метрики</string><string name="hud_frame_waiting">Кадр: ожидание устойчивого изображения</string><string name="hud_stats_pending">00:00  AArch64 JIT | ожидание статистики</string>
+    <string name="hud_cache_checking">Кэш: проверка существующих данных / подготовка нового кэша</string><string name="hud_cache_disabled">Кэширование отключено</string><string name="hud_runtime_waiting">блоки/ресурсы: ожидание среды выполнения</string><string name="hud_cache_waiting">Кэш: ожидание расширенной телеметрии</string><string name="hud_cache_old_and_new">Использование существующего кэша и формирование нового обнаруженного кэша</string><string name="hud_cache_old">Использование существующего кэша</string><string name="hud_cache_new">Формирование нового кэша</string><string name="hud_frame_verified">Устойчивый игровой кадр подтверждён @ %1$02d:%2$02d</string>
+    <string name="launching_game">Запуск AArch64 JIT: %1$s</string>
+    <string name="select_runtime">Выбрать среду выполнения</string>
+    <string name="initialize">Инициализировать</string>
+    <string name="scan_games">Найти игры</string>
+    <string name="present_test">Проверить изображение</string>
+    <string name="audio_probe">Проверить звук</string>
+    <string name="runtime_not_loaded">Среда выполнения не загружена.</string>
+    <string name="surface_not_attached">Поверхность не подключена.</string>
+    <string name="surface_detached">Поверхность отключена.</string>
+    <string name="surface_detach_failed">Не удалось отключить поверхность: %1$s</string>
+    <string name="aarch64_jit">AArch64 JIT</string>
+    <string name="controls_gamepad_hint">При подключении поддерживаемого геймпада экранный оверлей автоматически скрывается. Геймпады поддерживаются.</string>
+    <string name="resolution_native">Нативное (устройство)</string>
+    <string name="resolution_upscale_150">Масштаб 1,5× (2880×1620)</string>
+    <string name="audio_ngs2_module_ready">Аудиомодуль NGS2 установлен. Он будет использован при следующем запуске игры.</string>
+    <string name="audio_ngs2_module_missing">Аудиомодуль NGS2 отсутствует. Игры, использующие NGS2, будут работать без звука.</string>
+    <string name="audio_import_ngs2_module">Импортировать libSceNgs2.sprx</string>
+    <string name="audio_ngs2_module_hint">Импортируйте только расшифрованный модуль прошивки, снятый с вашей собственной PlayStation 4. После импорта перезапустите игру; перезапуск приложения не требуется.</string>
+    <string name="audio_ngs2_import_success">Аудиомодуль NGS2 импортирован. Перезапустите игру, чтобы включить звук.</string>
+    <string name="audio_ngs2_import_failed">Не удалось импортировать аудиомодуль NGS2: %1$s</string>
+    <string name="audio_ngs2_error_directory">Не удалось создать каталог системных модулей</string>
+    <string name="audio_ngs2_error_open">Не удалось открыть выбранный файл</string>
+    <string name="audio_ngs2_error_size">Выбранный модуль слишком большой</string>
+    <string name="audio_ngs2_error_name">Выберите модуль прошивки с именем %1$s</string>
+    <string name="audio_ngs2_error_format">Выбранный файл не является расшифрованным модулем PS4</string>
+    <string name="game_hold_waiting">Удерживайте: 2 с удалить · 4 с не поддерживается · 8 с поддерживается</string>
+    <string name="game_hold_release_remove">Отпустите: выбрать для удаления</string>
+    <string name="game_hold_release_unsupported">Отпустите: отметить неподдерживаемой</string>
+    <string name="game_hold_release_supported">Отпустите: отметить поддерживаемой</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 с · %2$s</string>
+    <string name="game_menu_title">Быстрые настройки</string>
+    <string name="game_menu_hint">Смахните вправо или нажмите вне панели, чтобы закрыть</string>
+    <string name="game_menu_open">Открыть быстрые настройки</string>
+    <string name="game_menu_close">Закрыть быстрые настройки</string>
+    <string name="game_menu_overlay">Экранное управление</string>
+    <string name="game_menu_opacity">Прозрачность управления</string>
+    <string name="game_menu_opacity_value">%1$d%%</string>
+    <string name="game_menu_exit">Выйти к списку игр</string>
+</resources>

@@ -1,0 +1,110 @@
+// SPDX-FileCopyrightText: Copyright 2026 LSX4
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include "executor/dynamic_translation/floating_operation.h"
+#include "executor/dynamic_translation/vector_lowering_policy.h"
+
+#include <cstddef>
+#include <cstdint>
+
+namespace Executor::Jit::VectorSemantic {
+
+struct PackedBitTestResult {
+    bool intersection_is_zero{};
+    bool masked_complement_is_zero{};
+};
+
+enum class PackedShiftKind : std::uint8_t {
+    LogicalLeft,
+    LogicalRight,
+    ArithmeticRight,
+};
+
+enum class PackedLogicKind : std::uint8_t {
+    And,
+    AndNot,
+    Or,
+    Xor,
+};
+
+PackedBitTestResult TestPackedBits(const void* left, const void* right,
+                                   std::size_t width) noexcept;
+bool DuplicateDwordParity(void* destination, const void* source,
+                          std::size_t width, bool odd_lanes) noexcept;
+bool DuplicateLowQwordPerLane(void* destination, const void* source,
+                              std::size_t width, bool zero_upper) noexcept;
+bool AddOrSubtractPacked(void* destination, const void* left, const void* right,
+                         std::size_t element_width, std::size_t total_width,
+                         bool subtract) noexcept;
+bool ReplicateElement(void* destination, const void* element,
+                      std::size_t element_width,
+                      std::size_t total_width) noexcept;
+bool SquareRootElements(void* destination, const void* source,
+                        std::size_t element_width,
+                        std::size_t total_width) noexcept;
+bool ShiftIntegerElements(void* destination, const void* source,
+                          std::uint64_t distance, std::size_t element_width,
+                          std::size_t total_width, PackedShiftKind kind) noexcept;
+bool CompareIntegerElements(void* destination, const void* left,
+                            const void* right, std::size_t element_width,
+                            std::size_t total_width,
+                            bool signed_greater_than) noexcept;
+bool InterleaveElementHalves(void* destination, const void* left,
+                             const void* right, std::size_t element_width,
+                             std::size_t total_width,
+                             bool select_upper_half) noexcept;
+bool SelectElementsByImmediate(void* destination, const void* left,
+                               const void* right, std::uint32_t selection_bits,
+                               std::size_t element_width,
+                               std::size_t total_width,
+                               bool restart_bits_per_half) noexcept;
+bool SelectElementsBySign(void* destination, const void* left,
+                          const void* right, const void* selectors,
+                          std::size_t element_width,
+                          std::size_t total_width) noexcept;
+bool Replace128BitHalf(void* destination, const void* original,
+                       const void* replacement,
+                       std::uint32_t half_index) noexcept;
+bool Permute128BitHalves(void* destination, const void* left,
+                         const void* right,
+                         std::uint32_t selection) noexcept;
+bool InsertSinglePrecisionElement(void* destination, const void* original,
+                                  const void* source, std::uint32_t control,
+                                  bool source_is_memory) noexcept;
+bool SumAbsoluteByteGroups(void* destination, const void* left,
+                           const void* right, std::size_t total_width) noexcept;
+bool ShiftBytesInsideHalves(void* destination, const void* source,
+                            std::size_t distance, std::size_t total_width,
+                            bool toward_high_addresses) noexcept;
+bool AlignRight128(void* destination, const void* upper, const void* lower,
+                   std::size_t distance) noexcept;
+bool ShuffleImmediate(void* destination, const void* left, const void* right,
+                      std::size_t total_width, std::uint8_t control,
+                      ImmediateShuffleKind kind) noexcept;
+bool ApplyBitwise(void* destination, const void* left, const void* right,
+                  std::size_t total_width, PackedLogicKind kind) noexcept;
+bool PackWithSaturation(void* destination, const void* left, const void* right,
+                        std::size_t total_width,
+                        std::size_t source_element_width,
+                        bool unsigned_destination) noexcept;
+bool ApplyFloatingElements(
+    void* destination, const void* left, const void* right,
+    std::size_t element_width, std::size_t total_width,
+    Lsx4::Translation::FloatingBinaryOperation operation) noexcept;
+bool ApplyAlternatingFloatingElements(void* destination, const void* left,
+                                      const void* right,
+                                      std::size_t element_width,
+                                      std::size_t total_width) noexcept;
+bool AbsoluteIntegerElements(void* destination, const void* source,
+                             std::size_t element_width,
+                             std::size_t total_width) noexcept;
+bool ConvertFloatingElementWidth(void* destination, const void* source,
+                                 std::size_t destination_width,
+                                 std::size_t source_width,
+                                 bool widen_to_double) noexcept;
+float CombineHorizontalSingle(float left, float right, bool subtract) noexcept;
+double CombineHorizontalDouble(double left, double right, bool subtract) noexcept;
+
+}
