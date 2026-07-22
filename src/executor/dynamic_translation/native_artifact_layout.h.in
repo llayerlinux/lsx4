@@ -1,0 +1,13 @@
+// SPDX-FileCopyrightText: Copyright 2026 LSX4
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <cstdint>
+
+namespace Executor::Jit {
+
+inline constexpr std::uint64_t kJitNativeCacheSourceAbiHash =
+    0x@EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH_64@ull;
+
+}

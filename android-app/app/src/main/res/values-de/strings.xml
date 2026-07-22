@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LSX4</string><string name="library_scanning">Installierte Spiele werden gesucht…</string><string name="library_found">Gefundene Spiele: %1$d</string><string name="library_empty_status">Keine Spiele gefunden</string><string name="library_empty">Keine Spiele installiert. Mit + einen entpackten Ordner oder ein PKG importieren.</string>
+    <string name="menu_import_directory">Ordner importieren</string><string name="menu_import_pkg">PKG importieren</string><string name="menu_settings">Einstellungen</string><string name="menu_add">Spiel hinzufügen</string><string name="menu_remove_game">Ausgewähltes Spiel entfernen</string><string name="game_removing">%1$s wird entfernt…</string><string name="game_removed">%1$s entfernt</string><string name="game_remove_failed">%1$s konnte nicht entfernt werden</string>
+    <string name="game_selected_for_removal">%1$s zum Entfernen ausgewählt</string><string name="game_selection_cleared">Auswahl von %1$s aufgehoben</string><string name="game_marked_unsupported">%1$s zu den nicht unterstützten Spielen hinzugefügt</string><string name="game_marked_supported">%1$s zu den unterstützten Spielen hinzugefügt</string>
+    <string name="game_status_unclassified">Nicht klassifiziert</string><string name="game_status_unsupported">Nicht unterstützt</string><string name="game_status_supported">Unterstützt</string>
+    <string name="game_item_accessibility">%1$s, %2$s. %3$s. 2 Sekunden halten, um das Spiel zum Entfernen auszuwählen, 4 Sekunden für nicht unterstützt oder 8 Sekunden für unterstützt.</string>
+    <string name="metadata_only">Nur Metadaten · eboot fehlt</string>
+    <string name="settings_title">Einstellungen</string><string name="settings_subtitle">Änderungen werden automatisch gespeichert</string><string name="section_general">Allgemein</string><string name="language">App-Sprache</string>
+    <string name="category_graphics">Grafik</string><string name="category_graphics_summary">GPU, Auflösung und Patches</string><string name="category_audio">Audio</string><string name="category_audio_summary">Audioausgabe</string><string name="category_controls">Steuerung</string><string name="category_controls_summary">Bildschirmsteuerung</string><string name="category_cache">Caching</string><string name="category_cache_summary">Cache kompilierter Blöcke</string><string name="category_other">Sonstiges</string><string name="category_other_summary">Debug-HUD</string>
+    <string name="graphics_gpu">GPU</string><string name="graphics_gpu_summary">Grafik-API und Gerätefamilie</string><string name="graphics_patches">Patches</string><string name="graphics_patches_summary">Grafikpatches pro Spiel</string><string name="graphics_resolution">Ausgabeauflösung</string>
+    <string name="gpu_vulkan">Vulkan (Snapdragon, starkes Mali)</string><string name="gpu_opengl">OpenGL (Mali, andere)</string><string name="gpu_opengl_pending">In Entwicklung</string>
+    <string name="audio_enable">Audioausgabe aktivieren</string><string name="controls_enable">Bildschirmsteuerung anzeigen</string><string name="controls_hint">Bei verbundenem physischen Controller wird sie ausgeblendet.</string><string name="controls_opacity">Deckkraft der Steuerung</string>
+    <string name="cache_enable">Persistenter Cache kompilierter Blöcke</string><string name="cache_hint">Verwendet kompilierte Blöcke bei späteren Starts erneut.</string><string name="debug_hud">Debug-HUD</string>
+    <string name="patch_select_game">Spiel</string><string name="patch_no_games">Keine Spiele mit integrierten Patches verfügbar.</string><string name="patch_dynamic_shadows">Dynamische Schatten</string><string name="patch_ssao">Umgebungsverdeckung (SSAO)</string><string name="patch_motion_blur">Bewegungsunschärfe</string><string name="patch_depth_of_field">Tiefenschärfe</string><string name="patch_enabled">Aktiviert</string><string name="patch_disabled">Für Leistung deaktiviert</string>
+    <string name="back">Zurück</string><string name="import_cancelled">Import abgebrochen</string><string name="operation_wait">Bitte warten, bis der aktuelle Vorgang beendet ist</string><string name="import_wait_before_launch">Vor dem Start auf den Import warten</string><string name="folder_picker_unavailable">Die Ordnerauswahl ist nicht verfügbar</string><string name="file_picker_unavailable">Die Dateiauswahl ist nicht verfügbar</string><string name="hud_metrics">Metriken</string>
+    <string name="import_checking_directory">Entpacktes Spiel wird geprüft…</string><string name="import_copying_pkg">PKG wird kopiert…</string><string name="scan_error">Die Spielebibliothek konnte nicht geprüft werden</string><string name="import_already_running">Ein anderer Import läuft noch</string><string name="import_error">Import fehlgeschlagen</string>
+    <string name="import_directory_success">Importiert: %1$s (%2$s), %3$d Dateien, %4$s</string><string name="import_pkg_copied">PKG kopiert (%1$s), Prüfung läuft…</string><string name="import_pkg_registered">PKG registriert: %1$s. eboot.bin ist verfügbar.</string><string name="import_pkg_metadata_only">PKG-Metadaten importiert: %1$s. Retail-eboot/PFS wurde noch nicht extrahiert, daher kann dieser Eintrag nicht gestartet werden.</string><string name="import_copy_progress">Kopieren: %1$d Dateien, %2$s</string><string name="import_pkg_copy_progress">PKG kopieren: %1$s</string>
+    <string name="game_activity_unavailable">Der Spielbildschirm ist in diesem Build nicht verfügbar</string><string name="another_game_active">Ein anderes Spiel läuft bereits. Schließe es vollständig, bevor du das Spiel wechselst.</string>
+    <string name="hud_external_controller">Externer Controller: %1$s | Bildschirmsteuerung ausgeblendet</string><string name="hud_controller_disconnected">Externer Controller getrennt</string><string name="hud_collapse">Metriken einklappen</string><string name="hud_expand">Metriken ausklappen</string><string name="hud_frame_waiting">Bild: Warten auf ein stabiles Bild</string><string name="hud_stats_pending">00:00  AArch64 JIT | Statistiken ausstehend</string>
+    <string name="hud_cache_checking">Cache: vorhandene Daten prüfen / neuen Cache vorbereiten</string><string name="hud_cache_disabled">Caching deaktiviert</string><string name="hud_runtime_waiting">Blöcke/Ressourcen: Warten auf Runtime</string><string name="hud_cache_waiting">Cache: Warten auf erweiterte Telemetrie</string><string name="hud_cache_old_and_new">Vorhandenen Cache verwenden und neu erkannten Cache aufbauen</string><string name="hud_cache_old">Vorhandenen Cache verwenden</string><string name="hud_cache_new">Neuen Cache aufbauen</string><string name="hud_frame_verified">Stabiles Spielbild bestätigt @ %1$02d:%2$02d</string>
+    <string name="launching_game">AArch64 JIT wird gestartet: %1$s</string>
+    <string name="select_runtime">Laufzeit auswählen</string>
+    <string name="initialize">Initialisieren</string>
+    <string name="scan_games">Spiele suchen</string>
+    <string name="present_test">Bildausgabe testen</string>
+    <string name="audio_probe">Audio testen</string>
+    <string name="runtime_not_loaded">Die Laufzeit ist nicht geladen.</string>
+    <string name="surface_not_attached">Die Oberfläche ist nicht verbunden.</string>
+    <string name="surface_detached">Oberfläche getrennt.</string>
+    <string name="surface_detach_failed">Trennen der Oberfläche fehlgeschlagen: %1$s</string>
+    <string name="aarch64_jit">AArch64-JIT</string>
+    <string name="controls_gamepad_hint">Wenn ein unterstützter Controller verbunden ist, wird die Bildschirmsteuerung automatisch ausgeblendet. Controller werden unterstützt.</string>
+    <string name="resolution_native">Nativ (Gerät)</string>
+    <string name="resolution_upscale_150">1,5×-Hochskalierung (2880×1620)</string>
+    <string name="audio_ngs2_module_ready">NGS2-Audiomodul installiert. Es wird beim nächsten Spielstart verwendet.</string>
+    <string name="audio_ngs2_module_missing">Das NGS2-Audiomodul fehlt. Spiele mit NGS2 bleiben stumm.</string>
+    <string name="audio_import_ngs2_module">libSceNgs2.sprx importieren</string>
+    <string name="audio_ngs2_module_hint">Importiere nur ein entschlüsseltes Firmwaremodul von deiner eigenen PlayStation 4. Starte danach nur das Spiel neu; die App muss nicht neu gestartet werden.</string>
+    <string name="audio_ngs2_import_success">NGS2-Audiomodul importiert. Starte das Spiel neu, um den Ton zu aktivieren.</string>
+    <string name="audio_ngs2_import_failed">NGS2-Audiomodul konnte nicht importiert werden: %1$s</string>
+    <string name="audio_ngs2_error_directory">Das Systemmodulverzeichnis konnte nicht erstellt werden</string>
+    <string name="audio_ngs2_error_open">Die ausgewählte Datei konnte nicht geöffnet werden</string>
+    <string name="audio_ngs2_error_size">Das ausgewählte Modul ist zu groß</string>
+    <string name="audio_ngs2_error_name">Wähle das Firmwaremodul mit dem Namen %1$s aus</string>
+    <string name="audio_ngs2_error_format">Die ausgewählte Datei ist kein entschlüsseltes PS4-Modul</string>
+    <string name="game_hold_waiting">Halten: 2 s entfernen · 4 s nicht unterstützt · 8 s unterstützt</string>
+    <string name="game_hold_release_remove">Jetzt loslassen: zum Entfernen auswählen</string>
+    <string name="game_hold_release_unsupported">Jetzt loslassen: als nicht unterstützt markieren</string>
+    <string name="game_hold_release_supported">Jetzt loslassen: als unterstützt markieren</string>
+    <string name="game_hold_elapsed">%1$.1f / 8.0 s · %2$s</string>
+    <string name="game_menu_title">Schnellsteuerung</string>
+    <string name="game_menu_hint">Zum Schließen nach rechts wischen oder außerhalb tippen</string>
+    <string name="game_menu_open">Schnellsteuerung öffnen</string>
+    <string name="game_menu_close">Schnellsteuerung schließen</string>
+    <string name="game_menu_overlay">Bildschirmsteuerung</string>
+    <string name="game_menu_opacity">Deckkraft der Steuerung</string>
+    <string name="game_menu_opacity_value">%1$d%%</string>
+    <string name="game_menu_exit">Zur Spielebibliothek</string>
+</resources>
