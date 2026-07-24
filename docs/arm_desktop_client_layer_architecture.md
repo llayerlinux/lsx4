@@ -25,7 +25,7 @@ This boundary was verified on 2026-07-24 with a clean CMake regeneration, a nati
 | Funnel ARM | `funnel-arm/src/emulator.*`, `funnel-arm/src/sdl_window.*` | Emulation entry and native window integration |
 | LSX4 client | `src/executor` | AArch64 dynamic translation, runtime API, native artifact cache, process-memory bridge, diagnostics, and fault containment |
 | LSX4 client | `android-app` | Android activities, launcher, settings, input overlay, lifecycle, JNI bridge, packaging, and localized UI |
-| LSX4 client | `CMakeLists.txt` | Final Android target composition and external dependency integration |
+| LSX4 client | `CMakeLists.txt` | Consumes the Funnel-owned Android profile, adds executor sources, and integrates final-target dependencies |
 
 The former client-side desktop snapshot was copied before removal to:
 
@@ -35,7 +35,7 @@ The backup contains 813 files. Every copied file was SHA-256 compared with its s
 
 ## Build contract
 
-`funnel-arm/cmake/lsx4_arm_desktop_layer.cmake` is the integration manifest. It resolves all desktop source lists to Funnel and validates ownership during CMake configuration.
+`funnel-arm/cmake/lsx4_arm_desktop_layer.cmake` is the authoritative integration manifest. It owns the Android desktop/emulation source profile, returns the selected Funnel sources to the client, and validates ownership during CMake configuration. The root `CMakeLists.txt` does not keep a duplicate list of common, core, shader, video, input, ImGui, or emulator sources.
 
 The include order is intentional:
 
@@ -65,12 +65,14 @@ The source tree and the final native link were audited separately. A file being 
 | `src/video_core` | 113 | 37 | Active AMDGPU, Vulkan, presentation, and cache implementation |
 | `src/emulator.*`, `src/sdl_window.*` | 4 | 2 | Active emulation entry and window/surface integration |
 | `src/runtime_resources` | 5 | 0 direct objects | Active through the embedded-resource library |
-| `src/dist` | 5 | 0 | Retained desktop packaging material; not linked on Android |
-| `src/resources` | 14 | 0 | Retained desktop resources; not linked on Android |
-| `src/shadnet` | 5 | 0 | Retained desktop network helper; not linked on Android |
-| `src/main.cpp` | 1 | 0 | Retained desktop entry point; not linked on Android |
+| `src/dist` | 5 | 0 | Funnel-owned Windows/macOS/Linux packaging metadata; it is not executable Android runtime code |
+| `src/resources` | 14 | 0 | Funnel-owned full desktop/big-picture assets; Android uses its own localized resources and Funnel `runtime_resources` |
+| `src/shadnet` | 5 | 0 | Funnel-owned online service implementation; disabled together with its protobuf, NP, account, and desktop notification profile |
+| `src/main.cpp` | 1 | 0 | Funnel-owned desktop executable entry point; Android enters through `MainActivity` and JNI instead |
 
 The final link has exactly 369 project object inputs: 321 from Funnel, 47 from `src/executor`, and one generated `scm_rev.cpp` object under the build directory. It has zero objects from a client-side desktop source tree. The apparently similar `externals/sdl3/src/core/...` paths are SDL implementation files, not a second LSX4/shad4pc emulation core.
+
+Every Funnel C++ file is now classified by the Funnel-owned profile. Active Android/ARM implementations are selected there. Desktop entry/UI/packaging code, unsupported services, and mutually exclusive host alternatives are explicitly excluded there rather than silently omitted by the client. Enabling a currently disabled desktop feature, such as ShadNet, requires enabling its complete dependency and UI contract in the Funnel profile; its implementation must never be copied into the Android client.
 
 The root `externals` directory remains final-target dependency infrastructure (SDL, Vulkan headers, shader tooling, codecs, containers, and similar third-party libraries). It is intentionally not classified as Android client business logic or as a duplicate desktop/emulation implementation. Dependency ownership can be consolidated later, but moving vendored packages would not change the runtime layer boundary and would add submodule risk without a performance benefit.
 
@@ -104,10 +106,10 @@ At runtime the Android client selects a game and owns lifecycle, permissions, pr
 The verified native library was:
 
 - file: `build/android-arm64-release/liblsx4_executor_android.so`;
-- size: 51,551,416 bytes;
-- SHA-256: `E2A0DEB22C5C578A11228A41EC8F2328FF0B5596367B1C3E7F05F3309B1EFC9C`.
+- size: 51,548,400 bytes;
+- SHA-256: `2B19316E105A7E7C287DF11905E7080B85BBB77C941B3F0A12B791BC0EB504E9`.
 
-The same hash was measured inside Vivo application storage at `files/runtime/liblsx4_executor_android.so`. In the final audit launch, Bloodborne created live game threads through the AArch64 JIT, exceeded 237,000 persistent-cache hits, opened the AAudio output, submitted Vulkan work, and completed more than 192 frames without a fatal process or Java exception. The device reported `vivo V2546A` and an Adreno Vulkan implementation; Mali results were not used for acceptance.
+The same hash was measured inside Vivo application storage at `files/runtime/liblsx4_executor_android.so`. After source-profile ownership moved into Funnel, Bloodborne recreated its `Game:Main`, JIT cache, GPU communication/scheduler/presenter, FMOD, audio output, and worker threads without a fatal process or Java exception. The device reported `vivo V2546A` and an Adreno Vulkan implementation; Mali results were not used for acceptance.
 
 ## Optimization order
 
@@ -140,5 +142,6 @@ Cross-layer changes require measurements from both sides. The main candidates ar
 - Do not restore desktop/emulation files under client `src`.
 - Do not add a client include path ahead of Funnel for `common`, `core`, `video_core`, `shader_recompiler`, `input`, or `imgui`.
 - Do not bypass `lsx4_arm_desktop_layer.cmake` with direct desktop source paths in the root target.
+- Do not restore a desktop source inventory in the root `CMakeLists.txt`; source selection and exclusions belong to Funnel.
 - Build and hash the `.so`, install the APK with data preservation, deploy that exact `.so`, and verify the on-device hash before compatibility testing.
 - Test at least native initialization, a cached title launch, live JIT execution, GPU submission, and frame completion after a boundary change.
