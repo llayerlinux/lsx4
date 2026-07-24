@@ -21,6 +21,10 @@ u64 NativeClock::GetTimeUS(u64 base_ptc) const {
     return MultiplyHigh(GetUptime() - base_ptc, us_rdtsc_factor);
 }
 
+u64 NativeClock::GetTimeUSRelaxed(u64 base_ptc) const {
+    return MultiplyHigh(RelaxedRDTSC() - base_ptc, us_rdtsc_factor);
+}
+
 u64 NativeClock::GetTimeMS(u64 base_ptc) const {
     return MultiplyHigh(GetUptime() - base_ptc, ms_rdtsc_factor);
 }

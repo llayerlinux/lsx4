@@ -72,6 +72,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
@@ -958,6 +959,59 @@ __attribute__((constructor)) void ExecutorNativeBuildMarkerOnLoad() {
 constexpr int ANDROID_LOG_INFO = 4;
 void NativeLog(const int, const char*, ...) {}
 #endif
+
+void PreferPerformanceCpusForPrimaryGuest() {
+#ifdef __ANDROID__
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        NativeLog(ANDROID_LOG_WARN,
+                  "[EXECUTOR_PRIMARY_CPU] affinity_read_failed errno=%d", errno);
+        return;
+    }
+
+    std::uint64_t fastest_frequency = 0;
+    int allowed_count = 0;
+    std::array<std::uint64_t, CPU_SETSIZE> frequencies{};
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (!CPU_ISSET(cpu, &allowed)) {
+            continue;
+        }
+        ++allowed_count;
+        std::ifstream frequency_file(
+            "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
+            "/cpufreq/cpuinfo_max_freq");
+        frequency_file >> frequencies[static_cast<std::size_t>(cpu)];
+        fastest_frequency =
+            std::max(fastest_frequency, frequencies[static_cast<std::size_t>(cpu)]);
+    }
+    if (allowed_count < 2 || fastest_frequency == 0) {
+        return;
+    }
+
+    cpu_set_t preferred;
+    CPU_ZERO(&preferred);
+    int preferred_count = 0;
+    const std::uint64_t performance_floor = fastest_frequency * 7 / 10;
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed) &&
+            frequencies[static_cast<std::size_t>(cpu)] >= performance_floor) {
+            CPU_SET(cpu, &preferred);
+            ++preferred_count;
+        }
+    }
+    if (preferred_count < 2) {
+        preferred = allowed;
+        preferred_count = allowed_count;
+    }
+    const int result = sched_setaffinity(0, sizeof(preferred), &preferred);
+    NativeLog(result == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+              "[EXECUTOR_PRIMARY_CPU] performanceCpus=%d maxKHz=%llu allowed=%d result=%d "
+              "errno=%d",
+              preferred_count, static_cast<unsigned long long>(fastest_frequency),
+              allowed_count, result, result == 0 ? 0 : errno);
+#endif
+}
 
 void ConfigureAndroidRuntimeUserPathsAndBaseConfig() {
     if (g_root.empty()) {
@@ -2068,7 +2122,7 @@ extern "C" bool ExecutorJitReadGuestBytes(const std::uint64_t address, void* dst
     const std::uint64_t host_address = JitCanonicalHostPointer(address);
     const std::uint64_t host_destination =
         JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(dst));
-    return Lsx4::Translation::ReadProcessGuestMemory(
+    return Lsx4::Translation::ReadProcessGuestMemoryWithFaultDispatch(
         host_address, reinterpret_cast<void*>(host_destination), size);
 }
 
@@ -2081,7 +2135,7 @@ extern "C" bool ExecutorJitReadGuestBytesStable(const std::uint64_t address, voi
     const std::uint64_t host_destination =
         JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(dst));
     return IsJitGuestRangeWithoutProcMaps(host_address, size) &&
-           Lsx4::Translation::ReadProcessGuestMemory(
+           Lsx4::Translation::ReadProcessGuestMemoryWithFaultDispatch(
                host_address, reinterpret_cast<void*>(host_destination), size);
 }
 
@@ -2093,7 +2147,7 @@ extern "C" bool ExecutorJitWriteGuestBytes(const std::uint64_t address, const vo
     const std::uint64_t host_address = JitCanonicalHostPointer(address);
     const std::uint64_t host_source =
         JitCanonicalHostPointer(reinterpret_cast<std::uint64_t>(src));
-    return Lsx4::Translation::WriteProcessGuestMemory(
+    return Lsx4::Translation::WriteProcessGuestMemoryWithFaultDispatch(
         host_address, reinterpret_cast<const void*>(host_source), size);
 }
 
@@ -2285,9 +2339,9 @@ extern "C" void executor_lsx4_android_register_guest_readable_range(const void* 
     RegisterBox64GuestReadableRange(base, size, label);
 }
 
-extern "C" void executor_lsx4_android_register_guest_stack_range(const void* base,
-                                                                      std::size_t size,
-                                                                      const char* label) {
+extern "C" void executor_lsx4_android_note_guest_stack_window(const void* base,
+                                                               std::size_t size,
+                                                               const char* label) {
     RegisterBox64GuestStackRange(base, size, label);
 }
 
@@ -5952,6 +6006,9 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         HleNameMatches(name, "sceGnmSetPsShader", "bQVd5YzCal0") ||
         HleNameMatches(name, "sceGnmSetPsShader350", "5uFKckiJYRM") ||
         HleNameMatches(name, "sceGnmSetVsShader", "gAhCn6UiU4Y") ||
+        HleNameMatches(name, "sceGnmSubmitCommandBuffers", "zwY0YV91TTI") ||
+        HleNameMatches(
+            name, "sceGnmSubmitCommandBuffersForWorkload", "jRcI8VcgTz4") ||
         HleNameMatches(name, "posix_pthread_mutex_lock", "7H0iTOciTLo") ||
         HleNameMatches(name, "posix_pthread_mutex_unlock", "2Z+PpY6CaJg") ||
         HleNameMatches(name, "posix_pthread_mutex_trylock", "K-jXhbt2gn4") ||
@@ -5972,6 +6029,7 @@ ExecutorHleTargetMetadata BuildExecutorHleTargetMetadata(const std::uint64_t nat
         HleNameMatches(name, "memcmp", "DfivPArhucg") ||
         SymbolNameContains(symbol_name, "sceGnmSetPsShader") ||
         SymbolNameContains(symbol_name, "sceGnmSetVsShader") ||
+        SymbolNameContains(symbol_name, "sceGnmSubmitCommandBuffers") ||
         SymbolNameContains(symbol_name, "posix_pthread_mutex_lock") ||
         SymbolNameContains(symbol_name, "posix_pthread_mutex_unlock") ||
         SymbolNameContains(symbol_name, "posix_pthread_mutex_trylock") ||
@@ -18110,6 +18168,27 @@ int PresentRgba8888Linear(const void* source, const std::uint32_t width,
 
 }
 
+namespace Lsx4::Translation {
+
+std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request) {
+    return ExecutorJitHleBridgeCallback(
+        request.function, request.integer_arguments[0], request.integer_arguments[1],
+        request.integer_arguments[2], request.integer_arguments[3],
+        request.integer_arguments[4], request.integer_arguments[5], request.guest_stack,
+        request.floating_arguments[0], request.floating_arguments[1],
+        request.floating_arguments[2], request.floating_arguments[3]);
+}
+
+std::uintptr_t SelectiveLeafBridgeEntry() noexcept {
+    return reinterpret_cast<std::uintptr_t>(&ExecutorJitTryLeafHleThunkCallback);
+}
+
+std::uintptr_t ResolvedLeafBridgeEntry() noexcept {
+    return reinterpret_cast<std::uintptr_t>(&ExecutorJitResolvedLeafHleCallback);
+}
+
+}
+
 extern "C" int executor_lsx4_runtime_present_guest_frame(
     const void* source, const std::uint32_t width, const std::uint32_t height,
     const std::uint32_t stride_bytes, const std::uint32_t pixel_format,
@@ -24146,6 +24225,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                     if (primary_guest_thread != nullptr) {
                         Libraries::Kernel::g_curthread = primary_guest_thread;
                         Common::SetCurrentThreadName(primary_guest_thread->name.c_str());
+                        PreferPerformanceCpusForPrimaryGuest();
                         primary_guest_thread->native_thr.Initialize();
                         sigset_t empty_signal_mask;
                         sigemptyset(&empty_signal_mask);
@@ -24171,7 +24251,7 @@ extern "C" int executor_lsx4_runtime_run_jit_mapped_entry() {
                     entry_request.thread_segment_origin = request.tcb_base;
                     entry_request.supplied_stack_base = request.stack_base;
                     entry_request.supplied_stack_bytes = request.stack_size;
-                    entry_request.permit_return_sentinel = true;
+                    entry_request.permit_return_sentinel = false;
                     const std::uint64_t guest_result =
                         Lsx4::Translation::ExecuteGuest(request.entry, entry_request);
                     result = static_cast<int>(guest_result);

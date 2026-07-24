@@ -26,5 +26,10 @@ struct IntegerMathResult {
 [[nodiscard]] std::optional<IntegerMathResult> EvaluateBitMovement(
     std::uint32_t mnemonic, std::uint64_t value, std::uint64_t count,
     std::uint32_t width) noexcept;
+[[nodiscard]] std::uint64_t ReverseByteOrder(std::uint64_t value,
+                                             std::uint32_t byte_width) noexcept;
+[[nodiscard]] std::uint64_t MergeLowRegisterBits(std::uint64_t previous,
+                                                 std::uint64_t replacement,
+                                                 std::uint32_t width) noexcept;
 
 }

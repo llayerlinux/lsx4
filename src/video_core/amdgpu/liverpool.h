@@ -356,6 +356,10 @@ private:
     [[nodiscard]] u32 RecountQueuedSubmits();
 #ifdef __ANDROID__
     [[nodiscard]] u64 ArmGpuCompletionTickForExecutor();
+    void QueueGpuCompletionForExecutor(u64 gpu_tick,
+                                       Common::UniqueFunction<void>&& completion);
+    void PublishGpuCompletionBatchForExecutor();
+    void OrderGpuWorkAfterCompletionForExecutor(u64 gpu_tick);
     void FlushGpuCompletionBatchForExecutor(bool force, bool synchronization_wait);
 #endif
 
@@ -500,6 +504,8 @@ private:
     u32 executor_async_frame_head{};
     u32 executor_async_frame_count{};
     bool executor_completion_flush_pending{};
+    u64 executor_completion_batch_tick{};
+    std::vector<Common::UniqueFunction<void>> executor_completion_batch{};
     u64 executor_guest_submit_count{};
     u64 executor_completion_point_count{};
     u64 executor_submit_done_frame_count{};

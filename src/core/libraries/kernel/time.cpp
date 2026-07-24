@@ -48,6 +48,12 @@ namespace Libraries::Kernel {
 static u64 initial_ptc;
 static std::unique_ptr<Common::NativeClock> clock;
 static std::mutex clock_mutex;
+#ifdef __ANDROID__
+static std::once_flag realtime_origin_once;
+static u64 realtime_origin_us;
+static u64 realtime_process_origin_us;
+static bool realtime_origin_valid;
+#endif
 
 #ifdef __ANDROID__
 static bool ShouldTraceLiveSleep() {
@@ -99,6 +105,13 @@ static void EnsureClockInitialized() {
         initial_ptc = clock->GetUptime();
     }
 }
+
+#ifdef __ANDROID__
+static u64 GetRelaxedProcessTime() {
+    EnsureClockInitialized();
+    return clock->GetTimeUSRelaxed(initial_ptc);
+}
+#endif
 
 u64 PS4_SYSV_ABI sceKernelGetTscFrequency() {
     EnsureClockInitialized();
@@ -158,24 +171,25 @@ static s32 posix_nanosleep_impl(const OrbisKernelTimespec* rqtp, OrbisKernelTime
     static std::atomic_bool s_gm_poll_trace{
         std::filesystem::exists(std::filesystem::path(
             "/data/data/app.lsx4.android/files/lsx4-home/run-gamemain-poll-trace"))};
-    if (s_gm_poll_trace.load(std::memory_order_relaxed) && executor_live_get_current_hle_call_site &&
-        g_curthread && g_curthread->name.find("Game:Main") != std::string::npos &&
+    if (s_gm_poll_trace.load(std::memory_order_relaxed) &&
+        executor_live_get_current_hle_call_site && g_curthread &&
+        g_curthread->name.find("Game:Main") != std::string::npos &&
         duration < std::chrono::milliseconds(1)) {
         static std::atomic_int budget{4096};
         if (budget.fetch_sub(1, std::memory_order_relaxed) > 0) {
             std::uint64_t g_ret = 0, g_off = 0, g_arg0 = 0;
             char sym[128]{};
             char mod[128]{};
-            const int rc = executor_live_get_current_hle_call_site(&g_ret, &g_off, &g_arg0, sym,
-                                                                   sizeof(sym), mod, sizeof(mod));
-            __android_log_print(ANDROID_LOG_WARN, "LSX4Native",
-                                "[EXECUTOR_GAMEMAIN_POLL] rc=%d guestRet=0x%llx off=0x%llx arg0=0x%llx "
-                                "module=%s symbol=%s napNs=%lld",
-                                rc, static_cast<unsigned long long>(g_ret),
-                                static_cast<unsigned long long>(g_off),
-                                static_cast<unsigned long long>(g_arg0), mod[0] ? mod : "<none>",
-                                sym[0] ? sym : "<none>",
-                                static_cast<long long>(duration.count()));
+            const int rc = executor_live_get_current_hle_call_site(
+                &g_ret, &g_off, &g_arg0, sym, sizeof(sym), mod, sizeof(mod));
+            __android_log_print(
+                ANDROID_LOG_WARN, "LSX4Native",
+                "[EXECUTOR_GAMEMAIN_POLL] rc=%d guestRet=0x%llx off=0x%llx arg0=0x%llx "
+                "module=%s symbol=%s napNs=%lld",
+                rc, static_cast<unsigned long long>(g_ret),
+                static_cast<unsigned long long>(g_off),
+                static_cast<unsigned long long>(g_arg0), mod[0] ? mod : "<none>",
+                sym[0] ? sym : "<none>", static_cast<long long>(duration.count()));
         }
     }
 #endif
@@ -551,6 +565,28 @@ s32 PS4_SYSV_ABI posix_gettimeofday(OrbisKernelTimeval* tp, OrbisKernelTimezone*
     }
     return 0;
 #else
+#ifdef __ANDROID__
+    if (tp && !tz) {
+        std::call_once(realtime_origin_once, [] {
+            timeval origin{};
+            if (::gettimeofday(&origin, nullptr) == 0) {
+                realtime_origin_us =
+                    static_cast<u64>(origin.tv_sec) * 1'000'000 +
+                    static_cast<u64>(origin.tv_usec);
+                realtime_process_origin_us = GetRelaxedProcessTime();
+                realtime_origin_valid = true;
+            }
+        });
+        if (realtime_origin_valid) {
+            const u64 current_process_us = GetRelaxedProcessTime();
+            const u64 current_realtime_us =
+                realtime_origin_us + current_process_us - realtime_process_origin_us;
+            tp->tv_sec = static_cast<s64>(current_realtime_us / 1'000'000);
+            tp->tv_usec = static_cast<s64>(current_realtime_us % 1'000'000);
+            return 0;
+        }
+    }
+#endif
     struct timezone tzz;
     timeval tv;
     const auto ret = gettimeofday(&tv, &tzz);

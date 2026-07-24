@@ -48,7 +48,7 @@ void TranslateOperand(const X86DecodedOperand& source, LsxOperandRecord& target)
         target.reg.value = static_cast<LsxRegisterCode>(source.reg.value);
         break;
     case X86_OPERAND_TYPE_MEMORY:
-        target.mem.type = static_cast<std::uint32_t>(source.mem.type);
+        target.mem.type = static_cast<std::uint8_t>(source.mem.type);
         target.mem.segment = static_cast<LsxRegisterCode>(source.mem.segment);
         target.mem.base = static_cast<LsxRegisterCode>(source.mem.base);
         target.mem.index = static_cast<LsxRegisterCode>(source.mem.index);

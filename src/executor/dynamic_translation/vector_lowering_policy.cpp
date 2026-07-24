@@ -4,6 +4,11 @@
 #include "executor/dynamic_translation/vector_lowering_policy.h"
 
 #include "common/x86_decoder.h"
+#include "executor/dynamic_translation/floating_relation.h"
+
+#include <algorithm>
+#include <array>
+#include <ranges>
 
 namespace Executor::Jit {
 namespace {
@@ -17,6 +22,104 @@ bool IsVectorRegister(const LsxOperandRecord& operand) noexcept {
            (reg >= X86_REGISTER_YMM0 && reg <= X86_REGISTER_YMM15);
 }
 
+}
+
+struct BlendDescriptor {
+    X86Mnemonic mnemonic;
+    VectorBlendPlan plan;
+};
+
+constexpr std::array kBlendDescriptors{
+    BlendDescriptor{X86_MNEMONIC_BLENDPS, {BlendControlKind::Immediate, 4, false, false}},
+    BlendDescriptor{X86_MNEMONIC_BLENDPD, {BlendControlKind::Immediate, 8, false, false}},
+    BlendDescriptor{X86_MNEMONIC_PBLENDW, {BlendControlKind::Immediate, 2, false, true}},
+    BlendDescriptor{X86_MNEMONIC_VBLENDPS, {BlendControlKind::Immediate, 4, true, false}},
+    BlendDescriptor{X86_MNEMONIC_VBLENDPD, {BlendControlKind::Immediate, 8, true, false}},
+    BlendDescriptor{X86_MNEMONIC_VPBLENDW, {BlendControlKind::Immediate, 2, true, true}},
+    BlendDescriptor{X86_MNEMONIC_VPBLENDD, {BlendControlKind::Immediate, 4, true, false}},
+    BlendDescriptor{X86_MNEMONIC_BLENDVPS, {BlendControlKind::VectorMask, 4, false, false}},
+    BlendDescriptor{X86_MNEMONIC_BLENDVPD, {BlendControlKind::VectorMask, 8, false, false}},
+    BlendDescriptor{X86_MNEMONIC_PBLENDVB, {BlendControlKind::VectorMask, 1, false, false}},
+    BlendDescriptor{X86_MNEMONIC_VBLENDVPS, {BlendControlKind::VectorMask, 4, true, false}},
+    BlendDescriptor{X86_MNEMONIC_VBLENDVPD, {BlendControlKind::VectorMask, 8, true, false}},
+    BlendDescriptor{X86_MNEMONIC_VPBLENDVB, {BlendControlKind::VectorMask, 1, true, false}},
+};
+
+struct ElementTransferDescriptor {
+    X86Mnemonic mnemonic;
+    ElementTransferPlan plan;
+};
+
+constexpr std::array kElementTransfers{
+    ElementTransferDescriptor{X86_MNEMONIC_PINSRB, {ElementTransferDirection::Insert, 1, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_PINSRW, {ElementTransferDirection::Insert, 2, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_PINSRD, {ElementTransferDirection::Insert, 4, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_PINSRQ, {ElementTransferDirection::Insert, 8, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_VPINSRB, {ElementTransferDirection::Insert, 1, true}},
+    ElementTransferDescriptor{X86_MNEMONIC_VPINSRW, {ElementTransferDirection::Insert, 2, true}},
+    ElementTransferDescriptor{X86_MNEMONIC_VPINSRD, {ElementTransferDirection::Insert, 4, true}},
+    ElementTransferDescriptor{X86_MNEMONIC_VPINSRQ, {ElementTransferDirection::Insert, 8, true}},
+    ElementTransferDescriptor{X86_MNEMONIC_PEXTRB, {ElementTransferDirection::Extract, 1, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_PEXTRW, {ElementTransferDirection::Extract, 2, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_PEXTRD, {ElementTransferDirection::Extract, 4, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_PEXTRQ, {ElementTransferDirection::Extract, 8, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_VPEXTRB, {ElementTransferDirection::Extract, 1, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_VPEXTRW, {ElementTransferDirection::Extract, 2, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_VPEXTRD, {ElementTransferDirection::Extract, 4, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_VPEXTRQ, {ElementTransferDirection::Extract, 8, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_EXTRACTPS, {ElementTransferDirection::Extract, 4, false}},
+    ElementTransferDescriptor{X86_MNEMONIC_VEXTRACTPS, {ElementTransferDirection::Extract, 4, false}},
+};
+
+bool IsReadableVector(const LsxOperandRecord& operand) noexcept {
+    return IsVectorRegister(operand) || operand.type == X86_OPERAND_TYPE_MEMORY;
+}
+
+std::optional<VectorBlendPlan> PlanVectorBlend(
+    const X86Mnemonic mnemonic) noexcept {
+    const auto found = std::ranges::find(
+        kBlendDescriptors, mnemonic, &BlendDescriptor::mnemonic);
+    return found == kBlendDescriptors.end()
+               ? std::nullopt
+               : std::optional{found->plan};
+}
+
+std::optional<ElementTransferPlan> PlanElementTransfer(
+    const X86Mnemonic mnemonic) noexcept {
+    const auto found = std::ranges::find(
+        kElementTransfers, mnemonic, &ElementTransferDescriptor::mnemonic);
+    return found == kElementTransfers.end()
+               ? std::nullopt
+               : std::optional{found->plan};
+}
+
+std::optional<MaskedTransferPlan> PlanMaskedTransfer(
+    const LsxDecodedOp& instruction) noexcept {
+    const auto mnemonic = static_cast<X86Mnemonic>(instruction.mnemonic);
+    const bool qword_lanes = mnemonic == X86_MNEMONIC_VMASKMOVPD ||
+                             mnemonic == X86_MNEMONIC_VPMASKMOVQ;
+    const bool dword_lanes = mnemonic == X86_MNEMONIC_VMASKMOVPS ||
+                             mnemonic == X86_MNEMONIC_VPMASKMOVD;
+    if ((!qword_lanes && !dword_lanes) || instruction.operand_count < 3 ||
+        !IsVectorRegister(instruction.operands[1])) {
+        return std::nullopt;
+    }
+    const bool writes_memory =
+        instruction.operands[0].type == X86_OPERAND_TYPE_MEMORY;
+    const bool valid_payload = writes_memory
+        ? IsVectorRegister(instruction.operands[2])
+        : IsVectorRegister(instruction.operands[0]) &&
+              instruction.operands[2].type == X86_OPERAND_TYPE_MEMORY;
+    return valid_payload
+        ? std::optional{MaskedTransferPlan{
+              static_cast<std::uint8_t>(qword_lanes ? 8u : 4u),
+              writes_memory}}
+        : std::nullopt;
+}
+
+bool IsScalarIntegerSource(const LsxOperandRecord& operand) noexcept {
+    return operand.type == X86_OPERAND_TYPE_REGISTER ||
+           operand.type == X86_OPERAND_TYPE_MEMORY;
 }
 
 DirectVectorPlan PlanDirectVectorKernel(
@@ -67,7 +170,8 @@ std::optional<LanePermutationPlan> PlanLanePermutation(
     const auto vector_or_memory = [](const LsxOperandRecord& operand) {
         return IsVectorRegister(operand) || operand.type == X86_OPERAND_TYPE_MEMORY;
     };
-    if (!vector_or_memory(instruction.operands[1])) {
+    const auto& source = instruction.operands[1];
+    if (!vector_or_memory(source)) {
         return std::nullopt;
     }
 
@@ -78,12 +182,17 @@ std::optional<LanePermutationPlan> PlanLanePermutation(
         .element_bytes = element_bytes,
         .vector_bytes = instruction.operands[0].size / 8u,
     };
+    if ((plan.vector_bytes != 16 && plan.vector_bytes != 32) ||
+        source.size != instruction.operands[0].size) {
+        return std::nullopt;
+    }
     if (control.type == X86_OPERAND_TYPE_IMMEDIATE) {
         plan.immediate = static_cast<std::uint8_t>(control.imm.value.u);
         plan.control_source = LaneControlSource::Immediate;
         return plan;
     }
-    if (!vector_or_memory(control)) {
+    if (!vector_or_memory(control) ||
+        control.size != instruction.operands[0].size) {
         return std::nullopt;
     }
     plan.control_source = LaneControlSource::VectorValue;
@@ -197,6 +306,204 @@ VectorLogicOperation ClassifyVectorLogic(
     default:
         return VectorLogicOperation::Unsupported;
     }
+}
+
+std::optional<ScalarInstructionPlan> PlanScalarInstruction(
+    const LsxDecodedOp& instruction) noexcept {
+    const auto operation = static_cast<X86Mnemonic>(instruction.mnemonic);
+    const auto enough_operands = [&](const std::uint8_t last) {
+        return instruction.operand_count > last;
+    };
+
+    if (const auto arithmetic =
+            Lsx4::Translation::DescribeScalarBinaryOperation(instruction.mnemonic)) {
+        if (enough_operands(arithmetic->right_operand) &&
+            IsVectorRegister(instruction.operands[0]) &&
+            IsVectorRegister(instruction.operands[arithmetic->merge_operand]) &&
+            IsReadableVector(instruction.operands[arithmetic->right_operand])) {
+            return ScalarInstructionPlan{
+                .family = ScalarInstructionFamily::BinaryArithmetic,
+                .merge_operand = arithmetic->merge_operand,
+                .source_operand = arithmetic->right_operand,
+                .double_precision = arithmetic->double_precision,
+            };
+        }
+        return std::nullopt;
+    }
+    if (const auto root =
+            Lsx4::Translation::DescribeScalarRootOperation(instruction.mnemonic)) {
+        if (enough_operands(root->source_operand) &&
+            IsVectorRegister(instruction.operands[0]) &&
+            IsVectorRegister(instruction.operands[root->merge_operand]) &&
+            IsReadableVector(instruction.operands[root->source_operand])) {
+            return ScalarInstructionPlan{
+                .family = ScalarInstructionFamily::RootArithmetic,
+                .merge_operand = root->merge_operand,
+                .source_operand = root->source_operand,
+                .double_precision = root->double_precision,
+            };
+        }
+        return std::nullopt;
+    }
+
+    const bool vector_move = operation == X86_MNEMONIC_VMOVSS ||
+                             operation == X86_MNEMONIC_VMOVSD;
+    if (operation == X86_MNEMONIC_MOVSS || operation == X86_MNEMONIC_MOVSD ||
+        vector_move) {
+        const std::uint8_t source_index =
+            static_cast<std::uint8_t>(vector_move && instruction.operand_count >= 3 ? 2 : 1);
+        if (!enough_operands(source_index)) {
+            return std::nullopt;
+        }
+        const auto& destination = instruction.operands[0];
+        const auto& source = instruction.operands[source_index];
+        const bool valid_destination = IsVectorRegister(destination) ||
+                                       destination.type == X86_OPERAND_TYPE_MEMORY;
+        if (!valid_destination || !IsReadableVector(source) ||
+            (destination.type == X86_OPERAND_TYPE_MEMORY &&
+             source.type == X86_OPERAND_TYPE_MEMORY)) {
+            return std::nullopt;
+        }
+        return ScalarInstructionPlan{
+            .family = ScalarInstructionFamily::MoveLane,
+            .merge_operand = static_cast<std::uint8_t>(vector_move ? 1 : 0),
+            .source_operand = source_index,
+            .double_precision = operation == X86_MNEMONIC_MOVSD ||
+                                operation == X86_MNEMONIC_VMOVSD,
+        };
+    }
+
+    if (const auto conversion =
+            Lsx4::Translation::DescribeIntegerToFloat(instruction.mnemonic)) {
+        if (enough_operands(conversion->source_operand) &&
+            IsVectorRegister(instruction.operands[0]) &&
+            IsVectorRegister(instruction.operands[conversion->merge_operand]) &&
+            IsScalarIntegerSource(instruction.operands[conversion->source_operand])) {
+            return ScalarInstructionPlan{
+                .family = ScalarInstructionFamily::IntegerToFloating,
+                .merge_operand = conversion->merge_operand,
+                .source_operand = conversion->source_operand,
+                .double_precision = conversion->double_precision,
+            };
+        }
+        return std::nullopt;
+    }
+    if (const auto conversion =
+            Lsx4::Translation::DescribeFloatWidthConversion(instruction.mnemonic)) {
+        if (enough_operands(conversion->source_operand) &&
+            IsVectorRegister(instruction.operands[0]) &&
+            IsVectorRegister(instruction.operands[conversion->merge_operand]) &&
+            IsReadableVector(instruction.operands[conversion->source_operand])) {
+            return ScalarInstructionPlan{
+                .family = ScalarInstructionFamily::ChangeFloatingWidth,
+                .merge_operand = conversion->merge_operand,
+                .source_operand = conversion->source_operand,
+                .double_precision = conversion->widen_to_double,
+            };
+        }
+        return std::nullopt;
+    }
+    if (const auto conversion =
+            Lsx4::Translation::DescribeFloatToInteger(instruction.mnemonic)) {
+        if (instruction.operand_count >= 2 &&
+            IsScalarIntegerSource(instruction.operands[0]) &&
+            IsReadableVector(instruction.operands[1])) {
+            return ScalarInstructionPlan{
+                .family = ScalarInstructionFamily::FloatingToInteger,
+                .source_operand = 1,
+                .double_precision = conversion->source_is_double,
+                .uses_environment_rounding = conversion->honor_mxcsr_rounding,
+            };
+        }
+        return std::nullopt;
+    }
+
+    const bool ordered_status = operation == X86_MNEMONIC_COMISS ||
+        operation == X86_MNEMONIC_VCOMISS || operation == X86_MNEMONIC_COMISD ||
+        operation == X86_MNEMONIC_VCOMISD || operation == X86_MNEMONIC_UCOMISS ||
+        operation == X86_MNEMONIC_VUCOMISS || operation == X86_MNEMONIC_UCOMISD ||
+        operation == X86_MNEMONIC_VUCOMISD;
+    if (ordered_status && instruction.operand_count >= 2 &&
+        IsVectorRegister(instruction.operands[0]) &&
+        IsReadableVector(instruction.operands[1])) {
+        return ScalarInstructionPlan{
+            .family = ScalarInstructionFamily::StatusComparison,
+            .source_operand = 1,
+            .double_precision = operation == X86_MNEMONIC_COMISD ||
+                operation == X86_MNEMONIC_VCOMISD || operation == X86_MNEMONIC_UCOMISD ||
+                operation == X86_MNEMONIC_VUCOMISD,
+        };
+    }
+
+    const bool legacy_predicate = operation == X86_MNEMONIC_CMPSS ||
+                                  operation == X86_MNEMONIC_CMPSD;
+    const bool vector_predicate = operation == X86_MNEMONIC_VCMPSS ||
+                                  operation == X86_MNEMONIC_VCMPSD;
+    if (legacy_predicate || vector_predicate) {
+        const std::uint8_t rhs = static_cast<std::uint8_t>(vector_predicate ? 2 : 1);
+        const std::uint8_t control = static_cast<std::uint8_t>(vector_predicate ? 3 : 2);
+        if (enough_operands(control) && IsVectorRegister(instruction.operands[0]) &&
+            (!vector_predicate || IsVectorRegister(instruction.operands[1])) &&
+            IsReadableVector(instruction.operands[rhs]) &&
+            instruction.operands[control].type == X86_OPERAND_TYPE_IMMEDIATE) {
+            return ScalarInstructionPlan{
+                .family = ScalarInstructionFamily::PredicateComparison,
+                .merge_operand = static_cast<std::uint8_t>(vector_predicate ? 1 : 0),
+                .source_operand = rhs,
+                .control_operand = control,
+                .double_precision = operation == X86_MNEMONIC_CMPSD ||
+                                    operation == X86_MNEMONIC_VCMPSD,
+            };
+        }
+        return std::nullopt;
+    }
+
+    if (const auto rounding =
+            Lsx4::Translation::DescribeScalarRound(instruction.mnemonic)) {
+        if (enough_operands(rounding->control_operand) &&
+            IsVectorRegister(instruction.operands[0]) &&
+            IsVectorRegister(instruction.operands[rounding->merge_operand]) &&
+            IsReadableVector(instruction.operands[rounding->source_operand]) &&
+            instruction.operands[rounding->control_operand].type ==
+                X86_OPERAND_TYPE_IMMEDIATE) {
+            return ScalarInstructionPlan{
+                .family = ScalarInstructionFamily::ControlledRounding,
+                .merge_operand = rounding->merge_operand,
+                .source_operand = rounding->source_operand,
+                .control_operand = rounding->control_operand,
+                .double_precision = rounding->double_precision,
+            };
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<VectorWritePlan> PlanVectorWrite(
+    const DecodeSummary& instruction, const LsxOperandRecord& destination) noexcept {
+    const bool ymm_register = destination.type == X86_OPERAND_TYPE_REGISTER &&
+                              destination.reg.value >= X86_REGISTER_YMM0 &&
+                              destination.reg.value <= X86_REGISTER_YMM15;
+    const std::uint8_t payload_bytes =
+        static_cast<std::uint8_t>(ymm_register || destination.size > 128 ? 32 : 16);
+    if (IsVectorRegister(destination)) {
+        const auto encoding = instruction.encoding;
+        const bool vector_encoding = encoding == X86_INSTRUCTION_ENCODING_VEX ||
+                                     encoding == X86_INSTRUCTION_ENCODING_EVEX ||
+                                     encoding == X86_INSTRUCTION_ENCODING_MVEX ||
+                                     encoding == X86_INSTRUCTION_ENCODING_XOP;
+        return VectorWritePlan{
+            .destination = VectorDestinationKind::RegisterFile,
+            .payload_bytes = payload_bytes,
+            .clear_register_tail = payload_bytes < 32 && vector_encoding,
+        };
+    }
+    if (destination.type == X86_OPERAND_TYPE_MEMORY) {
+        return VectorWritePlan{
+            .destination = VectorDestinationKind::GuestMemory,
+            .payload_bytes = payload_bytes,
+        };
+    }
+    return std::nullopt;
 }
 
 }

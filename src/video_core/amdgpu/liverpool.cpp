@@ -1491,14 +1491,56 @@ u64 Liverpool::ArmGpuCompletionTickForExecutor() {
     return current_tick > 1 ? current_tick - 1 : 0;
 }
 
+void Liverpool::QueueGpuCompletionForExecutor(
+    const u64 gpu_tick, Common::UniqueFunction<void>&& completion) {
+    if (gpu_tick == 0) {
+        completion();
+        return;
+    }
+    if (executor_completion_batch_tick != 0 &&
+        executor_completion_batch_tick != gpu_tick) {
+        PublishGpuCompletionBatchForExecutor();
+    }
+    executor_completion_batch_tick = gpu_tick;
+    executor_completion_batch.emplace_back(std::move(completion));
+}
+
+void Liverpool::PublishGpuCompletionBatchForExecutor() {
+    if (executor_completion_batch.empty() || rasterizer == nullptr) {
+        return;
+    }
+    const u64 gpu_tick = executor_completion_batch_tick;
+    auto completions = std::move(executor_completion_batch);
+    executor_completion_batch.clear();
+    executor_completion_batch_tick = 0;
+    rasterizer->GetScheduler().DeferPriorityOperationAt(
+        gpu_tick, [completions = std::move(completions)]() mutable {
+            for (auto& completion : completions) {
+                completion();
+            }
+        });
+}
+
+void Liverpool::OrderGpuWorkAfterCompletionForExecutor(const u64 gpu_tick) {
+    if (gpu_tick == 0 || rasterizer == nullptr || IsRendererTerminal()) {
+        return;
+    }
+    rasterizer->CompletionWaitBarrier();
+}
+
 void Liverpool::FlushGpuCompletionBatchForExecutor(bool force, bool synchronization_wait) {
     if (rasterizer == nullptr || (!force && !executor_completion_flush_pending)) {
+        return;
+    }
+    PublishGpuCompletionBatchForExecutor();
+    auto& scheduler = rasterizer->GetScheduler();
+    if (!scheduler.HasPendingWork()) {
+        executor_completion_flush_pending = false;
         return;
     }
     if (synchronization_wait && executor_completion_flush_pending) {
         ++executor_metrics_wait_flushes;
     }
-    auto& scheduler = rasterizer->GetScheduler();
     if (synchronization_wait && scheduler.HasPendingWork()) {
         const u64 publication_tick = scheduler.CurrentTick();
         scheduler.DeferPriorityOperationAt(
@@ -2010,6 +2052,11 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
                 }
                 if (remaining_submits == 0) {
+#ifdef __ANDROID__
+                    if (!submit_done) {
+                        FlushGpuCompletionBatchForExecutor(false, false);
+                    }
+#endif
                     std::scoped_lock submit_lock{submit_mutex};
                     submit_cv.notify_all();
                 }
@@ -2026,14 +2073,17 @@ void Liverpool::Process(std::stop_token stoken) {
 #endif
             VideoCore::EndCapture();
             if (rasterizer && !IsRendererTerminal()) {
+#ifdef __ANDROID__
+                PublishGpuCompletionBatchForExecutor();
+#endif
                 rasterizer->OnSubmit();
 #ifdef __ANDROID__
+                FlushGpuCompletionBatchForExecutor(true, false);
 #endif
 #ifdef __ANDROID__
                 const bool bounded_pipeline = ExecutorBoundedRasterizerPipeline();
                 auto& scheduler = rasterizer->GetScheduler();
 #endif
-                FlushGpuCompletionBatchForExecutor(true, false);
 #ifdef __ANDROID__
                 if (bounded_pipeline) {
                     const u64 current_tick = scheduler.CurrentTick();
@@ -3303,8 +3353,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 state, Pm4Engine::Graphics,
                                 reinterpret_cast<VAddr>(event_eos->Address()),
                                 event_eos->DataDWord(), sizeof(u32), completion_tick);
-                            rasterizer->GetScheduler().DeferPriorityOperationAt(
-                                completion_tick, std::move(signal_eos));
+                            QueueGpuCompletionForExecutor(completion_tick,
+                                                         std::move(signal_eos));
                         } else {
                             signal_eos();
                         }
@@ -3393,8 +3443,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                 reinterpret_cast<VAddr>(event_eop->Address<u32>()),
                                 event_eop->DataQWord(), sizeof(u64), completion_tick);
                         }
-                        rasterizer->GetScheduler().DeferPriorityOperationAt(
-                            completion_tick, std::move(signal_eop));
+                        QueueGpuCompletionForExecutor(completion_tick,
+                                                     std::move(signal_eop));
                     } else {
                         signal_eop();
                     }
@@ -3694,7 +3744,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const u64 dependency_tick = ConsumeCompletionWaitForExecutor(
                         state, Pm4Engine::Graphics, *wait_reg_mem);
                     if (dependency_tick != 0) {
-                        rasterizer->CompletionWaitBarrier();
+                        OrderGpuWorkAfterCompletionForExecutor(dependency_tick);
                         ++executor_logical_wait_count;
                         break;
                     }
@@ -4516,7 +4566,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                     const u64 dependency_tick = ConsumeCompletionWaitForExecutor(
                         state, Pm4Engine::Compute, *wait_reg_mem);
                     if (dependency_tick != 0) {
-                        rasterizer->CompletionWaitBarrier();
+                        OrderGpuWorkAfterCompletionForExecutor(dependency_tick);
                         ++executor_logical_wait_count;
                         break;
                     }
@@ -4602,8 +4652,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                                            packet.num_dw * sizeof(u32), false, true);
                     const u64 completion_tick = ArmGpuCompletionTickForExecutor();
                     if (completion_tick != 0) {
-                        rasterizer->GetScheduler().DeferPriorityOperationAt(
-                            completion_tick, signal_irq);
+                        QueueGpuCompletionForExecutor(completion_tick, signal_irq);
                     } else {
                         signal_irq();
                     }
@@ -4665,8 +4714,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid,
                                 state, Pm4Engine::Compute, packet.Address<VAddr>(),
                                 packet.DataQWord(), sizeof(u64), completion_tick);
                         }
-                        rasterizer->GetScheduler().DeferPriorityOperationAt(
-                            completion_tick, std::move(complete_release));
+                        QueueGpuCompletionForExecutor(completion_tick,
+                                                     std::move(complete_release));
                     } else {
                         complete_release();
                     }

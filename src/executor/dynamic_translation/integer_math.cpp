@@ -4,6 +4,8 @@
 #include "executor/dynamic_translation/integer_math.h"
 
 #include "common/x86_decoder.h"
+
+#include <bit>
 #include "executor/dynamic_translation/machine_state.h"
 
 namespace Lsx4::Translation {
@@ -148,6 +150,40 @@ std::optional<IntegerMathResult> EvaluateBitMovement(
         flags |= overflow ? OverflowFlag : 0;
     }
     return IntegerMathResult{result, flags, ArithmeticFlagMask, true};
+}
+
+}
+
+namespace Lsx4::Translation {
+
+std::uint64_t ReverseByteOrder(const std::uint64_t value,
+                               const std::uint32_t byte_width) noexcept {
+    switch (byte_width) {
+    case sizeof(std::uint16_t):
+        return std::byteswap(static_cast<std::uint16_t>(value));
+    case sizeof(std::uint32_t):
+        return std::byteswap(static_cast<std::uint32_t>(value));
+    case sizeof(std::uint64_t):
+        return std::byteswap(value);
+    default:
+        return value;
+    }
+}
+
+std::uint64_t MergeLowRegisterBits(const std::uint64_t previous,
+                                   const std::uint64_t replacement,
+                                   const std::uint32_t width) noexcept {
+    if (width >= 64) {
+        return replacement;
+    }
+    if (width >= 32) {
+        return static_cast<std::uint32_t>(replacement);
+    }
+    if (width == 0) {
+        return previous;
+    }
+    const std::uint64_t low_mask = (std::uint64_t{1} << width) - 1;
+    return (previous & ~low_mask) | (replacement & low_mask);
 }
 
 }

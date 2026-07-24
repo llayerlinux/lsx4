@@ -51,7 +51,12 @@ constexpr std::uint32_t kKnownNativeFlags =
     kJitNativeFlagDirectLseXchgV12 |
     kJitNativeFlagSharedChainAbiV13 |
     kJitNativeFlagScalarLogicDirectV14 |
-    kJitNativeFlagVpslldImmDirectV15;
+    kJitNativeFlagVpslldImmDirectV15 |
+    kJitNativeFlagInsertPsDirectV16 |
+    kJitNativeFlagInsertPsDirectV17 |
+    kJitNativeFlagDirectRetV18 |
+    kJitNativeFlagHotStateDirectV19 |
+    kJitNativeFlagHotAtomicPermuteV20;
 constexpr std::uint32_t kAarch64PointerMaterializationBytes = 4 * sizeof(std::uint32_t);
 
 constexpr std::uint16_t kBlockFlagCanJitInitial = 1u << 0;
@@ -664,11 +669,11 @@ void WriteNativeRelocation(ByteWriter& writer,
         break;
     case kOperandKindRegister: {
         std::uint32_t value = 0;
-        if (!reader.U32(value)) {
+        if (!reader.U32(value) || value > kRegisterCodeLimit) {
             error = "truncated register operand";
             return false;
         }
-        operand.reg.value = value;
+        operand.reg.value = static_cast<LsxRegisterCode>(value);
         break;
     }
     case kOperandKindMemory: {
@@ -684,10 +689,16 @@ void WriteNativeRelocation(ByteWriter& writer,
             error = "truncated memory operand";
             return false;
         }
-        operand.mem.type = memory_type;
-        operand.mem.segment = segment;
-        operand.mem.base = base;
-        operand.mem.index = index;
+        if (memory_type > kMemoryOperandKindLimit ||
+            segment > kRegisterCodeLimit || base > kRegisterCodeLimit ||
+            index > kRegisterCodeLimit) {
+            error = "invalid cached memory operand code";
+            return false;
+        }
+        operand.mem.type = static_cast<std::uint8_t>(memory_type);
+        operand.mem.segment = static_cast<LsxRegisterCode>(segment);
+        operand.mem.base = static_cast<LsxRegisterCode>(base);
+        operand.mem.index = static_cast<LsxRegisterCode>(index);
         operand.mem.disp.value = std::bit_cast<std::int64_t>(displacement);
         break;
     }

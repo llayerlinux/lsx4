@@ -96,6 +96,37 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     }
 
     const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
+#ifdef __ANDROID__
+    const auto adaptive_threshold = [device_local_memory](
+                                        const s64 numerator,
+                                        const s64 denominator,
+                                        const s64 floor,
+                                        const s64 ceiling) {
+        const s64 proportional = device_local_memory * numerator / denominator;
+        return static_cast<u64>(
+            std::min(device_local_memory, std::clamp(proportional, floor, ceiling)));
+    };
+    trigger_gc_memory = adaptive_threshold(9, 20, 768_MB, 1_GB + 512_MB);
+    pressure_gc_memory = std::min<u64>(
+        device_local_memory,
+        std::max<u64>(
+            trigger_gc_memory + 256_MB,
+            adaptive_threshold(3, 5, 1_GB, 2_GB + 256_MB)));
+    critical_gc_memory = std::min<u64>(
+        device_local_memory,
+        std::max<u64>(
+            pressure_gc_memory + 256_MB,
+            adaptive_threshold(3, 4, 1_GB + 512_MB, 3_GB)));
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4Native",
+        "[EXECUTOR_TEXTURE_GC_POLICY] budgetMiB=%lld triggerMiB=%llu pressureMiB=%llu "
+        "criticalMiB=%llu",
+        static_cast<long long>(device_local_memory / 1_MB),
+        static_cast<unsigned long long>(trigger_gc_memory / 1_MB),
+        static_cast<unsigned long long>(pressure_gc_memory / 1_MB),
+        static_cast<unsigned long long>(critical_gc_memory / 1_MB));
+    return;
+#endif
     const s64 min_spacing_expected = device_local_memory - 1_GB;
     const s64 min_spacing_critical = device_local_memory - 512_MB;
     const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
@@ -2138,15 +2169,19 @@ void TextureCache::GarbageCollectImages(const std::optional<size_t> sampled_devi
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
+#ifdef __ANDROID__
+        ticks_to_destroy = aggresive ? 16 : pressured ? 32 : 64;
+        num_deletions = aggresive ? 48 : pressured ? 24 : 8;
+#else
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
-        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
+#endif
+        ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
     };
     const auto clean_up = [&](ImageId image_id) {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
@@ -2159,6 +2194,7 @@ void TextureCache::GarbageCollectImages(const std::optional<size_t> sampled_devi
         if (download) {
             DownloadImageMemory(image_id);
         }
+        --num_deletions;
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {

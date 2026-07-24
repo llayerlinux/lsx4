@@ -23,6 +23,7 @@
         </activity>
         <activity
             android:name="app.lsx4.android.GameActivity"
+            android:enableOnBackInvokedCallback="true"
             android:exported="false"
             android:launchMode="singleTask"
             android:process=":game"

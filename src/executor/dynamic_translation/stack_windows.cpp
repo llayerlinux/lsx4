@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "executor/dynamic_translation/stack_windows.h"
+#include "executor/dynamic_translation/process_memory.h"
 
-#include <array>
-#include <atomic>
 #include <cstddef>
 #include <new>
 
@@ -12,7 +11,7 @@
 #include <sys/mman.h>
 #endif
 
-extern "C" void executor_lsx4_android_register_guest_stack_range(
+extern "C" void executor_lsx4_android_note_guest_stack_window(
     const void* base, std::uint64_t size, const char* label);
 
 namespace Lsx4::Translation {
@@ -31,38 +30,23 @@ thread_local ThreadStackPool pool{};
 
 std::byte* AllocatePool() noexcept {
 #if defined(__ANDROID__)
-    static std::atomic<std::uint32_t> candidate{0};
-    constexpr std::array<std::uintptr_t, 6> bases{
-        0x58000000u, 0x54000000u, 0x50000000u,
-        0x4c000000u, 0x48000000u, 0x44000000u};
-    for (std::size_t attempt = 0; attempt < bases.size(); ++attempt) {
-        const std::uintptr_t base =
-            bases[candidate.fetch_add(1, std::memory_order_relaxed) % bases.size()];
-        void* const mapping = mmap(reinterpret_cast<void*>(base), PoolBytes,
-                                   PROT_READ | PROT_WRITE,
-                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
-                                   -1, 0);
-        if (mapping == reinterpret_cast<void*>(base)) {
-            executor_lsx4_android_register_guest_stack_range(mapping, PoolBytes,
-                                                              "translation_stack_pool");
-            return static_cast<std::byte*>(mapping);
-        }
-        if (mapping != MAP_FAILED) {
-            munmap(mapping, PoolBytes);
-        }
+    if (void* const mapping = MapProcessMemoryBelow4GiB(PoolBytes)) {
+        executor_lsx4_android_note_guest_stack_window(mapping, PoolBytes,
+                                                       "translation_stack_pool");
+        return static_cast<std::byte*>(mapping);
     }
     void* const mapping = mmap(nullptr, PoolBytes, PROT_READ | PROT_WRITE,
                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mapping != MAP_FAILED) {
-        executor_lsx4_android_register_guest_stack_range(mapping, PoolBytes,
-                                                          "translation_stack_pool");
+        executor_lsx4_android_note_guest_stack_window(mapping, PoolBytes,
+                                                       "translation_stack_pool");
         return static_cast<std::byte*>(mapping);
     }
 #endif
     auto* const allocation = new (std::nothrow) std::byte[PoolBytes];
     if (allocation != nullptr) {
-        executor_lsx4_android_register_guest_stack_range(allocation, PoolBytes,
-                                                          "translation_stack_pool");
+        executor_lsx4_android_note_guest_stack_window(allocation, PoolBytes,
+                                                       "translation_stack_pool");
     }
     return allocation;
 }

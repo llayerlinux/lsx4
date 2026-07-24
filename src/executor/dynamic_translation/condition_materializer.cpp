@@ -4,6 +4,7 @@
 #include "executor/dynamic_translation/condition_materializer.h"
 
 #include <cstdint>
+#include <array>
 #include <optional>
 
 namespace Executor::Jit::NativeCondition {
@@ -92,6 +93,100 @@ bool Materialize(Xbyak_aarch64::CodeGenerator& code, const X86Mnemonic mnemonic,
         code.eor(result, result, 1);
     }
     return true;
+}
+
+bool Evaluate(const std::uint64_t flags, const X86Mnemonic mnemonic) noexcept {
+    const auto recipe = SelectRecipe(mnemonic);
+    if (!recipe) {
+        return false;
+    }
+    const auto bit = [flags](const std::uint8_t position) {
+        return ((flags >> position) & 1u) != 0;
+    };
+    const bool first = bit(recipe->first_bit);
+    const bool second = bit(recipe->second_bit);
+    bool result = first;
+    switch (recipe->relation) {
+    case Relation::Flag:
+        break;
+    case Relation::EitherFlag:
+        result = first || second;
+        break;
+    case Relation::DifferentFlags:
+        result = first != second;
+        break;
+    case Relation::DifferentOrFlag:
+        result = first != second || bit(recipe->third_bit);
+        break;
+    }
+    return result != recipe->invert;
+}
+
+bool EmitGuestBranchReturn(Xbyak_aarch64::CodeGenerator& code,
+                           const X86Mnemonic mnemonic,
+                           const std::uint32_t flags_state_offset,
+                           const std::uint64_t fallthrough,
+                           const std::uint64_t taken) noexcept {
+    code.ldr(code.x9, Xbyak_aarch64::ptr(code.x0, flags_state_offset));
+    if (!Materialize(code, mnemonic, code.x9, code.x10, code.x11, code.x12)) {
+        return false;
+    }
+    code.mov(code.x11, fallthrough);
+    code.mov(code.x12, taken);
+    code.cmp(code.x10, 0);
+    code.csel(code.x0, code.x12, code.x11, Xbyak_aarch64::NE);
+    code.ret();
+    return true;
+}
+
+void EmitGuestReturn(Xbyak_aarch64::CodeGenerator& code,
+                     const std::uint32_t stack_state_offset,
+                     const std::uint32_t stack_adjustment) noexcept {
+    code.ldr(code.x8, Xbyak_aarch64::ptr(code.x0, stack_state_offset));
+    code.ldr(code.x9, Xbyak_aarch64::ptr(code.x8));
+    code.add(code.x8, code.x8, stack_adjustment);
+    code.str(code.x8, Xbyak_aarch64::ptr(code.x0, stack_state_offset));
+    code.mov(code.x0, code.x9);
+    code.ret();
+}
+
+void EmitLinkedGuestTail(Xbyak_aarch64::CodeGenerator& code,
+                         Xbyak_aarch64::Label& linked,
+                         Xbyak_aarch64::Label& unresolved,
+                         const XReg& host_target,
+                         const std::uint64_t guest_target,
+                         const std::uint32_t guest_pc_offset) noexcept {
+    code.L(linked);
+    code.mov(code.x10, guest_target);
+    code.str(code.x10, Xbyak_aarch64::ptr(code.x0, guest_pc_offset));
+    code.br(host_target);
+    code.L(unresolved);
+    code.mov(code.x0, guest_target);
+    code.ret();
+}
+
+void EmitSharedFrameReturn(Xbyak_aarch64::CodeGenerator& code,
+                           const std::uint64_t result,
+                           const std::uint32_t frame_bytes) noexcept {
+    struct SavedPair {
+        std::uint8_t first;
+        std::uint8_t second;
+        std::uint8_t offset;
+    };
+    constexpr std::array saved{
+        SavedPair{27, 28, 80}, SavedPair{25, 26, 64},
+        SavedPair{23, 24, 48}, SavedPair{21, 22, 32},
+        SavedPair{19, 20, 16},
+    };
+    code.mov(code.x0, result);
+    for (const auto& pair : saved) {
+        code.ldp(XReg(pair.first), XReg(pair.second),
+                 Xbyak_aarch64::ptr(code.sp, pair.offset));
+    }
+    const auto caller_frame =
+        Xbyak_aarch64::post_ptr(code.sp, frame_bytes);
+    code.ldp(code.x29, code.x30, caller_frame);
+    code.ret();
 }
 
 }

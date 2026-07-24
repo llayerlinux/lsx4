@@ -43,5 +43,13 @@ void EmitDecrement64(Xbyak_aarch64::CodeGenerator& code, const XReg& input,
                      const XReg& result, const X86FlagLayout& layout);
 void EmitIncrement32(Xbyak_aarch64::CodeGenerator& code, const WReg& input,
                      const WReg& result, const X86FlagLayout& layout);
+void EmitBitIsolationStatus(Xbyak_aarch64::CodeGenerator& code,
+                            const XReg& input, const XReg& result,
+                            std::uint32_t width, bool carry_when_nonzero,
+                            const X86FlagLayout& layout);
+void EmitIndexedBitCarry(Xbyak_aarch64::CodeGenerator& code,
+                         const XReg& value, const XReg& bit_index,
+                         const XReg& state_base, std::uint32_t flags_offset,
+                         std::uint32_t carry_bit);
 
 }

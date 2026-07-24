@@ -3,6 +3,8 @@
 
 #include "executor/dynamic_translation/process_memory.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -10,6 +12,7 @@
 
 #if defined(__linux__)
 #include <link.h>
+#include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #endif
@@ -77,6 +80,12 @@ bool OverlapsOwningImage(const std::uint64_t address,
 
 }
 
+bool IsAddressRangeRepresentable(const std::uint64_t address,
+                                 const std::size_t byte_count) noexcept {
+    return byte_count == 0 ||
+           byte_count - 1 <= std::numeric_limits<std::uint64_t>::max() - address;
+}
+
 bool IsProcessImageMemory(const std::uint64_t address,
                           const std::size_t byte_count) noexcept {
     return AddressRangeExists(address, byte_count) &&
@@ -97,6 +106,46 @@ bool QueryProcessImageBounds(std::uint64_t& first,
 #endif
 }
 
+void* MapProcessMemoryBelow4GiB(const std::size_t byte_count) noexcept {
+#if defined(__linux__) && defined(MAP_FIXED_NOREPLACE)
+    if (byte_count == 0) {
+        return nullptr;
+    }
+    const long page_query = sysconf(_SC_PAGESIZE);
+    if (page_query <= 0) {
+        return nullptr;
+    }
+    const auto page_bytes = static_cast<std::uint64_t>(page_query);
+    if (byte_count > std::numeric_limits<std::uint64_t>::max() - (page_bytes - 1)) {
+        return nullptr;
+    }
+    const std::uint64_t mapping_bytes =
+        (static_cast<std::uint64_t>(byte_count) + page_bytes - 1) / page_bytes * page_bytes;
+    const std::uint64_t address_ceiling =
+        std::uint64_t{1} << std::numeric_limits<std::uint32_t>::digits;
+    if (mapping_bytes >= address_ceiling) {
+        return nullptr;
+    }
+
+    std::uint64_t candidate = (address_ceiling - mapping_bytes) / page_bytes * page_bytes;
+    while (candidate >= mapping_bytes) {
+        void* const requested = reinterpret_cast<void*>(candidate);
+        void* const mapping = mmap(requested, mapping_bytes, PROT_READ | PROT_WRITE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (mapping == requested) {
+            return mapping;
+        }
+        if (mapping != MAP_FAILED) {
+            munmap(mapping, mapping_bytes);
+        }
+        candidate -= mapping_bytes;
+    }
+#else
+    (void)byte_count;
+#endif
+    return nullptr;
+}
+
 bool ReadProcessGuestMemory(const std::uint64_t address, void* const destination,
                             const std::size_t byte_count) noexcept {
     if (destination == nullptr || !AddressRangeExists(address, byte_count)) {
@@ -113,6 +162,18 @@ bool ReadProcessGuestMemory(const std::uint64_t address, void* const destination
 #endif
 }
 
+bool ReadProcessGuestMemoryWithFaultDispatch(
+    const std::uint64_t address, void* const destination,
+    const std::size_t byte_count) {
+    if (destination == nullptr || !AddressRangeExists(address, byte_count)) {
+        return false;
+    }
+    const auto* const first = reinterpret_cast<const std::byte*>(address);
+    auto* const output = static_cast<std::byte*>(destination);
+    std::copy_n(first, byte_count, output);
+    return true;
+}
+
 bool WriteProcessGuestMemory(const std::uint64_t address, const void* const source,
                              const std::size_t byte_count) noexcept {
     if (source == nullptr || !AddressRangeExists(address, byte_count)) {
@@ -122,14 +183,27 @@ bool WriteProcessGuestMemory(const std::uint64_t address, const void* const sour
         return false;
     }
 #if defined(__linux__)
-    iovec local{reinterpret_cast<void*>(address), byte_count};
-    iovec remote{const_cast<void*>(source), byte_count};
-    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) ==
+    iovec local{const_cast<void*>(source), byte_count};
+    iovec remote{reinterpret_cast<void*>(address), byte_count};
+    return process_vm_writev(getpid(), &local, 1, &remote, 1, 0) ==
            static_cast<ssize_t>(byte_count);
 #else
     std::memcpy(reinterpret_cast<void*>(address), source, byte_count);
     return true;
 #endif
+}
+
+bool WriteProcessGuestMemoryWithFaultDispatch(
+    const std::uint64_t address, const void* const source,
+    const std::size_t byte_count) {
+    if (source == nullptr || !AddressRangeExists(address, byte_count) ||
+        IsProcessImageMemory(address, byte_count)) {
+        return false;
+    }
+    auto* const destination = reinterpret_cast<std::byte*>(address);
+    const auto* const first = static_cast<const std::byte*>(source);
+    std::copy_n(first, byte_count, destination);
+    return true;
 }
 
 bool ReadProcessGuestScalar(const std::uint64_t address,

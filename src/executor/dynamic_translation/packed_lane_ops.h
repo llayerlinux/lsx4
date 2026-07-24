@@ -8,13 +8,34 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 
 namespace Executor::Jit::VectorSemantic {
+
+std::uint64_t ReadUnsignedLane(const void* source, std::size_t lane_bytes) noexcept;
+std::int64_t ReadSignedLane(const void* source, std::size_t lane_bytes) noexcept;
+bool WriteLane(void* destination, std::uint64_t value,
+               std::size_t lane_bytes) noexcept;
+bool ComposeQwordPair(void* destination, const void* lower_source,
+                      std::size_t lower_offset, const void* upper_source,
+                      std::size_t upper_offset) noexcept;
+std::uint64_t CollectSignMask(const void* source, std::size_t lane_bytes,
+                              std::size_t total_width) noexcept;
+bool ShuffleBytesByMask(void* destination, const void* source, const void* mask,
+                        std::size_t total_width) noexcept;
 
 struct PackedBitTestResult {
     bool intersection_is_zero{};
     bool masked_complement_is_zero{};
 };
+
+struct MaskedLaneSelection {
+    std::array<std::uint8_t, 32> byte_offsets{};
+    std::uint8_t count{};
+};
+
+MaskedLaneSelection SelectMaskedLanes(const void* mask, std::size_t lane_bytes,
+                                      std::size_t total_width) noexcept;
 
 enum class PackedShiftKind : std::uint8_t {
     LogicalLeft,
@@ -38,6 +59,10 @@ bool DuplicateLowQwordPerLane(void* destination, const void* source,
 bool AddOrSubtractPacked(void* destination, const void* left, const void* right,
                          std::size_t element_width, std::size_t total_width,
                          bool subtract) noexcept;
+bool AddOrSubtractSaturating(void* destination, const void* left,
+                             const void* right, std::size_t element_width,
+                             std::size_t total_width, bool subtract,
+                             bool signed_elements) noexcept;
 bool ReplicateElement(void* destination, const void* element,
                       std::size_t element_width,
                       std::size_t total_width) noexcept;
@@ -51,6 +76,13 @@ bool CompareIntegerElements(void* destination, const void* left,
                             const void* right, std::size_t element_width,
                             std::size_t total_width,
                             bool signed_greater_than) noexcept;
+bool SelectIntegerExtrema(void* destination, const void* left, const void* right,
+                          std::size_t element_width, std::size_t total_width,
+                          bool signed_comparison, bool select_maximum) noexcept;
+bool ExtendIntegerElements(void* destination, const void* source,
+                           std::size_t source_element_width,
+                           std::size_t destination_element_width,
+                           std::size_t total_width, bool sign_extend) noexcept;
 bool InterleaveElementHalves(void* destination, const void* left,
                              const void* right, std::size_t element_width,
                              std::size_t total_width,
@@ -100,6 +132,13 @@ bool ApplyAlternatingFloatingElements(void* destination, const void* left,
 bool AbsoluteIntegerElements(void* destination, const void* source,
                              std::size_t element_width,
                              std::size_t total_width) noexcept;
+bool DotProductSinglePrecision(void* destination, const void* left,
+                               const void* right, std::uint8_t control,
+                               std::size_t total_width) noexcept;
+bool ConvertDwordFloatElements(void* destination, const void* source,
+                               bool integer_to_float, bool truncate,
+                               std::size_t total_width,
+                               std::uint32_t mxcsr) noexcept;
 bool ConvertFloatingElementWidth(void* destination, const void* source,
                                  std::size_t destination_width,
                                  std::size_t source_width,

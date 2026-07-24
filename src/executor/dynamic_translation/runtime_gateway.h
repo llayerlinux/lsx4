@@ -43,6 +43,13 @@ struct HleLeafOutcome {
     std::uint64_t accepted{};
 };
 
+struct HleBridgeRequest {
+    std::uint64_t function{};
+    std::array<std::uint64_t, 6> integer_arguments{};
+    std::array<std::uint64_t, 4> floating_arguments{};
+    std::uint64_t guest_stack{};
+};
+
 [[nodiscard]] std::uint64_t ExecuteGuest(std::uint64_t address,
                                          const EntryRequest& request);
 void ConfigureArtifactStore(const std::string& directory, const std::string& title,
@@ -50,5 +57,8 @@ void ConfigureArtifactStore(const std::string& directory, const std::string& tit
 [[nodiscard]] TranslationCounters ReadTranslationCounters() noexcept;
 [[nodiscard]] std::string DescribeTranslationRuntime();
 [[nodiscard]] std::string ExerciseTranslationRuntime();
+[[nodiscard]] std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request);
+[[nodiscard]] std::uintptr_t SelectiveLeafBridgeEntry() noexcept;
+[[nodiscard]] std::uintptr_t ResolvedLeafBridgeEntry() noexcept;
 
 }
