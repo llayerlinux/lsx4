@@ -34,6 +34,13 @@
     <string name="controls_opacity">Opacidad de los controles</string>
     <string name="cache_enable">Caché persistente de bloques compilados</string><string name="cache_hint">Reutiliza bloques compilados en lanzamientos posteriores.</string>
     <string name="debug_hud">HUD de depuración</string>
+    <string name="test_mode">Modo de prueba</string>
+    <string name="test_mode_hint">Activa los diagnósticos de depuración e instala el módulo de audio NGS2 incluido. Reinicia cualquier juego en ejecución después de cambiar esta opción.</string>
+    <string name="test_mode_module_unavailable">El APK de depuración no contiene libSceNgs2.sprx. Configura la ruta del módulo de shad4pc al compilar.</string>
+    <string name="test_mode_audio_ready">Modo de prueba activado. El módulo de audio NGS2 está listo.</string>
+    <string name="test_mode_user_audio_ready">Modo de prueba activado. Se usa el módulo de audio NGS2 instalado anteriormente por el usuario.</string>
+    <string name="test_mode_audio_failed">No se pudo activar el modo de prueba: %1$s</string>
+    <string name="test_mode_disabled">Modo de prueba desactivado. Se eliminó cualquier módulo de audio NGS2 gestionado por la compilación de depuración.</string>
     <string name="patch_select_game">Juego</string><string name="patch_no_games">No hay juegos con parches incluidos.</string>
     <string name="patch_dynamic_shadows">Sombras dinámicas</string><string name="patch_ssao">Oclusión ambiental (SSAO)</string><string name="patch_motion_blur">Desenfoque de movimiento</string><string name="patch_depth_of_field">Profundidad de campo</string>
     <string name="patch_enabled">Activado</string><string name="patch_disabled">Desactivado para rendimiento</string>

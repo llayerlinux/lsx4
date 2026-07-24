@@ -92,11 +92,11 @@ Contributions are welcome. Bug reports, compatibility results, performance trace
 | Path | Purpose |
 | --- | --- |
 | `android-app/` | LSX4 Android application |
-| `src/` | Native runtime, translation, system, and graphics sources |
+| `src/` | LSX4 client-owned native translation and Android runtime sources |
 | `externals/` | Native build dependencies |
 | `cmake/` | Android native build support |
 | `scripts/` | Android dependency build helpers |
-| `funnel-arm/` | ARM adaptation foundation linked from Funnel-arm |
+| `funnel-arm/` | Funnel ARM-adapted desktop/emulation layer used by the native target |
 | `assets/` | Project artwork |
 
 ## Android application
@@ -106,6 +106,18 @@ cd android-app
 ./gradlew assembleDebug
 ```
 
+The debug-only test mode can package a locally owned, decrypted NGS2 module from a
+shad4pc `sys_modules` directory:
+
+```sh
+./gradlew assembleDebug -Pshad4pcNgs2Module=/path/to/shad4pc/user/sys_modules/libSceNgs2.sprx
+```
+
+`SHAD4PC_NGS2_MODULE` provides the same path through the environment. The module is
+never included in release assets. LSX4 records the hash of a module installed by test
+mode and removes only that managed copy when test mode is disabled or a release build
+is launched; a module imported by the user is left untouched.
+
 ## Native runtime
 
 ```sh
@@ -114,3 +126,6 @@ powershell -File scripts/build-ffmpeg-android-pic.ps1
 cmake --preset android-arm64-release
 cmake --build --preset android-arm64-release
 ```
+
+The native ownership boundary and optimization strategy are documented in
+[`docs/arm_desktop_client_layer_architecture.md`](docs/arm_desktop_client_layer_architecture.md).

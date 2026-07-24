@@ -376,6 +376,7 @@ public class MainActivity extends Activity {
         Log.i(TAG, "EXECUTOR_UI_BUILD_MARKER=" + BUILD_MARKER);
         migrateLegacyPrivateHome();
         migrateLegacyPreferences();
+        TestModeManager.reconcileBuildScope(this);
 
         if (getClass() == MainActivity.class) {
             if (isLauncherHomeIntent(getIntent()) || !hasIntentAutomationExtras(getIntent())) {

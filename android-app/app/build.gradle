@@ -5,6 +5,45 @@ plugins {
 def resolvedApplicationId = providers.gradleProperty("applicationIdOverride")
         .orElse("app.lsx4.android")
 
+def generatedDebugTestAssets = layout.buildDirectory.dir("generated/lsx4DebugTestAssets")
+def configuredNgs2Module = providers.gradleProperty("shad4pcNgs2Module")
+        .orElse(providers.environmentVariable("SHAD4PC_NGS2_MODULE"))
+
+def prepareDebugTestAssets = tasks.register("prepareDebugTestAssets") {
+    outputs.dir(generatedDebugTestAssets)
+    outputs.upToDateWhen { false }
+    doLast {
+        File outputRoot = generatedDebugTestAssets.get().asFile
+        delete(outputRoot)
+
+        List<File> candidates = []
+        if (configuredNgs2Module.isPresent()) {
+            candidates.add(file(configuredNgs2Module.get()))
+        }
+        candidates.addAll([
+                rootProject.file("../../executor-shadps4-lab/user/sys_modules/libSceNgs2.sprx"),
+                rootProject.file("../../PS4Run/user/sys_modules/libSceNgs2.sprx"),
+                rootProject.file("../../refs/PS4Run/shadps4-pc-v016-reference/user/sys_modules/libSceNgs2.sprx")
+        ])
+
+        File source = candidates.find { it.isFile() }
+        if (source == null) {
+            logger.lifecycle("LSX4 debug test mode: libSceNgs2.sprx was not found in the " +
+                    "configured shad4pc sys_modules path; the debug APK will expose the " +
+                    "test-mode control but cannot install the optional module. Set " +
+                    "-Pshad4pcNgs2Module=<path> or SHAD4PC_NGS2_MODULE.")
+            return
+        }
+
+        copy {
+            from(source)
+            into(new File(outputRoot, "test_mode"))
+            rename { "libSceNgs2.sprx" }
+        }
+        logger.lifecycle("LSX4 debug test mode: packaged NGS2 module from ${source}")
+    }
+}
+
 android {
     namespace "app.lsx4.android"
     compileSdk 35
@@ -39,5 +78,17 @@ android {
         jniLibs {
             useLegacyPackaging true
         }
+    }
+
+    sourceSets {
+        debug {
+            assets.srcDir(generatedDebugTestAssets)
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name == "mergeDebugAssets") {
+        task.dependsOn(prepareDebugTestAssets)
     }
 }
