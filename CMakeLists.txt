@@ -16,6 +16,15 @@ if (NOT ANDROID)
     message(FATAL_ERROR "LSX4 native runtime must be configured with the Android NDK toolchain")
 endif()
 
+set(LSX4_ARM_DESKTOP_LAYER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/funnel-arm")
+set(LSX4_ARM_DESKTOP_LAYER_MANIFEST
+    "${LSX4_ARM_DESKTOP_LAYER_DIR}/cmake/lsx4_arm_desktop_layer.cmake")
+if(NOT EXISTS "${LSX4_ARM_DESKTOP_LAYER_MANIFEST}")
+    message(FATAL_ERROR
+        "Funnel ARM desktop layer is unavailable; initialize the funnel-arm submodule")
+endif()
+include("${LSX4_ARM_DESKTOP_LAYER_MANIFEST}")
+
 if(UNIX AND NOT APPLE)
     set(CMAKE_POSITION_INDEPENDENT_CODE TRUE)
 
@@ -183,7 +192,7 @@ set(EMULATOR_VERSION_PATCH "0")
 
 set(APP_VERSION "${EMULATOR_VERSION_MAJOR}.${EMULATOR_VERSION_MINOR}.${EMULATOR_VERSION_PATCH}")
 set(APP_IS_RELEASE true)
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/common/scm_rev.cpp.in" "${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp" @ONLY)
+configure_file("${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/scm_rev.cpp.in" "${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp" @ONLY)
 
 message("-- end git things, remote: ${GIT_REMOTE_NAME}, branch: ${GIT_BRANCH}, link: ${GIT_REMOTE_URL}")
 
@@ -224,11 +233,14 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "Ap
 endif()
 
 add_subdirectory(externals)
-include_directories(src)
+include_directories(BEFORE
+    "${LSX4_ARM_DESKTOP_SOURCE_DIR}"
+    "${LSX4_ARM_DESKTOP_LAYER_DIR}")
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
 set(LSX_ICED_MANIFEST
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/iced_x86_ffi/Cargo.toml")
+    "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/iced_x86_ffi/Cargo.toml")
 set(LSX_ICED_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargo")
 file(GLOB_RECURSE LSX_ICED_UPSTREAM_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/externals/iced-x86/src/rust/iced-x86/src/*.rs")
@@ -257,8 +269,8 @@ add_custom_command(
             --locked --release ${LSX_ICED_TARGET_ARGUMENTS}
     DEPENDS
         "${LSX_ICED_MANIFEST}"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/common/iced_x86_ffi/Cargo.lock"
-        "${CMAKE_CURRENT_SOURCE_DIR}/src/common/iced_x86_ffi/src/lib.rs"
+        "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/iced_x86_ffi/Cargo.lock"
+        "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/iced_x86_ffi/src/lib.rs"
         "${CMAKE_CURRENT_SOURCE_DIR}/externals/iced-x86/src/rust/iced-x86/Cargo.toml"
         ${LSX_ICED_UPSTREAM_SOURCES}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -1130,6 +1142,11 @@ set(EMULATOR src/emulator.cpp
              src/sdl_window.cpp
 )
 
+foreach(desktop_source_list IN ITEMS
+        IMGUI INPUT COMMON CORE SHADER_RECOMPILER VIDEO_CORE EMULATOR)
+    lsx4_use_arm_desktop_sources(${desktop_source_list})
+endforeach()
+
 set(LSX4_NATIVE_CORE_SOURCES
     ${AUDIO_CORE}
     ${IMGUI}
@@ -1140,6 +1157,7 @@ set(LSX4_NATIVE_CORE_SOURCES
     ${VIDEO_CORE}
     ${EMULATOR}
 )
+lsx4_assert_arm_desktop_ownership(${LSX4_NATIVE_CORE_SOURCES})
 
 add_library(lsx4_executor_android SHARED
     ${LSX4_NATIVE_CORE_SOURCES}
@@ -1248,7 +1266,9 @@ configure_file(
     @ONLY
 )
 target_include_directories(lsx4_executor_android PRIVATE
-    "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}")
+    "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}"
+    "${LSX4_ARM_DESKTOP_SOURCE_DIR}"
+    "${LSX4_ARM_DESKTOP_LAYER_DIR}")
 set_target_properties(lsx4_executor_android PROPERTIES
     OUTPUT_NAME lsx4_executor_android
 )
@@ -1305,7 +1325,7 @@ if(ANDROID)
 endif()
 
 target_compile_definitions(lsx4_executor_android PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
-target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
+target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${LSX4_ARM_DESKTOP_SOURCE_DIR}/imgui/imgui_config.h")
 
 if (ANDROID AND EXECUTOR_GPU_CORRUPTION_DIAG)
     set_source_files_properties(${VIDEO_CORE} ${SHADER_RECOMPILER}
@@ -1323,7 +1343,7 @@ add_compile_definitions(BOOST_ASIO_STANDALONE)
 target_include_directories(lsx4_executor_android PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(lsx4_executor_android PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/externals/tracy/public)
 
-set(HOST_SHADERS_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/src/video_core/host_shaders)
+set(HOST_SHADERS_INCLUDE ${LSX4_ARM_DESKTOP_SOURCE_DIR}/video_core/host_shaders)
 
 add_subdirectory(${HOST_SHADERS_INCLUDE})
 add_dependencies(lsx4_executor_android host_shaders)
@@ -1333,14 +1353,15 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/CMakeRC.cmake")
 cmrc_add_resource_library(embedded-resources
         ALIAS res::embedded
         NAMESPACE res
-        src/runtime_resources/trophy.wav
-        src/runtime_resources/bronze.png
-        src/runtime_resources/gold.png
-        src/runtime_resources/platinum.png
-        src/runtime_resources/silver.png)
+        WHENCE "${LSX4_ARM_DESKTOP_LAYER_DIR}"
+        ${LSX4_ARM_DESKTOP_SOURCE_DIR}/runtime_resources/trophy.wav
+        ${LSX4_ARM_DESKTOP_SOURCE_DIR}/runtime_resources/bronze.png
+        ${LSX4_ARM_DESKTOP_SOURCE_DIR}/runtime_resources/gold.png
+        ${LSX4_ARM_DESKTOP_SOURCE_DIR}/runtime_resources/platinum.png
+        ${LSX4_ARM_DESKTOP_SOURCE_DIR}/runtime_resources/silver.png)
 target_link_libraries(lsx4_executor_android PRIVATE res::embedded)
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/imgui/renderer)
+add_subdirectory(${LSX4_ARM_DESKTOP_SOURCE_DIR}/imgui/renderer)
 add_dependencies(lsx4_executor_android ImGui_Resources)
 target_include_directories(lsx4_executor_android PRIVATE ${IMGUI_RESOURCES_INCLUDE})
 

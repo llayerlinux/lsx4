@@ -53,6 +53,7 @@ public final class SettingsActivity extends Activity {
     public static final String K_OVERLAY = "gamepad_overlay";
     public static final String K_OVERLAY_OPACITY = "overlay_opacity";
     public static final String K_PERF_HUD = "perf_hud";
+    public static final String K_TEST_MODE = "test_mode";
     public static final String K_KEEP_AWAKE = "keep_awake";
     public static final String K_AUTO_LAUNCH_STORE = "auto_launch_store";
     public static final String K_PERSISTENT_JIT_CACHE = "persistent_jit_cache";
@@ -135,6 +136,7 @@ public final class SettingsActivity extends Activity {
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        TestModeManager.reconcileBuildScope(this);
         UiChrome.preparePortraitWindow(this);
         String screen = getIntent().getStringExtra(EXTRA_SCREEN);
         if (screen == null || screen.isEmpty()) {
@@ -429,6 +431,7 @@ public final class SettingsActivity extends Activity {
             Files.move(temporary.toPath(), destination.toPath(),
                     StandardCopyOption.REPLACE_EXISTING);
         }
+        TestModeManager.forgetManagedModule(this);
     }
 
     private String selectedFileName(Uri source) {
@@ -494,6 +497,67 @@ public final class SettingsActivity extends Activity {
 
     private void buildOther(LinearLayout root) {
         root.addView(preferenceCheck(R.string.debug_hud, K_PERF_HUD, false));
+        if (!TestModeManager.isDebugBuild(this)) {
+            return;
+        }
+
+        SharedPreferences preferences = prefs(this);
+        CheckBox testMode = check(getString(R.string.test_mode),
+                preferences.getBoolean(K_TEST_MODE, false));
+        testMode.setLayoutParams(cardMargins());
+        attachTestModeListener(testMode, preferences);
+        root.addView(testMode);
+
+        int hint = TestModeManager.hasBundledModule(this)
+                ? R.string.test_mode_hint
+                : R.string.test_mode_module_unavailable;
+        root.addView(hint(getString(hint)));
+    }
+
+    private void attachTestModeListener(CheckBox testMode, SharedPreferences preferences) {
+        testMode.setOnCheckedChangeListener((button, checked) -> {
+            testMode.setEnabled(false);
+            Thread worker = new Thread(() -> {
+                if (!checked) {
+                    TestModeManager.removeManagedModule(this);
+                    preferences.edit().putBoolean(K_TEST_MODE, false).apply();
+                    runOnUiThread(() -> {
+                        testMode.setEnabled(true);
+                        Toast.makeText(this, R.string.test_mode_disabled,
+                                Toast.LENGTH_LONG).show();
+                    });
+                    return;
+                }
+                try {
+                    TestModeManager.Activation result = TestModeManager.activate(this);
+                    preferences.edit()
+                            .putBoolean(K_TEST_MODE, true)
+                            .putBoolean(K_AUDIO, true)
+                            .apply();
+                    int message = result == TestModeManager.Activation.USER_MODULE_READY
+                            ? R.string.test_mode_user_audio_ready
+                            : R.string.test_mode_audio_ready;
+                    runOnUiThread(() -> {
+                        testMode.setEnabled(true);
+                        Toast.makeText(this, message, Toast.LENGTH_LONG).show();
+                    });
+                } catch (Exception error) {
+                    preferences.edit().putBoolean(K_TEST_MODE, false).apply();
+                    runOnUiThread(() -> {
+                        testMode.setOnCheckedChangeListener(null);
+                        testMode.setChecked(false);
+                        testMode.setEnabled(true);
+                        Toast.makeText(this, getString(R.string.test_mode_audio_failed,
+                                error.getMessage() == null
+                                        ? error.getClass().getSimpleName()
+                                        : error.getMessage()), Toast.LENGTH_LONG).show();
+                        attachTestModeListener(testMode, preferences);
+                    });
+                }
+            }, "lsx4-test-mode-audio");
+            worker.setDaemon(true);
+            worker.start();
+        });
     }
 
     private void addScreenHeader(LinearLayout root, String title) {
