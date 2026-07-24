@@ -39,8 +39,8 @@ The backup contains 813 files. Every copied file was SHA-256 compared with its s
 
 The include order is intentional:
 
-1. `funnel-arm/src` resolves includes such as `common/types.h`.
-2. `funnel-arm` resolves legacy includes such as `src/common/types.h`.
+1. `funnel-arm` resolves legacy includes such as `src/common/types.h`.
+2. `funnel-arm/src` resolves includes such as `common/types.h`.
 3. Client `src` resolves only `executor/...` headers.
 
 The verified generated build graph contains:
@@ -50,6 +50,31 @@ The verified generated build graph contains:
 - zero references to removed client desktop source paths.
 
 The iced-x86 Rust bridge is Funnel-owned, while the vendored iced-x86 dependency remains a root external shared by the final target. Embedded native resources and host-shader generation also read from Funnel paths.
+
+## Complete source-use audit
+
+The source tree and the final native link were audited separately. A file being present in the Funnel repository does not imply that the Android application compiles or executes it.
+
+| Funnel area | Files currently present | Objects linked into `liblsx4_executor_android.so` | Android use |
+| --- | ---: | ---: | --- |
+| `src/common` | 102 | 23 | Active shared runtime primitives |
+| `src/core` | 545 | 190 | Active PS4 loader, HLE, process, memory, audio, and kernel services |
+| `src/imgui` | 46 | 4 | Active native renderer subset; generated font resources are separate target inputs |
+| `src/input` | 6 | 3 | Active native input adaptation |
+| `src/shader_recompiler` | 107 | 62 | Active guest shader translation and SPIR-V generation |
+| `src/video_core` | 113 | 37 | Active AMDGPU, Vulkan, presentation, and cache implementation |
+| `src/emulator.*`, `src/sdl_window.*` | 4 | 2 | Active emulation entry and window/surface integration |
+| `src/runtime_resources` | 5 | 0 direct objects | Active through the embedded-resource library |
+| `src/dist` | 5 | 0 | Retained desktop packaging material; not linked on Android |
+| `src/resources` | 14 | 0 | Retained desktop resources; not linked on Android |
+| `src/shadnet` | 5 | 0 | Retained desktop network helper; not linked on Android |
+| `src/main.cpp` | 1 | 0 | Retained desktop entry point; not linked on Android |
+
+The final link has exactly 369 project object inputs: 321 from Funnel, 47 from `src/executor`, and one generated `scm_rev.cpp` object under the build directory. It has zero objects from a client-side desktop source tree. The apparently similar `externals/sdl3/src/core/...` paths are SDL implementation files, not a second LSX4/shad4pc emulation core.
+
+The root `externals` directory remains final-target dependency infrastructure (SDL, Vulkan headers, shader tooling, codecs, containers, and similar third-party libraries). It is intentionally not classified as Android client business logic or as a duplicate desktop/emulation implementation. Dependency ownership can be consolidated later, but moving vendored packages would not change the runtime layer boundary and would add submodule risk without a performance benefit.
+
+The pre-removal client snapshot contains 813 files in `D:\LProj\PetProj\backup-adapted-desktop-in-client`. Those files were overlaid into Funnel before deletion. The current Funnel copy differs from that backup only where integration required a path adjustment in `common/iced_x86_ffi/Cargo.toml`; the actual Rust source and dependency version are unchanged. The previously modified `shader_recompiler/ir/position.h` is byte-identical between the backup and Funnel, so the working-tree implementation was preserved rather than replaced by an older committed copy.
 
 ## Runtime data flow
 
@@ -80,9 +105,9 @@ The verified native library was:
 
 - file: `build/android-arm64-release/liblsx4_executor_android.so`;
 - size: 51,551,416 bytes;
-- SHA-256: `EFC72F02C2E2D93D51509183875238D133EEE5F8178BF27F0BD21F1C68605117`.
+- SHA-256: `E2A0DEB22C5C578A11228A41EC8F2328FF0B5596367B1C3E7F05F3309B1EFC9C`.
 
-The same hash was measured inside Vivo application storage at `files/runtime/liblsx4_executor_android.so`. Bloodborne created live game threads through the AArch64 JIT, accumulated persistent-cache hits, submitted GPU work, and returned frames without a fatal process or Java exception during both the pre-removal and post-removal checks.
+The same hash was measured inside Vivo application storage at `files/runtime/liblsx4_executor_android.so`. In the final audit launch, Bloodborne created live game threads through the AArch64 JIT, exceeded 237,000 persistent-cache hits, opened the AAudio output, submitted Vulkan work, and completed more than 192 frames without a fatal process or Java exception. The device reported `vivo V2546A` and an Adreno Vulkan implementation; Mali results were not used for acceptance.
 
 ## Optimization order
 
