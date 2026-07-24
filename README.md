@@ -59,7 +59,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/minit.jpg" alt="Minit running in LSX4"><br><sub><b>Minit</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/resogun.png" alt="Resogun running in LSX4"><br><sub><b>Resogun</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/the-binding-of-isaac-rebirth.jpg" alt="The Binding of Isaac: Rebirth running in LSX4"><br><sub><b>The Binding of Isaac: Rebirth</b></sub></td>
   </tr>
 </table>
 
@@ -81,6 +81,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Rain World | ✅ | |
 | Shovel Knight | ✅ | |
 | Sonic Mania | ✅ | |
+| The Binding of Isaac: Rebirth | ✅ | |
 | Undertale | ✅ | |
 
 ## Contributing
