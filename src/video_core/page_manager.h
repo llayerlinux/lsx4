@@ -14,6 +14,9 @@ class Rasterizer;
 
 namespace VideoCore {
 
+void BeginBulkGuestWrite(VAddr address, u64 size) noexcept;
+void EndBulkGuestWrite() noexcept;
+
 class PageManager {
     static constexpr size_t PAGE_BITS = TRACKER_PAGE_BITS;
     static constexpr size_t PAGE_BYTES = TRACKER_BYTES_PER_PAGE;
@@ -23,6 +26,11 @@ class PageManager {
 public:
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
     ~PageManager();
+
+    static void PrepareBulkGuestRead(VAddr address, u64 size);
+    static void PrepareBulkGuestWrite(VAddr address, u64 size);
+    static void EnterBulkGuestWrite(VAddr address, u64 size);
+    static void LeaveBulkGuestWrite(VAddr address, u64 size);
 
     void OnGpuMap(VAddr address, size_t size);
 

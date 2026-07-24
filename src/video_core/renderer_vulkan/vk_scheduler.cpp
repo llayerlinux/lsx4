@@ -1190,6 +1190,24 @@ void Scheduler::SubmitExecution(SubmitInfo& info, ExecutorSubmitKind kind,
     Check(current_cmdbuf.end());
 
     const vk::Semaphore timeline = master_semaphore.Handle();
+#ifdef __ANDROID__
+    if (signal_value > 1) {
+        const u64 preceding_signal = signal_value - 1;
+        bool merged_wait = false;
+        for (u32 index = 0; index < info.num_wait_semas; ++index) {
+            if (info.wait_semas[index] != timeline) {
+                continue;
+            }
+            info.wait_ticks[index] = std::max(info.wait_ticks[index], preceding_signal);
+            info.wait_stage_masks[index] |= vk::PipelineStageFlagBits::eAllCommands;
+            merged_wait = true;
+            break;
+        }
+        if (!merged_wait) {
+            info.AddWait(timeline, preceding_signal);
+        }
+    }
+#endif
     info.AddSignal(timeline, signal_value);
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {

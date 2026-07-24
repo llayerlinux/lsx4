@@ -1162,6 +1162,7 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/foundation_checks.cpp
     src/executor/dynamic_translation/floating_relation.cpp
     src/executor/dynamic_translation/guest_capability_profile.cpp
+    src/executor/dynamic_translation/guest_mapping_policy.cpp
     src/executor/dynamic_translation/hle_invocation_frame.cpp
     src/executor/dynamic_translation/instruction_diagnostics.cpp
     src/executor/dynamic_translation/integer_math.cpp
@@ -1187,58 +1188,56 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/vector_lowering_policy.cpp
     src/executor/dynamic_translation/packed_lane_ops.cpp
     src/executor/dynamic_translation/partial_move_plan.cpp
+    src/executor/dynamic_translation/partial_move_emitter.cpp
     src/executor/runtime_death_catcher.cpp
 )
 
+option(LSX4_FAST_TRANSLATION_ITERATION
+       "Compile the large translation core with reduced optimization for local iteration"
+       OFF)
+option(LSX4_TRANSLATION_THIN_LTO
+       "Allow cross-file inlining across the split dynamic-translation implementation"
+       ON)
 if(ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(LSX4_TRANSLATION_CORE_OPTIONS -mbranch-protection=bti -g0)
+    if(LSX4_FAST_TRANSLATION_ITERATION)
+        list(APPEND LSX4_TRANSLATION_CORE_OPTIONS -O1)
+    endif()
     set_source_files_properties(src/executor/dynamic_translation/retiring_execution_core.cpp PROPERTIES
-        COMPILE_OPTIONS "-mbranch-protection=bti")
+        COMPILE_OPTIONS "${LSX4_TRANSLATION_CORE_OPTIONS}")
+    if(LSX4_TRANSLATION_THIN_LTO AND
+       CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+        set(LSX4_TRANSLATION_LTO_SOURCES
+            src/executor/dynamic_translation/retiring_execution_core.cpp
+            src/executor/dynamic_translation/condition_materializer.cpp
+            src/executor/dynamic_translation/floating_relation.cpp
+            src/executor/dynamic_translation/guest_mapping_policy.cpp
+            src/executor/dynamic_translation/instruction_diagnostics.cpp
+            src/executor/dynamic_translation/integer_math.cpp
+            src/executor/dynamic_translation/native_status_emitter.cpp
+            src/executor/dynamic_translation/packed_lane_ops.cpp
+            src/executor/dynamic_translation/partial_move_emitter.cpp
+            src/executor/dynamic_translation/process_memory.cpp
+            src/executor/dynamic_translation/vector_lowering_policy.cpp)
+        set_property(SOURCE ${LSX4_TRANSLATION_LTO_SOURCES} APPEND PROPERTY
+            COMPILE_OPTIONS -flto=thin)
+        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/thinlto-cache")
+        target_link_options(lsx4_executor_android PRIVATE
+            -flto=thin
+            "LINKER:--thinlto-cache-dir=${CMAKE_CURRENT_BINARY_DIR}/thinlto-cache")
+    endif()
 endif()
 
-file(GLOB_RECURSE EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/*.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/*.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/externals/xbyak_aarch64/xbyak_aarch64/*.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_decoder.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_decoder.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_iced_mnemonic_names.inc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_iced_mnemonics.inc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_iced_register_names.inc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/x86_iced_registers.inc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/iced_x86_ffi/Cargo.lock"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/iced_x86_ffi/Cargo.toml"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/iced_x86_ffi/src/lib.rs"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/common/content_fingerprint.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/aerolib/stubs.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/core/memory.h"
-)
-list(APPEND EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS ${LSX_ICED_UPSTREAM_SOURCES})
-list(SORT EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    ${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS})
-string(TOUPPER "${CMAKE_BUILD_TYPE}" EXECUTOR_JIT_BUILD_TYPE_UPPER)
-set(EXECUTOR_JIT_NATIVE_CACHE_ABI_MATERIAL
-    "compiler=${CMAKE_CXX_COMPILER_ID}:${CMAKE_CXX_COMPILER_VERSION};"
-    "compilerPath=${CMAKE_CXX_COMPILER};system=${CMAKE_SYSTEM_NAME}:${CMAKE_SYSTEM_PROCESSOR};"
-    "android=${ANDROID_ABI}:${ANDROID_PLATFORM}:${CMAKE_ANDROID_NDK_VERSION};"
-    "build=${CMAKE_BUILD_TYPE};cxx=${CMAKE_CXX_STANDARD};"
-    "probe=${EXECUTOR_ANDROID_NATIVE_CORE_PROBE_NO_DESKTOP_MEDIA_USB}:"
-    "${EXECUTOR_ANDROID_NATIVE_CORE_PROBE_ENABLE_AVPLAYER};"
-    "flags=${CMAKE_CXX_FLAGS}:"
-    "${CMAKE_CXX_FLAGS_${EXECUTOR_JIT_BUILD_TYPE_UPPER}};")
-foreach(EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT
-        IN LISTS EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUTS)
-    file(SHA256 "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT}"
-         EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT_HASH)
-    file(RELATIVE_PATH EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT_NAME
-         "${CMAKE_CURRENT_SOURCE_DIR}" "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT}")
-    string(APPEND EXECUTOR_JIT_NATIVE_CACHE_ABI_MATERIAL
-           "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT_NAME}="
-           "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INPUT_HASH};")
-endforeach()
-string(SHA256 EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH
-       "${EXECUTOR_JIT_NATIVE_CACHE_ABI_MATERIAL}")
-string(SUBSTRING "${EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH}" 0 16
+set(LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH "4b739d10c6e58a21"
+    CACHE STRING "Explicit compatibility epoch for persisted AArch64 translations")
+string(LENGTH "${LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH}"
+       LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH_LENGTH)
+if(NOT LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH_LENGTH EQUAL 16 OR
+   LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH MATCHES "[^0-9a-fA-F]")
+    message(FATAL_ERROR
+        "LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH must contain exactly 16 hexadecimal digits")
+endif()
+string(TOLOWER "${LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH}"
        EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH_64)
 set(EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/generated/executor/dynamic_translation")
@@ -1263,6 +1262,9 @@ set_property(TARGET lsx4_executor_android APPEND PROPERTY
 
 if(CMAKE_STRIP AND CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
     add_custom_command(TARGET lsx4_executor_android POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy
+            "$<TARGET_FILE:lsx4_executor_android>"
+            "$<TARGET_FILE:lsx4_executor_android>.symbols"
         COMMAND "${CMAKE_STRIP}" --strip-unneeded "$<TARGET_FILE:lsx4_executor_android>"
         COMMENT "Stripping private symbols from liblsx4_executor_android.so"
         VERBATIM)

@@ -7,7 +7,7 @@
 #include "common/logging/log.h"
 
 
-void assert_fail_impl();
+void assert_fail_impl(const char* expression, const char* file, int line);
 [[noreturn]] void unreachable_impl();
 
 #ifdef _MSC_VER
@@ -20,7 +20,7 @@ void assert_fail_impl();
     ([&]() SHAD_NO_INLINE {                                                                        \
         if (!(_a_)) [[unlikely]] {                                                                 \
             LOG_CRITICAL(Debug, "Assertion Failed!");                                              \
-            assert_fail_impl();                                                                    \
+            assert_fail_impl(#_a_, __FILE__, __LINE__);                                             \
         }                                                                                          \
     }())
 
@@ -28,7 +28,7 @@ void assert_fail_impl();
     ([&]() SHAD_NO_INLINE {                                                                        \
         if (!(_a_)) [[unlikely]] {                                                                 \
             LOG_CRITICAL(Debug, "Assertion Failed!\n" __VA_ARGS__);                                \
-            assert_fail_impl();                                                                    \
+            assert_fail_impl(#_a_, __FILE__, __LINE__);                                             \
         }                                                                                          \
     }())
 

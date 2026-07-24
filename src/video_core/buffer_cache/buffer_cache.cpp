@@ -21,6 +21,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -48,24 +49,30 @@ std::atomic<u64> executor_buffer_download_count{0};
 std::atomic<u64> executor_buffer_empty_download_count{0};
 std::atomic<u64> executor_buffer_download_bytes{0};
 
-constexpr u64 ExecutorPreciseReadbackWindow = 1_MB;
-constexpr u64 ExecutorPreciseReadbackWaveWindow = 64_MB;
-constexpr u64 ExecutorPreciseReadbackWaveMaxBytes = 16_MB;
+constexpr u64 ExecutorPreciseReadbackWindow = TRACKER_BYTES_PER_PAGE;
+constexpr u64 ExecutorPreciseReadbackWaveMaxBytes = 4_MB;
 
 }
 #endif
 
 static constexpr size_t DataShareBufferSize = 64_KB;
+#ifdef __ANDROID__
+static constexpr size_t StagingBufferSize = 192_MB;
+static constexpr size_t DownloadBufferSize = 16_MB;
+static constexpr size_t UboStreamBufferSize = 32_MB;
+static constexpr size_t DeviceBufferSize = 64_MB;
+#else
 static constexpr size_t StagingBufferSize = 512_MB;
 static constexpr size_t DownloadBufferSize = 32_MB;
 static constexpr size_t UboStreamBufferSize = 64_MB;
 static constexpr size_t DeviceBufferSize = 128_MB;
+#endif
 
 BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          AmdGpu::Liverpool* liverpool_, TextureCache& texture_cache_,
                          PageManager& tracker)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
-      memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
+      page_manager{&tracker}, memory{Core::Memory::Instance()}, texture_cache{texture_cache_},
       fault_manager{instance, scheduler, *this, CACHING_PAGEBITS, CACHING_NUMPAGES},
       staging_buffer{instance, scheduler, MemoryUsage::Upload, StagingBufferSize},
       stream_buffer{instance, scheduler, MemoryUsage::Stream, UboStreamBufferSize},
@@ -97,6 +104,30 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     }
 
     const s64 device_local_memory = static_cast<s64>(instance.GetTotalMemoryBudget());
+#ifdef __ANDROID__
+    const auto adaptive_threshold = [device_local_memory](
+                                        const s64 numerator,
+                                        const s64 denominator,
+                                        const s64 floor,
+                                        const s64 ceiling) {
+        const s64 proportional = device_local_memory * numerator / denominator;
+        return static_cast<u64>(
+            std::min(device_local_memory, std::clamp(proportional, floor, ceiling)));
+    };
+    trigger_gc_memory = adaptive_threshold(9, 20, 768_MB, 1_GB + 512_MB);
+    critical_gc_memory = std::min<u64>(
+        device_local_memory,
+        std::max<u64>(
+            trigger_gc_memory + 256_MB,
+            adaptive_threshold(3, 4, 1_GB + 256_MB, 2_GB + 512_MB)));
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4Native",
+        "[EXECUTOR_BUFFER_GC_POLICY] budgetMiB=%lld triggerMiB=%llu criticalMiB=%llu",
+        static_cast<long long>(device_local_memory / 1_MB),
+        static_cast<unsigned long long>(trigger_gc_memory / 1_MB),
+        static_cast<unsigned long long>(critical_gc_memory / 1_MB));
+    return;
+#endif
     const s64 min_spacing_expected = device_local_memory - 1_GB;
     const s64 min_spacing_critical = device_local_memory - 512_MB;
     const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
@@ -113,6 +144,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 BufferCache::~BufferCache() = default;
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
+#ifdef __ANDROID__
+    WaitForPendingReadback(device_addr, size);
+#endif
     if (!IsRegionRegistered(device_addr, size)) {
         return;
     }
@@ -122,6 +156,9 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
+#ifdef __ANDROID__
+    WaitForPendingReadback(device_addr, size);
+#endif
 #ifdef __ANDROID__
     if (ExecutorBufferReadbackContractTraceEnabled()) {
         const u64 ordinal =
@@ -174,6 +211,203 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
 }
 
 #ifdef __ANDROID__
+void BufferCache::WaitForPendingReadback(VAddr device_addr, u64 size) {
+    if (size == 0 || device_addr > std::numeric_limits<VAddr>::max() - size) {
+        return;
+    }
+    u64 dependency_tick = 0;
+    {
+        std::scoped_lock lock{pending_readback_mutex};
+        const VAddr request_end = device_addr + size;
+        for (const PendingReadbackRange& pending : pending_readback_ranges) {
+            if (pending.begin > std::numeric_limits<VAddr>::max() - pending.size) {
+                continue;
+            }
+            const VAddr pending_end = pending.begin + pending.size;
+            if (device_addr < pending_end && pending.begin < request_end) {
+                dependency_tick = std::max(dependency_tick, pending.tick);
+            }
+        }
+    }
+    if (dependency_tick == 0) {
+        return;
+    }
+    liverpool->SendCommand<true>([this, dependency_tick] {
+        scheduler.Wait(dependency_tick);
+        scheduler.WaitRetirement(dependency_tick);
+    });
+}
+
+void BufferCache::PrefetchReadbackWindows() {
+    if (recent_readback_window_count == 0 ||
+        Config::getReadbacksMode() != Config::GpuReadbacksMode::Precise) {
+        return;
+    }
+
+    struct PrefetchCopy {
+        vk::Buffer source{};
+        VAddr guest_addr = 0;
+        u64 size = 0;
+        u64 source_offset = 0;
+        u64 download_offset = 0;
+    };
+
+    boost::container::small_vector<PrefetchCopy, 32> copies;
+    RangeSet scheduled_ranges;
+    u64 total_size_bytes = 0;
+    constexpr u64 CopyAlignment = 64;
+    constexpr u64 PrefetchBudget = 4_MB;
+
+    const auto range_is_pending = [&](const VAddr begin, const u64 size) {
+        std::scoped_lock lock{pending_readback_mutex};
+        const VAddr end = begin + size;
+        return std::ranges::any_of(pending_readback_ranges, [&](const auto& pending) {
+            return pending.begin <= std::numeric_limits<VAddr>::max() - pending.size &&
+                   begin < pending.begin + pending.size && pending.begin < end;
+        });
+    };
+
+    const auto queue_buffer_ranges = [&](Buffer& buffer, const VAddr range_addr,
+                                         const u64 range_size) {
+        if (range_size == 0 || total_size_bytes >= PrefetchBudget) {
+            return;
+        }
+        memory_tracker->ForEachDownloadRange<false>(
+            range_addr, range_size, [&](const u64 download_addr, const u64 download_size) {
+                gpu_modified_ranges.ForEachInRange(
+                    download_addr, download_size, [&](const VAddr start, const VAddr end) {
+                        if (start >= end || scheduled_ranges.Intersects(start, end - start) ||
+                            !buffer.IsInBounds(start, end - start) ||
+                            total_size_bytes >= PrefetchBudget ||
+                            range_is_pending(start, end - start)) {
+                            return;
+                        }
+                        const u64 copy_size =
+                            std::min<u64>(end - start, PrefetchBudget - total_size_bytes);
+                        if (copy_size == 0) {
+                            return;
+                        }
+                        copies.push_back(PrefetchCopy{
+                            .source = buffer.Handle(),
+                            .guest_addr = start,
+                            .size = copy_size,
+                            .source_offset = buffer.Offset(start),
+                            .download_offset = total_size_bytes,
+                        });
+                        scheduled_ranges.Add(start, copy_size);
+                        total_size_bytes =
+                            Common::AlignUp(total_size_bytes + copy_size, CopyAlignment);
+                    });
+            });
+    };
+
+    for (u32 index = 0;
+         index < recent_readback_window_count && total_size_bytes < PrefetchBudget; ++index) {
+        const RecentReadbackWindow& window = recent_readback_windows[index];
+        buffer_ranges.ForEachInRange(
+            window.begin, window.size,
+            [&](const VAddr range_begin, const VAddr range_end, const BufferId id) {
+                if (total_size_bytes >= PrefetchBudget || IsBufferInvalid(id)) {
+                    return;
+                }
+                Buffer& buffer = slot_buffers[id];
+                const VAddr begin = std::max(range_begin, buffer.CpuAddr());
+                const VAddr end =
+                    std::min<VAddr>(range_end, buffer.CpuAddr() + buffer.SizeBytes());
+                if (begin < end) {
+                    queue_buffer_ranges(buffer, begin, end - begin);
+                }
+            });
+    }
+    if (copies.empty()) {
+        return;
+    }
+
+    const auto [download, base_offset] =
+        download_buffer.Map(total_size_bytes, CopyAlignment, false);
+    if (download == nullptr) {
+        return;
+    }
+    download_buffer.Commit();
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    for (const PrefetchCopy& copy : copies) {
+        cmdbuf.copyBuffer(copy.source, download_buffer.Handle(), vk::BufferCopy{
+            .srcOffset = copy.source_offset,
+            .dstOffset = base_offset + copy.download_offset,
+            .size = copy.size,
+        });
+    }
+
+    std::vector<PendingReadbackRange> tracked_ranges;
+    tracked_ranges.reserve(copies.size());
+    const u64 completion_tick = scheduler.CurrentTick();
+    scheduled_ranges.ForEach([&](const VAddr begin, const VAddr end) {
+        const u64 size = end - begin;
+        page_manager->UpdatePageWatchers<true>(begin, size);
+        page_manager->TrackPendingCompletionRead(begin, size);
+        tracked_ranges.push_back(PendingReadbackRange{begin, size, completion_tick});
+    });
+    {
+        std::scoped_lock lock{pending_readback_mutex};
+        pending_readback_ranges.insert(pending_readback_ranges.end(), tracked_ranges.begin(),
+                                       tracked_ranges.end());
+    }
+    for (const PendingReadbackRange& range : tracked_ranges) {
+        memory_tracker->UnmarkRegionAsGpuModified(range.begin, range.size);
+        gpu_modified_ranges.Subtract(range.begin, range.size);
+    }
+
+    static u64 prefetch_batches = 0;
+    static u64 prefetch_bytes = 0;
+    prefetch_bytes += total_size_bytes;
+    if (((++prefetch_batches) & 255u) == 0u) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4Native",
+            "[EXECUTOR_READBACK_PREFETCH] batches=256 bytesMiB=%.3f avgKiB=%.3f",
+            static_cast<double>(prefetch_bytes) / static_cast<double>(1_MB),
+            static_cast<double>(prefetch_bytes) / (256.0 * 1024.0));
+        prefetch_bytes = 0;
+    }
+
+    scheduler.DeferOperation(
+        [this, copies = std::move(copies), tracked_ranges = std::move(tracked_ranges),
+         download, base_offset, completion_tick]() mutable {
+            auto* guest_memory = Core::Memory::Instance();
+            bool wrote_all = true;
+            for (const PrefetchCopy& copy : copies) {
+                if (!guest_memory->TryWriteBacking(
+                        std::bit_cast<u8*>(copy.guest_addr),
+                        download + copy.download_offset, copy.size)) {
+                    wrote_all = false;
+                }
+            }
+            if (!wrote_all) {
+                for (const PendingReadbackRange& range : tracked_ranges) {
+                    gpu_modified_ranges.Add(range.begin, range.size);
+                    memory_tracker->MarkRegionAsGpuModified(range.begin, range.size);
+                }
+            } else {
+                NotifyGuestReadback();
+            }
+            {
+                std::scoped_lock lock{pending_readback_mutex};
+                std::erase_if(pending_readback_ranges, [&](const auto& pending) {
+                    return pending.tick == completion_tick &&
+                           std::ranges::any_of(tracked_ranges, [&](const auto& completed) {
+                               return pending.begin == completed.begin &&
+                                      pending.size == completed.size;
+                           });
+                });
+            }
+            for (const PendingReadbackRange& range : tracked_ranges) {
+                page_manager->UntrackPendingCompletionRead(range.begin, range.size);
+                page_manager->UpdatePageWatchers<false>(range.begin, range.size);
+            }
+            liverpool->NotifyMemoryPublicationForExecutor(0, 1);
+        });
+}
+
 void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_addr, u64 size) {
     struct WaveCopy {
         Buffer* buffer = nullptr;
@@ -187,10 +421,11 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
     RangeSet scheduled_ranges;
     u64 total_size_bytes = 0;
     constexpr u64 CopyAlignment = 64;
+    constexpr u64 transfer_budget = ExecutorPreciseReadbackWaveMaxBytes;
 
     const auto queue_buffer_ranges = [&](Buffer& buffer, const VAddr range_addr,
                                          const u64 range_size) {
-        if (range_size == 0 || total_size_bytes >= ExecutorPreciseReadbackWaveMaxBytes) {
+        if (range_size == 0 || total_size_bytes >= transfer_budget) {
             return;
         }
         memory_tracker->ForEachDownloadRange<false>(
@@ -199,11 +434,10 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
                     download_addr, download_size, [&](const VAddr start, const VAddr end) {
                         if (start >= end || scheduled_ranges.Intersects(start, end - start) ||
                             !buffer.IsInBounds(start, end - start) ||
-                            total_size_bytes >= ExecutorPreciseReadbackWaveMaxBytes) {
+                            total_size_bytes >= transfer_budget) {
                             return;
                         }
-                        const u64 available =
-                            ExecutorPreciseReadbackWaveMaxBytes - total_size_bytes;
+                        const u64 available = transfer_budget - total_size_bytes;
                         const u64 copy_size = std::min<u64>(end - start, available);
                         if (copy_size == 0) {
                             return;
@@ -223,28 +457,54 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
     };
 
     queue_buffer_ranges(primary_buffer, device_addr, size);
+    const u64 primary_size_bytes = total_size_bytes;
 
-    const VAddr wave_begin =
-        Common::AlignDown(device_addr, ExecutorPreciseReadbackWaveWindow);
-    const VAddr wave_end =
-        wave_begin > std::numeric_limits<VAddr>::max() - ExecutorPreciseReadbackWaveWindow
-            ? std::numeric_limits<VAddr>::max()
-            : wave_begin + ExecutorPreciseReadbackWaveWindow;
-    buffer_ranges.ForEachInRange(
-        wave_begin, wave_end - wave_begin,
-        [&](const VAddr range_begin, const VAddr range_end, const BufferId id) {
-            if (total_size_bytes >= ExecutorPreciseReadbackWaveMaxBytes ||
-                IsBufferInvalid(id)) {
-                return;
-            }
-            Buffer& buffer = slot_buffers[id];
-            const VAddr begin = std::max(range_begin, buffer.CpuAddr());
-            const VAddr end =
-                std::min<VAddr>(range_end, buffer.CpuAddr() + buffer.SizeBytes());
-            if (begin < end) {
-                queue_buffer_ranges(buffer, begin, end - begin);
-            }
-        });
+    const auto queue_window = [&](const RecentReadbackWindow& window) {
+        if (window.size == 0 || total_size_bytes >= transfer_budget) {
+            return;
+        }
+        buffer_ranges.ForEachInRange(
+            window.begin, window.size,
+            [&](const VAddr range_begin, const VAddr range_end, const BufferId id) {
+                if (total_size_bytes >= transfer_budget || IsBufferInvalid(id)) {
+                    return;
+                }
+                Buffer& buffer = slot_buffers[id];
+                const VAddr begin = std::max(range_begin, buffer.CpuAddr());
+                const VAddr end =
+                    std::min<VAddr>(range_end, buffer.CpuAddr() + buffer.SizeBytes());
+                if (begin < end) {
+                    queue_buffer_ranges(buffer, begin, end - begin);
+                }
+            });
+    };
+
+    const RecentReadbackWindow current_window{device_addr, size};
+    u32 previous_index = recent_readback_window_count;
+    for (u32 index = 0; index < recent_readback_window_count; ++index) {
+        const auto& recent = recent_readback_windows[index];
+        if (recent.begin == current_window.begin && recent.size == current_window.size) {
+            previous_index = index;
+            continue;
+        }
+        queue_window(recent);
+    }
+    if (previous_index < recent_readback_window_count) {
+        for (u32 index = previous_index; index > 0; --index) {
+            recent_readback_windows[index] = recent_readback_windows[index - 1];
+        }
+    } else {
+        const u32 insert_index =
+            std::min<u32>(recent_readback_window_count,
+                          static_cast<u32>(recent_readback_windows.size() - 1));
+        for (u32 index = insert_index; index > 0; --index) {
+            recent_readback_windows[index] = recent_readback_windows[index - 1];
+        }
+        recent_readback_window_count =
+            std::min<u32>(recent_readback_window_count + 1,
+                          static_cast<u32>(recent_readback_windows.size()));
+    }
+    recent_readback_windows[0] = current_window;
 
     if (copies.empty()) {
         return;
@@ -252,11 +512,15 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
 
     static u64 wave_plan_samples{};
     static u64 wave_plan_bytes{};
+    static u64 wave_plan_primary_bytes{};
+    static u64 wave_plan_budget_bytes{};
     static u64 wave_plan_copies{};
     static u64 wave_plan_max_bytes{};
     static u64 wave_plan_max_copies{};
     ++wave_plan_samples;
     wave_plan_bytes += total_size_bytes;
+    wave_plan_primary_bytes += primary_size_bytes;
+    wave_plan_budget_bytes += transfer_budget;
     wave_plan_copies += copies.size();
     wave_plan_max_bytes = std::max(wave_plan_max_bytes, total_size_bytes);
     wave_plan_max_copies = std::max<u64>(wave_plan_max_copies, copies.size());
@@ -264,14 +528,21 @@ void BufferCache::DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",
             "[EXECUTOR_READBACK_WAVE_PLAN] samples=256 totalMiB=%.3f avgKiB=%.3f "
-            "maxMiB=%.3f copies=%llu avgCopies=%.3f maxCopies=%llu",
+            "primaryMiB=%.3f avgPrimaryKiB=%.3f maxMiB=%.3f copies=%llu "
+            "avgCopies=%.3f maxCopies=%llu avgBudgetMiB=%.3f",
             static_cast<double>(wave_plan_bytes) / static_cast<double>(1_MB),
             static_cast<double>(wave_plan_bytes) / (256.0 * 1024.0),
+            static_cast<double>(wave_plan_primary_bytes) / static_cast<double>(1_MB),
+            static_cast<double>(wave_plan_primary_bytes) / (256.0 * 1024.0),
             static_cast<double>(wave_plan_max_bytes) / static_cast<double>(1_MB),
             static_cast<unsigned long long>(wave_plan_copies),
             static_cast<double>(wave_plan_copies) / 256.0,
-            static_cast<unsigned long long>(wave_plan_max_copies));
+            static_cast<unsigned long long>(wave_plan_max_copies),
+            static_cast<double>(wave_plan_budget_bytes) /
+                (256.0 * static_cast<double>(1_MB)));
         wave_plan_bytes = 0;
+        wave_plan_primary_bytes = 0;
+        wave_plan_budget_bytes = 0;
         wave_plan_copies = 0;
         wave_plan_max_bytes = 0;
         wave_plan_max_copies = 0;
@@ -1476,8 +1747,13 @@ void BufferCache::RunGarbageCollector(const std::optional<size_t> sampled_device
         return;
     }
     const bool aggressive = total_used_memory >= critical_gc_memory;
+#ifdef __ANDROID__
+    const u64 ticks_to_destroy = std::min<u64>(aggressive ? 16 : 64, gc_tick);
+    int max_deletions = aggressive ? 48 : 16;
+#else
     const u64 ticks_to_destroy = std::min<u64>(aggressive ? 80 : 160, gc_tick);
     int max_deletions = aggressive ? 64 : 32;
+#endif
     const auto clean_up = [&](BufferId buffer_id) {
         if (max_deletions == 0) {
             return true;

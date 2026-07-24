@@ -1723,7 +1723,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
             is_indexed, false);
     }
     ExecutorTraceDrawnColorTarget(cb_descs[0].first ? &cb_descs[0].second : nullptr);
-    if (Libraries::GnmDriver::ExecutorLivePresentRtEnabled() && cb_descs[0].first) {
+    if (cb_descs[0].first) {
         texture_cache.ExecutorTrackLiveDrawnColorTarget(cb_descs[0].first);
     }
 #endif
@@ -2013,7 +2013,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             is_indexed, true);
     }
     ExecutorTraceDrawnColorTarget(cb_descs[0].first ? &cb_descs[0].second : nullptr);
-    if (Libraries::GnmDriver::ExecutorLivePresentRtEnabled() && cb_descs[0].first) {
+    if (cb_descs[0].first) {
         texture_cache.ExecutorTrackLiveDrawnColorTarget(cb_descs[0].first);
     }
 #endif
@@ -2170,7 +2170,11 @@ void Rasterizer::OnSubmit() {
     texture_cache.ProcessDownloadImages();
     std::optional<size_t> sampled_device_memory;
     if (instance.CanReportMemoryUsage()) {
+#ifdef __ANDROID__
+        constexpr u64 MemoryBudgetSampleInterval = 8;
+#else
         constexpr u64 MemoryBudgetSampleInterval = 16;
+#endif
         if (!memory_budget_sample_valid ||
             (memory_budget_submit_counter++ % MemoryBudgetSampleInterval) == 0) {
             cached_device_memory_usage = instance.GetDeviceMemoryUsage();
@@ -3108,9 +3112,7 @@ void Rasterizer::Resolve() {
     mrt1_image.Resolve(mrt0_image, mrt0_desc.view_info.range, mrt1_desc.view_info.range);
     ScopeMarkerEnd();
 #ifdef __ANDROID__
-    if (Libraries::GnmDriver::ExecutorLivePresentRtEnabled()) {
-        texture_cache.ExecutorTrackLiveDrawnColorTarget(mrt1_id);
-    }
+    texture_cache.ExecutorTrackLiveDrawnColorTarget(mrt1_id);
     if (log_resolve) {
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4Native",

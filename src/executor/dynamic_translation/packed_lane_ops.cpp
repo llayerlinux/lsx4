@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "executor/dynamic_translation/packed_lane_ops.h"
+#include "executor/dynamic_translation/floating_relation.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -122,6 +124,27 @@ void StoreUnsignedLane(std::uint8_t* const destination, const std::uint64_t valu
 
 }
 
+MaskedLaneSelection SelectMaskedLanes(const void* const mask,
+                                      const std::size_t lane_bytes,
+                                      const std::size_t total_width) noexcept {
+    MaskedLaneSelection selected{};
+    if (mask == nullptr || lane_bytes == 0 || !ValidWidth(total_width) ||
+        total_width % lane_bytes != 0) {
+        return selected;
+    }
+    const auto* bytes = static_cast<const std::uint8_t*>(mask);
+    std::size_t offset = 0;
+    while (offset < total_width) {
+        const std::size_t sign_byte = offset + lane_bytes - 1;
+        if ((bytes[sign_byte] & 0x80u) != 0) {
+            selected.byte_offsets[selected.count++] =
+                static_cast<std::uint8_t>(offset);
+        }
+        offset += lane_bytes;
+    }
+    return selected;
+}
+
 bool ShiftIntegerElements(void* const destination, const void* const source,
                           const std::uint64_t distance,
                           const std::size_t element_width,
@@ -196,6 +219,93 @@ double CombineHorizontalDouble(const double left, const double right,
     }
     return left + adjusted_right;
 #endif
+}
+
+std::uint64_t ReadUnsignedLane(const void* const source,
+                               const std::size_t lane_bytes) noexcept {
+    if (source == nullptr || lane_bytes == 0 || lane_bytes > sizeof(std::uint64_t)) {
+        return 0;
+    }
+    std::uint64_t value{};
+    std::memcpy(&value, source, lane_bytes);
+    return value;
+}
+
+std::int64_t ReadSignedLane(const void* const source,
+                            const std::size_t lane_bytes) noexcept {
+    const std::size_t bounded = std::min(lane_bytes, sizeof(std::uint64_t));
+    if (bounded == 0) {
+        return 0;
+    }
+    const std::uint32_t shift = static_cast<std::uint32_t>(
+        (sizeof(std::uint64_t) - bounded) * 8u);
+    const auto bits = ReadUnsignedLane(source, bounded);
+    return static_cast<std::int64_t>(bits << shift) >> shift;
+}
+
+bool WriteLane(void* const destination, const std::uint64_t value,
+               const std::size_t lane_bytes) noexcept {
+    if (destination == nullptr || lane_bytes == 0 || lane_bytes > sizeof(value)) {
+        return false;
+    }
+    std::memcpy(destination, &value, lane_bytes);
+    return true;
+}
+
+bool ComposeQwordPair(void* const destination, const void* const lower_source,
+                      const std::size_t lower_offset, const void* const upper_source,
+                      const std::size_t upper_offset) noexcept {
+    if (destination == nullptr || lower_source == nullptr || upper_source == nullptr ||
+        lower_offset > 24 || upper_offset > 24) {
+        return false;
+    }
+    std::array<std::byte, 16> pair{};
+    std::memcpy(pair.data(), static_cast<const std::byte*>(lower_source) + lower_offset, 8);
+    std::memcpy(pair.data() + 8, static_cast<const std::byte*>(upper_source) + upper_offset, 8);
+    std::memcpy(destination, pair.data(), pair.size());
+    return true;
+}
+
+std::uint64_t CollectSignMask(const void* const source, const std::size_t lane_bytes,
+                              const std::size_t total_width) noexcept {
+    const bool invalid_shape =
+        lane_bytes == 0 || lane_bytes > sizeof(std::uint64_t) ||
+        total_width > 32 || total_width % lane_bytes != 0;
+    if (invalid_shape) {
+        return 0;
+    }
+    if (!source) {
+        return 0;
+    }
+    const auto bytes = static_cast<const std::uint8_t*>(source);
+    std::uint64_t mask = 0;
+    std::size_t lane = 0;
+    for (std::size_t end = lane_bytes; end <= total_width; end += lane_bytes) {
+        const auto sign_byte = bytes[end - 1];
+        mask |= static_cast<std::uint64_t>(sign_byte >> 7u) << lane;
+        ++lane;
+    }
+    return mask;
+}
+
+bool ShuffleBytesByMask(void* const destination, const void* const source,
+                        const void* const mask, const std::size_t total_width) noexcept {
+    if (destination == nullptr || source == nullptr || mask == nullptr ||
+        (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+    const auto* input = static_cast<const std::uint8_t*>(source);
+    const auto* selectors = static_cast<const std::uint8_t*>(mask);
+    std::array<std::uint8_t, 32> output{};
+    for (std::size_t index = 0; index < total_width; ++index) {
+        const std::uint8_t selector = selectors[index];
+        if ((selector & 0x80u) == 0) {
+            const std::size_t half = (index / 16u) * 16u;
+            output[index] = input[half + (selector & 0x0fu)];
+        }
+    }
+    std::memcpy(destination, output.data(), total_width);
+    return true;
 }
 
 PackedBitTestResult TestPackedBits(const void* const left,
@@ -292,9 +402,13 @@ bool ShuffleImmediate(void* const destination, const void* const left,
     const auto* second = static_cast<const std::uint8_t*>(right);
     std::array<std::uint8_t, kMaximumVectorBytes> output{};
     for (std::size_t half = 0; half < total_width; half += 16) {
+        const auto selected_lane = [control](const std::size_t lane) {
+            return static_cast<std::size_t>((control >> (lane + lane)) & 3u);
+        };
         if (kind == ImmediateShuffleKind::Dwords) {
-            for (std::size_t lane = 0; lane < 4; ++lane) {
-                const std::size_t selected = (control >> (lane * 2u)) & 3u;
+            for (std::uint32_t lane = 0; lane != 4; ++lane) {
+                const std::size_t selected = selected_lane(
+                    static_cast<std::size_t>(lane));
                 std::memcpy(output.data() + half + lane * 4,
                             second + half + selected * 4, 4);
             }
@@ -303,14 +417,16 @@ bool ShuffleImmediate(void* const destination, const void* const left,
             std::memcpy(output.data() + half, second + half, 16);
             const std::size_t base_word =
                 kind == ImmediateShuffleKind::HighWords ? 4u : 0u;
-            for (std::size_t lane = 0; lane < 4; ++lane) {
-                const std::size_t selected = (control >> (lane * 2u)) & 3u;
+            for (std::uint32_t lane = 0; lane != 4; ++lane) {
+                const std::size_t selected = selected_lane(
+                    static_cast<std::size_t>(lane));
                 std::memcpy(output.data() + half + (base_word + lane) * 2,
                             second + half + (base_word + selected) * 2, 2);
             }
         } else if (kind == ImmediateShuffleKind::SinglePrecisionPairs) {
-            for (std::size_t lane = 0; lane < 4; ++lane) {
-                const std::size_t selected = (control >> (lane * 2u)) & 3u;
+            for (std::uint32_t lane = 0; lane != 4; ++lane) {
+                const std::size_t selected = selected_lane(
+                    static_cast<std::size_t>(lane));
                 const auto* source = lane < 2 ? first : second;
                 std::memcpy(output.data() + half + lane * 4,
                             source + half + selected * 4, 4);
@@ -507,6 +623,88 @@ bool AbsoluteIntegerElements(void* const destination, const void* const source,
     return true;
 }
 
+bool DotProductSinglePrecision(void* const destination, const void* const left,
+                               const void* const right, const std::uint8_t control,
+                               const std::size_t total_width) noexcept {
+    if (destination == nullptr || left == nullptr || right == nullptr ||
+        (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+    const auto* lhs = static_cast<const std::byte*>(left);
+    const auto* rhs = static_cast<const std::byte*>(right);
+    std::array<std::byte, 32> output{};
+    std::size_t group = 0;
+    while (group != total_width) {
+        float sum = 0.0f;
+        std::size_t lane = 0;
+        while (lane != 4) {
+            if ((control & (0x10u << lane)) == 0) {
+                ++lane;
+                continue;
+            }
+            float left_value{};
+            float right_value{};
+            std::memcpy(&left_value, lhs + group + lane * 4, sizeof(float));
+            std::memcpy(&right_value, rhs + group + lane * 4, sizeof(float));
+            sum += left_value * right_value;
+            ++lane;
+        }
+        lane = 0;
+        while (lane != 4) {
+            if ((control & (1u << lane)) != 0) {
+                std::memcpy(output.data() + group + lane * 4, &sum, sizeof(sum));
+            }
+            ++lane;
+        }
+        group += 16;
+    }
+    std::memcpy(destination, output.data(), total_width);
+    return true;
+}
+
+bool ConvertDwordFloatElements(void* const destination, const void* const source,
+                               const bool integer_to_float, const bool truncate,
+                               const std::size_t total_width,
+                               const std::uint32_t mxcsr) noexcept {
+    if (destination == nullptr || source == nullptr ||
+        (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+    const auto* input = static_cast<const std::byte*>(source);
+    std::array<std::byte, 32> output{};
+    const std::uint32_t rounding_mode = (mxcsr >> 13u) & 3u;
+    for (std::size_t offset = 0; offset < total_width; offset += 4) {
+        const std::uint32_t bits =
+            static_cast<std::uint32_t>(ReadUnsignedLane(input + offset, 4));
+        std::uint32_t converted = 0;
+        if (integer_to_float) {
+            converted = std::bit_cast<std::uint32_t>(
+                static_cast<float>(static_cast<std::int32_t>(bits)));
+        } else {
+            const float value = std::bit_cast<float>(bits);
+            const double rounded = truncate
+                ? std::trunc(value)
+                : Lsx4::Translation::RoundFloatingValue(value, rounding_mode);
+            converted = 0x80000000u;
+            const auto minimum =
+                static_cast<double>(std::numeric_limits<std::int32_t>::min());
+            const auto maximum =
+                static_cast<double>(std::numeric_limits<std::int32_t>::max());
+            const bool representable =
+                std::isfinite(rounded) && rounded >= minimum && rounded <= maximum;
+            if (representable) {
+                const auto signed_value = static_cast<std::int32_t>(rounded);
+                converted = std::bit_cast<std::uint32_t>(signed_value);
+            }
+        }
+        if (!WriteLane(output.data() + offset, converted, 4)) {
+            return false;
+        }
+    }
+    std::memcpy(destination, output.data(), total_width);
+    return true;
+}
+
 bool ConvertFloatingElementWidth(void* const destination,
                                  const void* const source,
                                  const std::size_t destination_width,
@@ -675,6 +873,44 @@ bool AddOrSubtractPacked(void* const destination, const void* const left,
     return true;
 }
 
+bool AddOrSubtractSaturating(void* const destination, const void* const left,
+                             const void* const right,
+                             const std::size_t element_width,
+                             const std::size_t total_width,
+                             const bool subtract,
+                             const bool signed_elements) noexcept {
+    if (destination == nullptr || left == nullptr || right == nullptr ||
+        (element_width != 1 && element_width != 2) ||
+        (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+    const auto* lhs = static_cast<const std::uint8_t*>(left);
+    const auto* rhs = static_cast<const std::uint8_t*>(right);
+    auto* output = static_cast<std::uint8_t*>(destination);
+    const std::int64_t signed_limit = std::int64_t{1} << (element_width * 8u - 1u);
+    const std::uint64_t unsigned_limit =
+        (std::uint64_t{1} << (element_width * 8u)) - 1u;
+    for (std::size_t offset = 0; offset < total_width; offset += element_width) {
+        std::uint64_t lane{};
+        if (signed_elements) {
+            const std::int64_t l = ReadSignedLane(lhs + offset, element_width);
+            const std::int64_t r = ReadSignedLane(rhs + offset, element_width);
+            const std::int64_t raw = subtract ? l - r : l + r;
+            lane = static_cast<std::uint64_t>(
+                std::clamp(raw, -signed_limit, signed_limit - 1));
+        } else {
+            const std::uint64_t l = ReadUnsignedLane(lhs + offset, element_width);
+            const std::uint64_t r = ReadUnsignedLane(rhs + offset, element_width);
+            lane = subtract ? (l >= r ? l - r : 0u)
+                            : std::min(unsigned_limit, l + r);
+        }
+        if (!WriteLane(output + offset, lane, element_width)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ReplicateElement(void* const destination, const void* const element,
                       const std::size_t element_width,
                       const std::size_t total_width) noexcept {
@@ -748,6 +984,68 @@ bool CompareIntegerElements(void* const destination, const void* const left,
                     element_width);
     }
     std::memcpy(destination, output.data(), output.size());
+    return true;
+}
+
+bool SelectIntegerExtrema(void* const destination, const void* const left,
+                          const void* const right, const std::size_t element_width,
+                          const std::size_t total_width, const bool signed_comparison,
+                          const bool select_maximum) noexcept {
+    const bool supported_lane = element_width == 1 || element_width == 2 ||
+                                element_width == 4 || element_width == 8;
+    if (destination == nullptr || left == nullptr || right == nullptr ||
+        !supported_lane || (total_width != 16 && total_width != 32)) {
+        return false;
+    }
+    const auto* left_bytes = static_cast<const std::byte*>(left);
+    const auto* right_bytes = static_cast<const std::byte*>(right);
+    std::array<std::byte, 32> output{};
+    for (std::size_t offset = 0; offset < total_width; offset += element_width) {
+        bool choose_right = false;
+        if (signed_comparison) {
+            const auto lhs = ReadSignedLane(left_bytes + offset, element_width);
+            const auto rhs = ReadSignedLane(right_bytes + offset, element_width);
+            choose_right = select_maximum ? rhs > lhs : rhs <= lhs;
+        } else {
+            const auto lhs = ReadUnsignedLane(left_bytes + offset, element_width);
+            const auto rhs = ReadUnsignedLane(right_bytes + offset, element_width);
+            choose_right = select_maximum ? rhs > lhs : rhs <= lhs;
+        }
+        std::memcpy(output.data() + offset,
+                    (choose_right ? right_bytes : left_bytes) + offset, element_width);
+    }
+    std::memcpy(destination, output.data(), total_width);
+    return true;
+}
+
+bool ExtendIntegerElements(void* const destination, const void* const source,
+                           const std::size_t source_element_width,
+                           const std::size_t destination_element_width,
+                           const std::size_t total_width,
+                           const bool sign_extend) noexcept {
+    const bool source_width_supported = source_element_width == 1 ||
+                                        source_element_width == 2 ||
+                                        source_element_width == 4;
+    if (destination == nullptr || source == nullptr || !source_width_supported ||
+        destination_element_width <= source_element_width || destination_element_width > 8 ||
+        (total_width != 16 && total_width != 32) ||
+        total_width % destination_element_width != 0) {
+        return false;
+    }
+    const auto* input = static_cast<const std::byte*>(source);
+    std::array<std::byte, 32> output{};
+    const std::size_t lanes = total_width / destination_element_width;
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        const std::byte* element = input + lane * source_element_width;
+        const std::uint64_t value = sign_extend
+            ? static_cast<std::uint64_t>(ReadSignedLane(element, source_element_width))
+            : ReadUnsignedLane(element, source_element_width);
+        if (!WriteLane(output.data() + lane * destination_element_width,
+                       value, destination_element_width)) {
+            return false;
+        }
+    }
+    std::memcpy(destination, output.data(), total_width);
     return true;
 }
 

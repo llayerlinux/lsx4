@@ -11,6 +11,7 @@
 #include "core/libraries/libc_internal/libc_internal_io.h"
 #include "core/memory.h"
 #include "executor/dynamic_translation/hle_thunk_identity.h"
+#include "video_core/page_manager.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3933,8 +3934,14 @@ u64 ExecutorLibcMemcpy(u64 dest, u64 src, u64 size) {
             module[0] ? module : "?");
     }
 #endif
+    VideoCore::PageManager::PrepareBulkGuestRead(src, size);
+    VideoCore::PageManager::PrepareBulkGuestWrite(dest, size);
+    VideoCore::PageManager::EnterBulkGuestWrite(dest, size);
+    VideoCore::BeginBulkGuestWrite(dest, size);
     std::memcpy(reinterpret_cast<void*>(dest), reinterpret_cast<const void*>(src),
                 static_cast<std::size_t>(size));
+    VideoCore::PageManager::LeaveBulkGuestWrite(dest, size);
+    VideoCore::EndBulkGuestWrite();
     ExecutorWatchGateWrite("memcpy", dest, size,
                            size >= 8 ? *reinterpret_cast<const u64*>(src) : 0);
     ExecutorMaybeLogLibcCopy("memcpy", dest, src, size);
@@ -3944,8 +3951,14 @@ u64 ExecutorLibcMemcpy(u64 dest, u64 src, u64 size) {
 u64 ExecutorLibcMemmove(u64 dest, u64 src, u64 size) {
     if (ExecutorLibcRejectHostImageWrite("memmove", dest, size))
         return dest;
+    VideoCore::PageManager::PrepareBulkGuestRead(src, size);
+    VideoCore::PageManager::PrepareBulkGuestWrite(dest, size);
+    VideoCore::PageManager::EnterBulkGuestWrite(dest, size);
+    VideoCore::BeginBulkGuestWrite(dest, size);
     std::memmove(reinterpret_cast<void*>(dest), reinterpret_cast<const void*>(src),
                  static_cast<std::size_t>(size));
+    VideoCore::PageManager::LeaveBulkGuestWrite(dest, size);
+    VideoCore::EndBulkGuestWrite();
     ExecutorWatchGateWrite("memmove", dest, size,
                            size >= 8 ? *reinterpret_cast<const u64*>(dest) : 0);
     ExecutorMaybeLogLibcCopy("memmove", dest, src, size);
@@ -3998,7 +4011,12 @@ u64 ExecutorLibcMemset(u64 dest, u64 val, u64 size) {
         }
         return dest;
     }
+    VideoCore::PageManager::PrepareBulkGuestWrite(dest, size);
+    VideoCore::PageManager::EnterBulkGuestWrite(dest, size);
+    VideoCore::BeginBulkGuestWrite(dest, size);
     std::memset(reinterpret_cast<void*>(dest), fill, static_cast<std::size_t>(size));
+    VideoCore::PageManager::LeaveBulkGuestWrite(dest, size);
+    VideoCore::EndBulkGuestWrite();
     return dest;
 }
 

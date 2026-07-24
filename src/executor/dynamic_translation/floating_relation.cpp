@@ -6,7 +6,9 @@
 #include "common/x86_decoder.h"
 
 #include <array>
+#include <bit>
 #include <cmath>
+#include <cstring>
 
 namespace Lsx4::Translation {
 
@@ -291,6 +293,123 @@ float EvaluateScalarRoot(const ScalarRootOperation operation,
         return 1.0f / std::sqrt(value);
     }
     return value;
+}
+
+}
+
+namespace Lsx4::Translation {
+
+bool EncodeSignedIntegerAsFloating(void* const destination,
+                                   const std::uint64_t encoded_integer,
+                                   const std::uint32_t integer_bits,
+                                   const bool double_precision) noexcept {
+    if (destination == nullptr || (integer_bits != 32 && integer_bits != 64)) {
+        return false;
+    }
+    const std::int64_t value = integer_bits == 64
+        ? static_cast<std::int64_t>(encoded_integer)
+        : static_cast<std::int64_t>(static_cast<std::int32_t>(encoded_integer));
+    if (double_precision) {
+        const double converted = static_cast<double>(value);
+        std::memcpy(destination, &converted, sizeof(converted));
+    } else {
+        const float converted = static_cast<float>(value);
+        std::memcpy(destination, &converted, sizeof(converted));
+    }
+    return true;
+}
+
+bool ChangeScalarFloatingWidth(void* const destination,
+                               const std::uint64_t source_bits,
+                               const bool widen_to_double) noexcept {
+    if (destination == nullptr) {
+        return false;
+    }
+    if (widen_to_double) {
+        const float source = std::bit_cast<float>(static_cast<std::uint32_t>(source_bits));
+        const double converted = static_cast<double>(source);
+        std::memcpy(destination, &converted, sizeof(converted));
+    } else {
+        const double source = std::bit_cast<double>(source_bits);
+        const float converted = static_cast<float>(source);
+        std::memcpy(destination, &converted, sizeof(converted));
+    }
+    return true;
+}
+
+bool EncodeFloatingRelationMask(void* const destination, const bool relation_holds,
+                                const bool double_precision) noexcept {
+    if (destination == nullptr) {
+        return false;
+    }
+    if (double_precision) {
+        const std::uint64_t mask = relation_holds ? UINT64_MAX : 0;
+        std::memcpy(destination, &mask, sizeof(mask));
+    } else {
+        const std::uint32_t mask = relation_holds ? UINT32_MAX : 0;
+        std::memcpy(destination, &mask, sizeof(mask));
+    }
+    return true;
+}
+
+bool EncodeRoundedScalar(void* const destination, const std::uint64_t source_bits,
+                         const bool double_precision, const std::uint32_t mode) noexcept {
+    if (destination == nullptr) {
+        return false;
+    }
+    if (double_precision) {
+        const double rounded = RoundFloatingValue(std::bit_cast<double>(source_bits), mode);
+        std::memcpy(destination, &rounded, sizeof(rounded));
+    } else {
+        const float source = std::bit_cast<float>(static_cast<std::uint32_t>(source_bits));
+        const float rounded = static_cast<float>(RoundFloatingValue(source, mode));
+        std::memcpy(destination, &rounded, sizeof(rounded));
+    }
+    return true;
+}
+
+bool EncodeScalarBinaryOperation(void* const destination, const void* const left,
+                                 const void* const right, const bool double_precision,
+                                 const FloatingBinaryOperation operation) noexcept {
+    if (destination == nullptr || left == nullptr || right == nullptr) {
+        return false;
+    }
+    const bool selects_operand = operation == FloatingBinaryOperation::Minimum ||
+                                 operation == FloatingBinaryOperation::Maximum;
+    if (double_precision) {
+        std::uint64_t left_bits{};
+        std::uint64_t right_bits{};
+        std::memcpy(&left_bits, left, sizeof(left_bits));
+        std::memcpy(&right_bits, right, sizeof(right_bits));
+        const double lhs = std::bit_cast<double>(left_bits);
+        const double rhs = std::bit_cast<double>(right_bits);
+        if (selects_operand) {
+            const bool use_left = !std::isnan(lhs) && !std::isnan(rhs) &&
+                (operation == FloatingBinaryOperation::Minimum ? lhs < rhs : lhs > rhs);
+            const std::uint64_t selected = use_left ? left_bits : right_bits;
+            std::memcpy(destination, &selected, sizeof(selected));
+        } else {
+            const double value = ApplyFloatingBinary(lhs, rhs, operation);
+            std::memcpy(destination, &value, sizeof(value));
+        }
+        return true;
+    }
+    std::uint32_t left_bits{};
+    std::uint32_t right_bits{};
+    std::memcpy(&left_bits, left, sizeof(left_bits));
+    std::memcpy(&right_bits, right, sizeof(right_bits));
+    const float lhs = std::bit_cast<float>(left_bits);
+    const float rhs = std::bit_cast<float>(right_bits);
+    if (selects_operand) {
+        const bool use_left = !std::isnan(lhs) && !std::isnan(rhs) &&
+            (operation == FloatingBinaryOperation::Minimum ? lhs < rhs : lhs > rhs);
+        const std::uint32_t selected = use_left ? left_bits : right_bits;
+        std::memcpy(destination, &selected, sizeof(selected));
+    } else {
+        const float value = ApplyFloatingBinary(lhs, rhs, operation);
+        std::memcpy(destination, &value, sizeof(value));
+    }
+    return true;
 }
 
 }

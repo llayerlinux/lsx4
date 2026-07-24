@@ -58,6 +58,7 @@ inline constexpr std::uint64_t ParityFlag = 1ull << 2;
 inline constexpr std::uint64_t AuxiliaryFlag = 1ull << 4;
 inline constexpr std::uint64_t ZeroFlag = 1ull << 6;
 inline constexpr std::uint64_t SignFlag = 1ull << 7;
+inline constexpr std::uint64_t DirectionFlag = 1ull << 10;
 inline constexpr std::uint64_t OverflowFlag = 1ull << 11;
 inline constexpr std::uint64_t ArithmeticFlagMask =
     CarryFlag | ParityFlag | AuxiliaryFlag | ZeroFlag | SignFlag | OverflowFlag;

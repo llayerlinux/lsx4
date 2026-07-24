@@ -59,6 +59,15 @@ public:
                             });
     }
 
+    void MarkRegionAsGpuModified(VAddr dirty_cpu_addr, u64 query_size) noexcept {
+        IteratePages<false>(dirty_cpu_addr, query_size,
+                            [](RegionManager* manager, u64 offset, size_t size) {
+                                std::scoped_lock lk{manager->lock};
+                                manager->template ChangeRegionState<Type::GPU, true>(
+                                    manager->GetCpuAddr() + offset, size);
+                            });
+    }
+
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
         IteratePages<false>(
             cpu_addr, size, [&on_flush](RegionManager* manager, u64 offset, size_t size) {

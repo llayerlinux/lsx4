@@ -6,6 +6,7 @@
 
 #include "executor/dynamic_translation/floating_operation.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -149,6 +150,35 @@ static_assert(std::is_standard_layout_v<LsxEntryPacket> &&
 
 using Arm64BlockEntry = std::uint64_t (*)(LsxMachineImage*);
 
+enum class TranslationFeature : std::uint32_t {
+    InitialNativeCandidate = 1u << 0u,
+    Executable = 1u << 1u,
+    NativeCode = 1u << 2u,
+    DirectEntry = 1u << 3u,
+    SynchronousFaultResume = 1u << 4u,
+    DispatcherBoundary = 1u << 5u,
+    ReturnTerminator = 1u << 6u,
+};
+
+constexpr std::uint32_t TranslationFeatureMask(const TranslationFeature feature) noexcept {
+    return static_cast<std::uint32_t>(feature);
+}
+
+constexpr bool TranslationHasFeature(const std::uint32_t flags,
+                                     const TranslationFeature feature) noexcept {
+    return (flags & TranslationFeatureMask(feature)) != 0;
+}
+
+constexpr void TranslationEnableFeature(std::uint32_t& flags,
+                                        const TranslationFeature feature) noexcept {
+    flags |= TranslationFeatureMask(feature);
+}
+
+constexpr void TranslationDisableFeature(std::uint32_t& flags,
+                                         const TranslationFeature feature) noexcept {
+    flags &= ~TranslationFeatureMask(feature);
+}
+
 struct TranslationRecord {
     Arm64BlockEntry entry{};
     std::uint32_t guest_size{};
@@ -191,23 +221,23 @@ struct DecodeSummary {
 static_assert(std::is_standard_layout_v<DecodeSummary>);
 static_assert(sizeof(DecodeSummary) == 24);
 
-using LsxRegisterCode = std::uint32_t;
+using LsxRegisterCode = std::uint16_t;
 
 struct LsxRegisterOperand {
     LsxRegisterCode value;
 };
 
 struct LsxMemoryOperand {
-    std::uint32_t type;
-    LsxRegisterCode segment;
-    LsxRegisterCode base;
-    LsxRegisterCode index;
-    std::uint8_t scale;
     struct {
         std::int64_t value;
         std::uint8_t offset;
         std::uint8_t size;
     } disp;
+    LsxRegisterCode segment;
+    LsxRegisterCode base;
+    LsxRegisterCode index;
+    std::uint8_t type;
+    std::uint8_t scale;
 };
 
 struct LsxPointerOperand {
@@ -216,12 +246,12 @@ struct LsxPointerOperand {
 };
 
 struct LsxImmediateOperand {
-    std::uint8_t is_signed;
-    std::uint8_t is_relative;
     union {
         std::uint64_t u;
         std::int64_t s;
     } value;
+    std::uint8_t is_signed;
+    std::uint8_t is_relative;
     std::uint8_t offset;
     std::uint8_t size;
 };
@@ -247,6 +277,111 @@ struct LsxOperandRecord {
 
 static_assert(std::is_standard_layout_v<LsxOperandRecord>);
 static_assert(std::is_trivially_copyable_v<LsxOperandRecord>);
+static_assert(sizeof(LsxMemoryOperand) == 24);
+static_assert(sizeof(LsxImmediateOperand) == 16);
+static_assert(sizeof(LsxOperandRecord) == 40);
+
+class LsxOperandStorage {
+public:
+    static constexpr std::size_t InlineCapacity = 3;
+    static constexpr std::size_t Capacity = kLsxVisibleOperandLimit;
+
+    LsxOperandStorage() = default;
+
+    LsxOperandStorage(const LsxOperandStorage& other)
+        : inline_operands_{other.inline_operands_} {
+        if (other.extended_operands_) {
+            extended_operands_ =
+                std::make_unique<ExtendedArray>(*other.extended_operands_);
+        }
+    }
+
+    LsxOperandStorage& operator=(const LsxOperandStorage& other) {
+        if (this == &other) {
+            return *this;
+        }
+        inline_operands_ = other.inline_operands_;
+        if (other.extended_operands_) {
+            extended_operands_ =
+                std::make_unique<ExtendedArray>(*other.extended_operands_);
+        } else {
+            extended_operands_.reset();
+        }
+        return *this;
+    }
+
+    LsxOperandStorage(LsxOperandStorage&&) noexcept = default;
+    LsxOperandStorage& operator=(LsxOperandStorage&&) noexcept = default;
+
+    LsxOperandRecord& operator[](const std::size_t index) {
+        if (index < InlineCapacity && !extended_operands_) {
+            return inline_operands_[index];
+        }
+        EnsureExtended();
+        return (*extended_operands_)[index];
+    }
+
+    const LsxOperandRecord& operator[](const std::size_t index) const noexcept {
+        return extended_operands_ ? (*extended_operands_)[index]
+                                  : inline_operands_[index];
+    }
+
+    LsxOperandRecord* data() noexcept {
+        return extended_operands_ ? extended_operands_->data()
+                                  : inline_operands_.data();
+    }
+
+    const LsxOperandRecord* data() const noexcept {
+        return extended_operands_ ? extended_operands_->data()
+                                  : inline_operands_.data();
+    }
+
+    LsxOperandRecord* begin() noexcept {
+        return data();
+    }
+
+    const LsxOperandRecord* begin() const noexcept {
+        return data();
+    }
+
+    LsxOperandRecord* end() noexcept {
+        return data() +
+            (extended_operands_ ? Capacity : InlineCapacity);
+    }
+
+    const LsxOperandRecord* end() const noexcept {
+        return data() +
+            (extended_operands_ ? Capacity : InlineCapacity);
+    }
+
+    LsxOperandRecord& front() noexcept {
+        return *data();
+    }
+
+    const LsxOperandRecord& front() const noexcept {
+        return *data();
+    }
+
+    static constexpr std::size_t size() noexcept {
+        return Capacity;
+    }
+
+private:
+    using ExtendedArray = std::array<LsxOperandRecord, Capacity>;
+
+    void EnsureExtended() {
+        if (extended_operands_) {
+            return;
+        }
+        auto expanded = std::make_unique<ExtendedArray>();
+        std::copy(inline_operands_.begin(), inline_operands_.end(),
+                  expanded->begin());
+        extended_operands_ = std::move(expanded);
+    }
+
+    std::array<LsxOperandRecord, InlineCapacity> inline_operands_{};
+    std::unique_ptr<ExtendedArray> extended_operands_{};
+};
 
 struct LsxDecodedOp {
     std::uint64_t guest_rip = 0;
@@ -255,7 +390,7 @@ struct LsxDecodedOp {
     std::uint32_t mnemonic = 0;
     std::array<std::uint8_t, kLsxInstructionByteLimit> bytes{};
     DecodeSummary decoded{};
-    std::array<LsxOperandRecord, kLsxVisibleOperandLimit> operands{};
+    LsxOperandStorage operands{};
     std::uint8_t operand_count = 0;
     LsxOpClass category = LsxOpClass::Unsupported;
     bool can_execute_vector = false;
@@ -266,6 +401,7 @@ struct LsxDecodedOp {
 };
 
 static_assert(std::is_standard_layout_v<LsxDecodedOp>);
+static_assert(sizeof(LsxDecodedOp) == 192);
 
 enum class RegionDecodeStatus : std::uint8_t {
     Ready,
@@ -284,6 +420,7 @@ struct LsxDecodedRegion {
     RegionDecodeStatus decode_status = RegionDecodeStatus::Ready;
     RegionExecutionTier execution_tier = RegionExecutionTier::Interpreter;
     std::string diagnostic{};
+    std::vector<std::uint8_t> validation_bytes{};
 
     [[nodiscard]] bool HasDecodeFailure() const noexcept {
         return decode_status == RegionDecodeStatus::Rejected;
@@ -303,26 +440,30 @@ struct LsxStackReservoir {
     BytePointer allocation{};
     BytePointer low{};
     BytePointer top{};
-    BytePointer current{};
+    std::uint32_t active_leases{};
+    std::uint32_t generation{};
 };
 
 static_assert(std::is_standard_layout_v<LsxStackReservoir> &&
               offsetof(LsxStackReservoir, allocation) == 0x00 &&
               offsetof(LsxStackReservoir, low) == 0x08 &&
               offsetof(LsxStackReservoir, top) == 0x10 &&
-              offsetof(LsxStackReservoir, current) == 0x18 &&
+              offsetof(LsxStackReservoir, active_leases) == 0x18 &&
+              offsetof(LsxStackReservoir, generation) == 0x1c &&
               sizeof(LsxStackReservoir) == 0x20);
 
 struct LsxStackLease {
     std::uint64_t stack_low{};
     std::uint64_t current_sp{};
-    std::uint64_t previous_current_sp{};
+    std::uint32_t slot_index{};
+    std::uint32_t generation{};
 };
 
 static_assert(std::is_standard_layout_v<LsxStackLease> &&
               offsetof(LsxStackLease, stack_low) == 0x00 &&
               offsetof(LsxStackLease, current_sp) == 0x08 &&
-              offsetof(LsxStackLease, previous_current_sp) == 0x10 &&
+              offsetof(LsxStackLease, slot_index) == 0x10 &&
+              offsetof(LsxStackLease, generation) == 0x14 &&
               sizeof(LsxStackLease) == 0x18);
 
 struct LsxEngineReport {
@@ -390,7 +531,8 @@ void RecordIntegerAdditionFlags(LsxMachineImage& state, std::uint64_t lhs, std::
                     std::uint32_t size_bits);
 void RecordIntegerSubtractionFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, std::uint64_t result,
                     std::uint32_t size_bits);
-void RecordLogicalResultFlags(LsxMachineImage& state, std::uint64_t result, std::uint32_t size_bits);
+void RecordLogicalResultFlags(void* machine, std::uintptr_t result,
+                              std::uintptr_t size_bits);
 void RecordCarryingAdditionFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, bool carry,
                     std::uint64_t result, std::uint32_t size_bits);
 void RecordBorrowingSubtractionFlags(LsxMachineImage& state, std::uint64_t lhs, std::uint64_t rhs, bool borrow,
@@ -402,7 +544,7 @@ void CopyBytesToGuest(std::uint64_t guest_va, const void* src, std::uint32_t siz
 void ExchangeGuestMemoryAtomically(LsxMachineImage& state, void* target, std::size_t state_offset,
                        std::uint32_t size_bits);
 LsxStackReservoir& LocalGuestStackReservoir();
-LsxStackLease BorrowGuestStackWindow(LsxMachineImage* state);
+LsxStackLease BorrowGuestStackWindow();
 void ReturnGuestStackWindow(const LsxStackLease& frame);
 LsxMachineImage* FindActiveMachineImage();
 LsxMachineImage* ExchangeDiagnosticMachineImage(LsxMachineImage* state);

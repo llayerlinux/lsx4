@@ -447,13 +447,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 #ifdef __ANDROID__
     const auto registered_image_id = image_id;
     bool using_live_drawn_target = false;
-    if (std::getenv("EXECUTOR_LIVE_PRESENT_RT") != nullptr) {
-        const auto live_target = texture_cache.ExecutorTakeLiveFullResolutionTarget(
-            attribute.attrib.width, attribute.attrib.height, registered_image_id);
-        if (live_target) {
-            image_id = live_target;
-            using_live_drawn_target = true;
-        }
+    const auto live_target = texture_cache.ExecutorTakeLiveFullResolutionTarget(
+        attribute.attrib.width, attribute.attrib.height, registered_image_id);
+    if (live_target) {
+        image_id = live_target;
+        using_live_drawn_target = true;
     }
 #endif
     auto& source_image = texture_cache.GetImage(image_id);
@@ -1084,10 +1082,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame) {
     }
 
     SubmitInfo info{};
-    info.AddWait(swapchain.GetImageAcquiredSemaphore(), 1,
-                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
-    info.AddWait(frame->ready_semaphore, frame->ready_tick,
-                 vk::PipelineStageFlagBits::eFragmentShader);
+    info.AddWait(swapchain.GetImageAcquiredSemaphore());
+    info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);

@@ -21,7 +21,6 @@ import android.graphics.drawable.GradientDrawable;
 import android.hardware.input.InputManager;
 import android.net.Uri;
 import android.media.AudioManager;
-import android.media.ToneGenerator;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -50,8 +49,9 @@ import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.window.OnBackInvokedCallback;
+import android.window.OnBackInvokedDispatcher;
 import android.widget.Button;
-import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -181,13 +181,14 @@ public class MainActivity extends Activity {
     private SeekBar gameMenuOpacitySlider;
     private boolean gameMenuOpen;
     private boolean gameExitRequested;
+    private OnBackInvokedCallback gameBackCallback;
     private LinearLayout debugHudPanel;
+    private TextView debugHudFps;
     private TextView debugHud;
+    private TextView debugHudBrand;
     private TextView debugHudCollapsedButton;
-    private CheckBox frameCaughtCheck;
     private LinearLayout loadingProgressPanel;
     private TextView loadingBlocksText;
-    private ToneGenerator uiTone;
     private boolean launcherMode;
     private LauncherUi launcherUi;
     private boolean overlayEnabledByPreference;
@@ -253,10 +254,6 @@ public class MainActivity extends Activity {
     private String runtimeHudEvent = "PAD ready";
     private boolean frameDetectionInFlight;
     private boolean frameCaught;
-    private long frameCaughtAtMs;
-    private String frameCaughtPath = "";
-    private int frameProbeNonblack;
-    private int frameProbeEdges;
     private int frameProbeAcceptedStreak;
     private final Runnable runtimeHudTick = new Runnable() {
         @Override
@@ -531,6 +528,7 @@ public class MainActivity extends Activity {
                 installDebugHud(renderFrame);
             }
             installGameSideMenu(renderFrame);
+            registerGameBackCallback();
         }
         if (fullscreenRender) {
             root.addView(renderFrame, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -978,22 +976,34 @@ public class MainActivity extends Activity {
             liveSettings.unregisterOnSharedPreferenceChangeListener(liveSettingsListener);
             liveSettings = null;
         }
-        ToneGenerator tone = uiTone;
-        uiTone = null;
-        if (tone != null) {
-            tone.release();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && gameBackCallback != null) {
+            getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(gameBackCallback);
+            gameBackCallback = null;
         }
         super.onDestroy();
     }
 
+    private void handleGameBack() {
+        if (gameMenuOpen) {
+            closeGameSideMenu();
+        } else {
+            openGameSideMenu();
+        }
+    }
+
+    private void registerGameBackCallback() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || gameBackCallback != null) {
+            return;
+        }
+        gameBackCallback = this::handleGameBack;
+        getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_OVERLAY, gameBackCallback);
+    }
+
     @Override
     public void onBackPressed() {
-        if (!launcherMode && fullscreenRender) {
-            if (gameMenuOpen) {
-                closeGameSideMenu();
-            } else {
-                openGameSideMenu();
-            }
+        if (!launcherMode) {
+            handleGameBack();
             return;
         }
         super.onBackPressed();
@@ -1010,6 +1020,15 @@ public class MainActivity extends Activity {
                 return super.dispatchKeyEvent(event);
             }
             boolean pressed = event.getAction() == KeyEvent.ACTION_DOWN;
+            InputDevice device = event.getDevice();
+            boolean systemBackEvent = event.getKeyCode() == KeyEvent.KEYCODE_BACK
+                    && (device == null || event.getDeviceId() < 0);
+            if (systemBackEvent) {
+                if (!pressed) {
+                    handleGameBack();
+                }
+                return true;
+            }
             if (handlePadKey(event.getKeyCode(), pressed, event)) {
                 return true;
             }
@@ -2311,12 +2330,14 @@ public class MainActivity extends Activity {
         inputOverlay = new FrameLayout(this);
         inputOverlay.setFocusable(false);
         inputOverlay.setClickable(false);
+        inputOverlay.setSoundEffectsEnabled(false);
         renderFrame.addView(inputOverlay, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 Gravity.CENTER));
 
         dualShockOverlay = new DualShockOverlayView(this);
+        dualShockOverlay.setSoundEffectsEnabled(false);
         inputOverlay.addView(dualShockOverlay, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -2398,6 +2419,7 @@ public class MainActivity extends Activity {
         }
         debugHudPanel = new LinearLayout(this);
         debugHudPanel.setOrientation(LinearLayout.VERTICAL);
+        debugHudPanel.setGravity(Gravity.CENTER_HORIZONTAL);
         debugHudPanel.setPadding(dp(6), dp(3), dp(6), dp(4));
         debugHudPanel.setBackgroundColor(0x99000000);
         debugHudPanel.setClickable(true);
@@ -2409,38 +2431,48 @@ public class MainActivity extends Activity {
             setDebugHudCollapsed(true);
         });
 
-        frameCaughtCheck = new CheckBox(this);
-        frameCaughtCheck.setText(R.string.hud_frame_waiting);
-        frameCaughtCheck.setTextColor(0xfff4f7fa);
-        frameCaughtCheck.setTextSize(9);
-        frameCaughtCheck.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
-        frameCaughtCheck.setButtonDrawable(
-                SettingsActivity.createCheckBoxButtonDrawable(this));
-        frameCaughtCheck.setCompoundDrawablePadding(dp(4));
-        frameCaughtCheck.setPadding(0, 0, 0, 0);
-        frameCaughtCheck.setClickable(false);
-        frameCaughtCheck.setFocusable(false);
-        frameCaughtCheck.setChecked(false);
-        debugHudPanel.addView(frameCaughtCheck, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        debugHudFps = new TextView(this);
+        debugHudFps.setTextColor(0xffffffff);
+        debugHudFps.setTextSize(10);
+        debugHudFps.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        debugHudFps.setGravity(Gravity.CENTER);
+        debugHudFps.setIncludeFontPadding(false);
+        debugHudFps.setText("FPS --");
+        debugHudFps.setClickable(false);
+        debugHudFps.setFocusable(false);
 
         debugHud = new TextView(this);
-        debugHud.setTextColor(0xeeffffff);
-        debugHud.setTextSize(9);
+        debugHud.setTextColor(0xccffffff);
+        debugHud.setTextSize(6.5f);
         debugHud.setTypeface(Typeface.MONOSPACE);
-        debugHud.setGravity(Gravity.START);
+        debugHud.setGravity(Gravity.CENTER);
+        debugHud.setSingleLine(true);
+        debugHud.setIncludeFontPadding(false);
         debugHud.setPadding(0, 0, 0, 0);
-        debugHud.setText(getString(R.string.hud_stats_pending));
+        debugHud.setText("time 00:00  blocks --  draw --  submit --  present --");
         debugHud.setClickable(false);
         debugHud.setFocusable(false);
         debugHudPanel.addView(debugHud, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
+        debugHudBrand = new TextView(this);
+        debugHudBrand.setText("LSX4-APP");
+        debugHudBrand.setTextColor(0xff78b5ff);
+        debugHudBrand.setTextSize(8);
+        debugHudBrand.setTypeface(Typeface.create("sans-serif-medium", Typeface.BOLD));
+        debugHudBrand.setGravity(Gravity.CENTER);
+        debugHudBrand.setIncludeFontPadding(false);
+        debugHudBrand.setClickable(false);
+        debugHudBrand.setFocusable(false);
+        debugHudPanel.addView(debugHudBrand, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        debugHudPanel.addView(debugHudFps, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         FrameLayout.LayoutParams params = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP | Gravity.START);
-        params.leftMargin = dp(10);
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         params.topMargin = dp(10);
         renderFrame.addView(debugHudPanel, params);
 
@@ -2467,8 +2499,7 @@ public class MainActivity extends Activity {
         });
 
         FrameLayout.LayoutParams collapsedParams = new FrameLayout.LayoutParams(
-                dp(40), dp(40), Gravity.TOP | Gravity.START);
-        collapsedParams.leftMargin = dp(10);
+                dp(40), dp(40), Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         collapsedParams.topMargin = dp(10);
         renderFrame.addView(debugHudCollapsedButton, collapsedParams);
         debugHudCollapsedButton.setVisibility(View.GONE);
@@ -2509,8 +2540,9 @@ public class MainActivity extends Activity {
                 parent.removeView(debugHudPanel);
             }
             debugHudPanel = null;
+            debugHudFps = null;
             debugHud = null;
-            frameCaughtCheck = null;
+            debugHudBrand = null;
         }
         if (debugHudCollapsedButton != null) {
             ViewGroup parent = (ViewGroup) debugHudCollapsedButton.getParent();
@@ -2633,15 +2665,7 @@ public class MainActivity extends Activity {
             runtimeHudCurrentStats = null;
             frameDetectionInFlight = false;
             frameCaught = false;
-            frameCaughtAtMs = 0;
-            frameCaughtPath = "";
-            frameProbeNonblack = 0;
-            frameProbeEdges = 0;
             frameProbeAcceptedStreak = 0;
-            if (frameCaughtCheck != null) {
-                frameCaughtCheck.setChecked(false);
-                frameCaughtCheck.setText(R.string.hud_frame_waiting);
-            }
             if (loadingProgressPanel != null) {
                 loadingProgressPanel.setVisibility(View.VISIBLE);
             }
@@ -2689,7 +2713,7 @@ public class MainActivity extends Activity {
     }
 
     private void renderRuntimeDebugHud() {
-        if (debugHud == null || debugHudPanel == null ||
+        if (debugHudFps == null || debugHud == null || debugHudPanel == null ||
                 debugHudPanel.getVisibility() != View.VISIBLE) {
             return;
         }
@@ -2702,26 +2726,21 @@ public class MainActivity extends Activity {
         long[] current = runtimeHudCurrentStats;
         long[] previous = runtimeHudLastStats;
         if (current == null || current.length < 11) {
+            debugHudFps.setText("FPS --");
             debugHud.setText(String.format(Locale.US,
-                    "FPS -- | %02d:%02d\n%s\n%s",
-                    minutes, seconds, getString(R.string.hud_runtime_waiting), runtimeHudEvent));
+                    "time %02d:%02d  blocks --  draw --  submit --  present --",
+                    minutes, seconds));
             return;
         }
 
         long generatedRate = counterRate(current, previous, 0);
-        long executionRate = counterRate(current, previous, 4);
         long drawRate = counterRate(current, previous, 6);
         long submitRate = counterRate(current, previous, 8);
         long presentRate = counterRate(current, previous, 10);
+        debugHudFps.setText(String.format(Locale.US, "FPS %,d", presentRate));
         debugHud.setText(String.format(Locale.US,
-                "FPS %,d | %02d:%02d\n" +
-                        "blocks %,d  +%,d/s\n" +
-                        "exec %,d/s | draw %,d/s\n" +
-                        "submit %,d/s | present %,d/s\n%s",
-                presentRate, minutes, seconds,
-                current[0], generatedRate,
-                executionRate, drawRate,
-                submitRate, presentRate, runtimeHudEvent));
+                "time %02d:%02d  blocks %,d (+%,d/s)  draw %,d/s  submit %,d/s  present %,d/s",
+                minutes, seconds, current[0], generatedRate, drawRate, submitRate, presentRate));
     }
 
     private String describePersistentCache(long[] stats) {
@@ -2906,6 +2925,7 @@ public class MainActivity extends Activity {
     }
 
     private final class DualShockOverlayView extends View {
+        private static final long STICK_CLICK_HOLD_MS = 500;
         private static final int AXIS_LEFT_X = 0;
         private static final int AXIS_LEFT_Y = 1;
         private static final int AXIS_RIGHT_X = 2;
@@ -2963,6 +2983,14 @@ public class MainActivity extends Activity {
         private int triggerRight;
         private int leftStickPointerId = -1;
         private int rightStickPointerId = -1;
+        private boolean leftStickLongPressEligible;
+        private boolean rightStickLongPressEligible;
+        private boolean leftStickClickHeld;
+        private boolean rightStickClickHeld;
+        private float leftStickDownX;
+        private float leftStickDownY;
+        private float rightStickDownX;
+        private float rightStickDownY;
         private int touchpadPointerId = -1;
         private boolean touchpadDown;
         private boolean touchpadExpanded;
@@ -2976,11 +3004,30 @@ public class MainActivity extends Activity {
             lastVisualRefreshAtMs = SystemClock.uptimeMillis();
             invalidate();
         };
+        private final Runnable leftStickLongPress = () -> {
+            if (leftStickPointerId == -1 || !leftStickLongPressEligible) {
+                return;
+            }
+            leftStickLongPressEligible = false;
+            leftStickClickHeld = true;
+            applyMask(activeMask | PAD_L3);
+            requestVisualRefresh(true);
+        };
+        private final Runnable rightStickLongPress = () -> {
+            if (rightStickPointerId == -1 || !rightStickLongPressEligible) {
+                return;
+            }
+            rightStickLongPressEligible = false;
+            rightStickClickHeld = true;
+            applyMask(activeMask | PAD_R3);
+            requestVisualRefresh(true);
+        };
 
         DualShockOverlayView(Context context) {
             super(context);
             setClickable(true);
             setFocusable(false);
+            setSoundEffectsEnabled(false);
             setWillNotDraw(false);
 
             fillPaint.setStyle(Paint.Style.FILL);
@@ -3038,9 +3085,11 @@ public class MainActivity extends Activity {
                 releasedPointerIndex = event.getActionIndex();
                 int pointerId = event.getPointerId(releasedPointerIndex);
                 if (pointerId == leftStickPointerId) {
+                    finishLeftStickTouch();
                     leftStickPointerId = -1;
                 }
                 if (pointerId == rightStickPointerId) {
+                    finishRightStickTouch();
                     rightStickPointerId = -1;
                 }
                 if (pointerId == touchpadPointerId) {
@@ -3064,10 +3113,10 @@ public class MainActivity extends Activity {
                     return true;
                 }
                 if (leftStickPointerId == -1 && isInsideStick(x, y, leftStickCenterX, leftStickCenterY)) {
-                    leftStickPointerId = pointerId;
+                    beginLeftStickTouch(pointerId, x, y);
                 } else if (rightStickPointerId == -1 &&
                         isInsideStick(x, y, rightStickCenterX, rightStickCenterY)) {
-                    rightStickPointerId = pointerId;
+                    beginRightStickTouch(pointerId, x, y);
                 } else if (touchpadPointerId == -1 && touchpad.contains(x, y)) {
                     touchpadPointerId = pointerId;
                     updateTouchpad(x, y, true);
@@ -3092,17 +3141,23 @@ public class MainActivity extends Activity {
                 if (pointerId == leftStickPointerId) {
                     newLeftX = axisValue(x, leftStickCenterX);
                     newLeftY = axisValue(y, leftStickCenterY);
-                    if (distance(x, y, leftStickCenterX, leftStickCenterY) < stickRadius * 0.38f) {
-                        newMask |= PAD_L3;
+                    if (leftStickLongPressEligible &&
+                            distance(x, y, leftStickDownX, leftStickDownY) > stickRadius * 0.35f) {
+                        leftStickLongPressEligible = false;
+                        removeCallbacks(leftStickLongPress);
                     }
+                    if (leftStickClickHeld) newMask |= PAD_L3;
                     continue;
                 }
                 if (pointerId == rightStickPointerId) {
                     newRightX = axisValue(x, rightStickCenterX);
                     newRightY = axisValue(y, rightStickCenterY);
-                    if (distance(x, y, rightStickCenterX, rightStickCenterY) < stickRadius * 0.38f) {
-                        newMask |= PAD_R3;
+                    if (rightStickLongPressEligible &&
+                            distance(x, y, rightStickDownX, rightStickDownY) > stickRadius * 0.35f) {
+                        rightStickLongPressEligible = false;
+                        removeCallbacks(rightStickLongPress);
                     }
+                    if (rightStickClickHeld) newMask |= PAD_R3;
                     continue;
                 }
                 if (pointerId == touchpadPointerId) {
@@ -3151,6 +3206,8 @@ public class MainActivity extends Activity {
         @Override
         protected void onDetachedFromWindow() {
             removeCallbacks(delayedMotionRefresh);
+            removeCallbacks(leftStickLongPress);
+            removeCallbacks(rightStickLongPress);
             motionRefreshPosted = false;
             lastVisualRefreshAtMs = 0;
             super.onDetachedFromWindow();
@@ -3246,7 +3303,7 @@ public class MainActivity extends Activity {
             setCentered(circle, faceX + unit, faceY, faceSize, faceSize);
 
             float shoulderW = Math.min(width * 0.090f, min * 0.180f);
-            float shoulderH = Math.max(dp(18), min * 0.032f);
+            float shoulderH = Math.max(dp(24), min * 0.042f);
             float shoulderGap = Math.max(dp(12), width * 0.009f);
             float shoulderTop = Math.max(dp(12), height * 0.078f);
             l1.set(sideMargin, shoulderTop, sideMargin + shoulderW, shoulderTop + shoulderH);
@@ -3454,8 +3511,6 @@ public class MainActivity extends Activity {
             if (r1.contains(x, y)) mask |= PAD_R1;
             if (r2.contains(x, y)) mask |= PAD_R2;
             if (options.contains(x, y)) mask |= PAD_OPTIONS;
-            if (leftStick.contains(x, y)) mask |= PAD_L3;
-            if (rightStick.contains(x, y)) mask |= PAD_R3;
             if (includeTouchpad && touchpadExpanded && touchpad.contains(x, y) &&
                     !touchpadToggle.contains(x, y)) {
                 mask |= PAD_TOUCHPAD;
@@ -3549,9 +3604,43 @@ public class MainActivity extends Activity {
             }
         }
 
+        private void beginLeftStickTouch(int pointerId, float x, float y) {
+            leftStickPointerId = pointerId;
+            leftStickDownX = x;
+            leftStickDownY = y;
+            leftStickLongPressEligible = true;
+            leftStickClickHeld = false;
+            removeCallbacks(leftStickLongPress);
+            postDelayed(leftStickLongPress, STICK_CLICK_HOLD_MS);
+        }
+
+        private void beginRightStickTouch(int pointerId, float x, float y) {
+            rightStickPointerId = pointerId;
+            rightStickDownX = x;
+            rightStickDownY = y;
+            rightStickLongPressEligible = true;
+            rightStickClickHeld = false;
+            removeCallbacks(rightStickLongPress);
+            postDelayed(rightStickLongPress, STICK_CLICK_HOLD_MS);
+        }
+
+        private void finishLeftStickTouch() {
+            removeCallbacks(leftStickLongPress);
+            leftStickLongPressEligible = false;
+            leftStickClickHeld = false;
+        }
+
+        private void finishRightStickTouch() {
+            removeCallbacks(rightStickLongPress);
+            rightStickLongPressEligible = false;
+            rightStickClickHeld = false;
+        }
+
         private void resetAllInputs() {
             boolean visualStateChanged = activeMask != 0 || leftX != 128 || leftY != 128 ||
                     rightX != 128 || rightY != 128;
+            finishLeftStickTouch();
+            finishRightStickTouch();
             leftStickPointerId = -1;
             rightStickPointerId = -1;
             touchpadPointerId = -1;
@@ -3784,9 +3873,6 @@ public class MainActivity extends Activity {
             setDebugHud(String.format(Locale.US, "PAD 0x%08x %s result=%d", mask,
                     pressed ? "DOWN" : "UP", result));
             if (pressed) {
-                if (hostFeedback) {
-                    playUiClickTone(mask);
-                }
                 handleStorePreviewPad(mask);
             }
         } catch (Throwable t) {
@@ -3814,20 +3900,6 @@ public class MainActivity extends Activity {
         } catch (Throwable t) {
             Log.i(TAG, "Pad axis failed: " + t.getMessage());
             setDebugHud("AXIS failed: " + t.getMessage());
-        }
-    }
-
-    private void playUiClickTone(int mask) {
-        try {
-            if (uiTone == null) {
-                uiTone = new ToneGenerator(AudioManager.STREAM_MUSIC, 88);
-            }
-            int tone = mask == PAD_CROSS ? ToneGenerator.TONE_PROP_ACK :
-                    mask == PAD_CIRCLE ? ToneGenerator.TONE_PROP_NACK :
-                            ToneGenerator.TONE_PROP_BEEP;
-            uiTone.startTone(tone, mask == PAD_CROSS ? 90 : 45);
-        } catch (Throwable t) {
-            appendSmokeLog("UI click tone failed: " + t.getMessage());
         }
     }
 
@@ -4334,8 +4406,6 @@ public class MainActivity extends Activity {
                     int[] pixels = new int[64 * 36];
                     probe.getPixels(pixels, 0, 64, 0, 0, 64, 36);
                     int[] score = scoreDetailedGuestFrame(pixels, 64, 36);
-                    frameProbeNonblack = score[0];
-                    frameProbeEdges = score[1];
                     if (score[2] != 0) {
                         frameProbeAcceptedStreak = Math.min(FRAME_PROBE_REQUIRED_STREAK,
                                 frameProbeAcceptedStreak + 1);
@@ -4392,41 +4462,14 @@ public class MainActivity extends Activity {
         return Math.max(dr, Math.max(dg, db));
     }
 
-    private void latchCaughtGuestFrame(Bitmap verifiedFrame) {
+    private void latchCaughtGuestFrame() {
         if (frameCaught) {
-            verifiedFrame.recycle();
             return;
         }
         frameCaught = true;
         if (loadingProgressPanel != null) {
             loadingProgressPanel.setVisibility(View.GONE);
         }
-        frameCaughtAtMs = Math.max(0, SystemClock.elapsedRealtime() - runtimeHudStartedAtMs);
-        long caughtSeconds = frameCaughtAtMs / 1000;
-        if (frameCaughtCheck != null) {
-            frameCaughtCheck.setChecked(true);
-            frameCaughtCheck.setText(getString(R.string.hud_frame_verified,
-                    caughtSeconds / 60, caughtSeconds % 60));
-        }
-        runtimeHudEvent = "stable guest frame verified: 3 probes + full-size recheck";
-        renderRuntimeDebugHud();
-        Thread saver = new Thread(() -> {
-            String path = savePixelCopyFrame(verifiedFrame, "auto-verified-guest-frame");
-            verifiedFrame.recycle();
-            runOnUiThread(() -> {
-                frameCaughtPath = path;
-                append("PixelCopy result: {\"attempted\":true,\"success\":" +
-                        (!path.isEmpty()) +
-                        ",\"trigger\":\"auto_verified_guest_frame\",\"framePath\":\"" +
-                        sanitizeJson(path) + "\"}");
-                runtimeHudEvent = path.isEmpty()
-                        ? "verified frame latched; PNG save failed"
-                        : "verified frame PNG saved";
-                renderRuntimeDebugHud();
-            });
-        }, "ps4run-verified-frame-save");
-        saver.setDaemon(true);
-        saver.start();
     }
 
     private void requestVerifiedCaughtGuestFrameEvidence() {
@@ -4459,8 +4502,6 @@ public class MainActivity extends Activity {
                 verification.getPixels(pixels, 0, 64, 0, 0, 64, 36);
                 verification.recycle();
                 int[] score = scoreDetailedGuestFrame(pixels, 64, 36);
-                frameProbeNonblack = score[0];
-                frameProbeEdges = score[1];
                 if (score[2] == 0) {
                     bitmap.recycle();
                     frameProbeAcceptedStreak = 0;
@@ -4468,7 +4509,8 @@ public class MainActivity extends Activity {
                     renderRuntimeDebugHud();
                     return;
                 }
-                latchCaughtGuestFrame(bitmap);
+                bitmap.recycle();
+                latchCaughtGuestFrame();
             }, runtimeHudHandler);
         } catch (Throwable t) {
             frameDetectionInFlight = false;

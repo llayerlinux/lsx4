@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <boost/container/small_vector.hpp>
+#include <mutex>
 #include <optional>
+#include <vector>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
@@ -165,6 +168,8 @@ public:
     }
 
 #ifdef __ANDROID__
+    void PrefetchReadbackWindows();
+
     void ExecutorProbeGpuBuffer(VAddr device_addr, u32 size, const char* role, u64 sequence);
 
     void ExecutorProbeBoundGpuBuffer(VAddr guest_addr, u32 size, vk::Buffer bound_buffer,
@@ -205,7 +210,24 @@ private:
     }
 
 #ifdef __ANDROID__
+    struct RecentReadbackWindow {
+        VAddr begin = 0;
+        u64 size = 0;
+    };
+
+    struct PendingReadbackRange {
+        VAddr begin = 0;
+        u64 size = 0;
+        u64 tick = 0;
+    };
+
     void DownloadBufferMemoryWave(Buffer& primary_buffer, VAddr device_addr, u64 size);
+    void WaitForPendingReadback(VAddr device_addr, u64 size);
+
+    std::array<RecentReadbackWindow, 32> recent_readback_windows{};
+    u32 recent_readback_window_count = 0;
+    std::mutex pending_readback_mutex;
+    std::vector<PendingReadbackRange> pending_readback_ranges;
 #endif
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);
@@ -238,6 +260,7 @@ private:
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
+    PageManager* page_manager;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
     FaultManager fault_manager;

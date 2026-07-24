@@ -76,6 +76,19 @@ struct ScalarRoundPlan {
 
 [[nodiscard]] double RoundFloatingValue(double value, std::uint32_t mode) noexcept;
 
+bool EncodeSignedIntegerAsFloating(void* destination, std::uint64_t encoded_integer,
+                                   std::uint32_t integer_bits,
+                                   bool double_precision) noexcept;
+bool ChangeScalarFloatingWidth(void* destination, std::uint64_t source_bits,
+                               bool widen_to_double) noexcept;
+bool EncodeFloatingRelationMask(void* destination, bool relation_holds,
+                                bool double_precision) noexcept;
+bool EncodeRoundedScalar(void* destination, std::uint64_t source_bits,
+                         bool double_precision, std::uint32_t mode) noexcept;
+bool EncodeScalarBinaryOperation(void* destination, const void* left,
+                                 const void* right, bool double_precision,
+                                 FloatingBinaryOperation operation) noexcept;
+
 [[nodiscard]] std::optional<ScalarRootPlan> DescribeScalarRootOperation(
     std::uint32_t mnemonic) noexcept;
 [[nodiscard]] std::optional<ScalarBinaryPlan> DescribeScalarBinaryOperation(

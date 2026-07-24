@@ -210,4 +210,44 @@ void EmitIncrement32(Xbyak_aarch64::CodeGenerator& code, const WReg& input,
     PublishStatus(code, layout, layout.arithmetic_mask & ~std::uint64_t{1});
 }
 
+void EmitIndexedBitCarry(Xbyak_aarch64::CodeGenerator& code,
+                         const XReg& value, const XReg& bit_index,
+                         const XReg& state_base,
+                         const std::uint32_t flags_offset,
+                         const std::uint32_t carry_bit) {
+    code.lsrv(code.x14, value, bit_index);
+    code.and_(code.x14, code.x14, 1);
+    code.ldr(code.x9, Xbyak_aarch64::ptr(state_base, flags_offset));
+    code.bfi(code.x9, code.x14, carry_bit, 1);
+    code.str(code.x9, Xbyak_aarch64::ptr(state_base, flags_offset));
+}
+
+void EmitBitIsolationStatus(Xbyak_aarch64::CodeGenerator& code,
+                            const XReg& input, const XReg& result,
+                            const std::uint32_t width,
+                            const bool carry_when_nonzero,
+                            const X86FlagLayout& layout) {
+    code.tst(input, input);
+    code.cset(code.x13,
+              carry_when_nonzero ? Xbyak_aarch64::NE : Xbyak_aarch64::EQ);
+    if (width == 32) {
+        code.tst(WReg(result.getIdx()), WReg(result.getIdx()));
+    } else {
+        code.tst(result, result);
+    }
+    code.cset(code.x14, Xbyak_aarch64::EQ);
+    code.cset(code.x15, Xbyak_aarch64::MI);
+    code.bfi(code.x13, code.x14, layout.zero_bit, 1);
+    code.bfi(code.x13, code.x15, layout.sign_bit, 1);
+    const std::uint64_t affected = std::uint64_t{1} |
+        (std::uint64_t{1} << layout.zero_bit) |
+        (std::uint64_t{1} << layout.sign_bit) |
+        (std::uint64_t{1} << layout.overflow_bit);
+    code.mov(code.x17, affected);
+    code.ldr(code.x9, Xbyak_aarch64::ptr(code.x19, layout.state_offset));
+    code.bic(code.x9, code.x9, code.x17);
+    code.orr(code.x9, code.x9, code.x13);
+    code.str(code.x9, Xbyak_aarch64::ptr(code.x19, layout.state_offset));
+}
+
 }

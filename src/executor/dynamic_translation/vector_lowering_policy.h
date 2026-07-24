@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/x86_decoder.h"
 #include "executor/dynamic_translation/retiring_execution_core.h"
 
 #include <optional>
@@ -74,5 +75,80 @@ enum class VectorLogicOperation : std::uint8_t {
 
 [[nodiscard]] VectorLogicOperation ClassifyVectorLogic(
     const LsxDecodedOp& instruction) noexcept;
+
+enum class ScalarInstructionFamily : std::uint8_t {
+    MoveLane,
+    BinaryArithmetic,
+    RootArithmetic,
+    IntegerToFloating,
+    ChangeFloatingWidth,
+    FloatingToInteger,
+    StatusComparison,
+    PredicateComparison,
+    ControlledRounding,
+};
+
+struct ScalarInstructionPlan {
+    ScalarInstructionFamily family{};
+    std::uint8_t merge_operand{};
+    std::uint8_t source_operand{};
+    std::uint8_t control_operand{};
+    bool double_precision{};
+    bool uses_environment_rounding{};
+};
+
+[[nodiscard]] std::optional<ScalarInstructionPlan> PlanScalarInstruction(
+    const LsxDecodedOp& instruction) noexcept;
+
+enum class VectorDestinationKind : std::uint8_t {
+    RegisterFile,
+    GuestMemory,
+};
+
+struct VectorWritePlan {
+    VectorDestinationKind destination{};
+    std::uint8_t payload_bytes{};
+    bool clear_register_tail{};
+};
+
+enum class BlendControlKind : std::uint8_t {
+    Immediate,
+    VectorMask,
+};
+
+struct VectorBlendPlan {
+    BlendControlKind control{};
+    std::uint8_t lane_bytes{};
+    bool distinct_left_operand{};
+    bool repeat_control_per_128{};
+};
+
+[[nodiscard]] std::optional<VectorBlendPlan> PlanVectorBlend(
+    X86Mnemonic mnemonic) noexcept;
+
+enum class ElementTransferDirection : std::uint8_t {
+    Insert,
+    Extract,
+};
+
+struct ElementTransferPlan {
+    ElementTransferDirection direction{};
+    std::uint8_t element_bytes{};
+    bool distinct_merge_operand{};
+};
+
+[[nodiscard]] std::optional<ElementTransferPlan> PlanElementTransfer(
+    X86Mnemonic mnemonic) noexcept;
+
+struct MaskedTransferPlan {
+    std::uint8_t lane_bytes{};
+    bool writes_memory{};
+};
+
+[[nodiscard]] std::optional<MaskedTransferPlan> PlanMaskedTransfer(
+    const LsxDecodedOp& instruction) noexcept;
+
+[[nodiscard]] std::optional<VectorWritePlan> PlanVectorWrite(
+    const DecodeSummary& instruction, const LsxOperandRecord& destination) noexcept;
 
 }

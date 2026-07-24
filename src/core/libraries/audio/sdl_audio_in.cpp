@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <SDL3/SDL.h>
 #include <common/config.h>
 #include <common/logging/log.h>
@@ -71,6 +74,11 @@ public:
     }
 
     ~SDLInPortBackend() override {
+        {
+            std::scoped_lock lock{capture_clock_mutex};
+            capture_clock_stopping = true;
+        }
+        capture_clock_event.notify_all();
         if (stream) {
             SDL_DestroyAudioStream(stream);
         }
@@ -101,6 +109,25 @@ public:
             const int framesRead = bytesRead / (port.sample_size * port.channels_num);
             return framesRead;
         } else if (internal_buffer) {
+            const auto packet_period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(
+                    static_cast<double>(port.samples_num) / static_cast<double>(port.freq)));
+            {
+                std::unique_lock lock{capture_clock_mutex};
+                const auto now = std::chrono::steady_clock::now();
+                if (next_capture_packet.time_since_epoch().count() == 0 ||
+                    now > next_capture_packet + packet_period * 4) {
+                    next_capture_packet = now + packet_period;
+                }
+                capture_clock_event.wait_until(lock, next_capture_packet, [&] {
+                    return capture_clock_stopping ||
+                           std::chrono::steady_clock::now() >= next_capture_packet;
+                });
+                if (capture_clock_stopping) {
+                    return 0;
+                }
+                next_capture_packet += packet_period;
+            }
             std::memcpy(out_buffer, internal_buffer, bytesToRead);
             return port.samples_num;
         } else {
@@ -126,6 +153,10 @@ private:
     SDL_AudioStream* stream = nullptr;
     void* internal_buffer = nullptr;
     bool nullDevice = false;
+    std::mutex capture_clock_mutex;
+    std::condition_variable capture_clock_event;
+    std::chrono::steady_clock::time_point next_capture_packet{};
+    bool capture_clock_stopping = false;
 };
 
 std::unique_ptr<PortInBackend> SDLAudioIn::Open(PortIn& port) {

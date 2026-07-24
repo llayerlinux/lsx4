@@ -6,10 +6,9 @@
 #include <algorithm>
 #include <atomic>
 #include <limits>
-
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 namespace Lsx4::Translation {
