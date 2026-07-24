@@ -4,7 +4,7 @@
 
 LSX4 has two explicit native ownership layers:
 
-- Funnel ARM owns the ARM-adapted desktop/emulation implementation.
+- Funnel ARM owns the Android/ARM-adapted emulation implementation. It is no longer a desktop distribution repository.
 - The LSX4 repository owns the Android client, runtime bridge, and dynamic translation implementation.
 
 The Android native target must not compile a second desktop/emulation copy from the LSX4 client tree. The build fails when a desktop source escapes Funnel ownership.
@@ -53,30 +53,28 @@ The iced-x86 Rust bridge is Funnel-owned, while the vendored iced-x86 dependency
 
 ## Complete source-use audit
 
-The source tree and the final native link were audited separately. A file being present in the Funnel repository does not imply that the Android application compiles or executes it.
+The source tree and final native link were audited separately before pruning. Funnel now retains only Android build inputs, source dependencies, generated-resource inputs, licenses, and its integration manifest.
 
 | Funnel area | Files currently present | Objects linked into `liblsx4_executor_android.so` | Android use |
 | --- | ---: | ---: | --- |
-| `src/common` | 102 | 23 | Active shared runtime primitives |
-| `src/core` | 545 | 190 | Active PS4 loader, HLE, process, memory, audio, and kernel services |
-| `src/imgui` | 46 | 4 | Active native renderer subset; generated font resources are separate target inputs |
+| `src/common` | 95 | 23 | Active shared runtime primitives |
+| `src/core` | 417 | 190 | Active PS4 loader, HLE, process, memory, audio, and kernel services |
+| `src/imgui` | 15 | 4 | Active native renderer subset; two generated font translation units are linked through `ImGui_Resources` |
 | `src/input` | 6 | 3 | Active native input adaptation |
-| `src/shader_recompiler` | 107 | 62 | Active guest shader translation and SPIR-V generation |
-| `src/video_core` | 113 | 37 | Active AMDGPU, Vulkan, presentation, and cache implementation |
+| `src/shader_recompiler` | 106 | 62 | Active guest shader translation and SPIR-V generation |
+| `src/video_core` | 113 | 37 | Active AMDGPU, Vulkan, presentation, cache, and host-shader generation implementation |
 | `src/emulator.*`, `src/sdl_window.*` | 4 | 2 | Active emulation entry and window/surface integration |
 | `src/runtime_resources` | 5 | 0 direct objects | Active through the embedded-resource library |
-| `src/dist` | 5 | 0 | Funnel-owned Windows/macOS/Linux packaging metadata; it is not executable Android runtime code |
-| `src/resources` | 14 | 0 | Funnel-owned full desktop/big-picture assets; Android uses its own localized resources and Funnel `runtime_resources` |
-| `src/shadnet` | 5 | 0 | Funnel-owned online service implementation; disabled together with its protobuf, NP, account, and desktop notification profile |
-| `src/main.cpp` | 1 | 0 | Funnel-owned desktop executable entry point; Android enters through `MainActivity` and JNI instead |
 
 The final link has exactly 369 project object inputs: 321 from Funnel, 47 from `src/executor`, and one generated `scm_rev.cpp` object under the build directory. It has zero objects from a client-side desktop source tree. The apparently similar `externals/sdl3/src/core/...` paths are SDL implementation files, not a second LSX4/shad4pc emulation core.
 
-Every Funnel C++ file is now classified by the Funnel-owned profile. Active Android/ARM implementations are selected there. Desktop entry/UI/packaging code, unsupported services, and mutually exclusive host alternatives are explicitly excluded there rather than silently omitted by the client. Enabling a currently disabled desktop feature, such as ShadNet, requires enabling its complete dependency and UI contract in the Funnel profile; its implementation must never be copied into the Android client.
+Every remaining Funnel C++ implementation is now classified by the Funnel-owned profile. The profile includes the complete surviving Android/ARM implementation and excludes only generated font translation units that are already linked once through `ImGui_Resources`.
+
+The cleanup removed 311 tracked paths and left 772 tracked Android-layer files. Removed content includes standalone desktop CMake entry points and presets, Windows/macOS/Linux distribution metadata, desktop assets and documentation, `src/main.cpp`, Discord integration, ShadNet, Big Picture and desktop notification UI, unsupported host backends, unused codec/service implementations, desktop tests and scripts, all 53 Funnel-local external gitlinks, and `.gitmodules`. Third-party packages used by the final Android target remain owned once by the LSX4 root build.
 
 The root `externals` directory remains final-target dependency infrastructure (SDL, Vulkan headers, shader tooling, codecs, containers, and similar third-party libraries). It is intentionally not classified as Android client business logic or as a duplicate desktop/emulation implementation. Dependency ownership can be consolidated later, but moving vendored packages would not change the runtime layer boundary and would add submodule risk without a performance benefit.
 
-The pre-removal client snapshot contains 813 files in `D:\LProj\PetProj\backup-adapted-desktop-in-client`. Those files were overlaid into Funnel before deletion. The current Funnel copy differs from that backup only where integration required a path adjustment in `common/iced_x86_ffi/Cargo.toml`; the actual Rust source and dependency version are unchanged. The previously modified `shader_recompiler/ir/position.h` is byte-identical between the backup and Funnel, so the working-tree implementation was preserved rather than replaced by an older committed copy.
+The pre-removal client snapshot contains 813 files in `D:\LProj\PetProj\backup-adapted-desktop-in-client`. It is recovery-only, is outside both repositories, and is not part of either build or Git history. The current Funnel tree is authoritative.
 
 ## Runtime data flow
 
@@ -106,10 +104,10 @@ At runtime the Android client selects a game and owns lifecycle, permissions, pr
 The verified native library was:
 
 - file: `build/android-arm64-release/liblsx4_executor_android.so`;
-- size: 51,548,400 bytes;
-- SHA-256: `2B19316E105A7E7C287DF11905E7080B85BBB77C941B3F0A12B791BC0EB504E9`.
+- size: 51,547,568 bytes;
+- SHA-256: `EFAB71D5232BAE9B952878CE10F263CB09139DE952466CA7A71B20ABFB5D7093`.
 
-The same hash was measured inside Vivo application storage at `files/runtime/liblsx4_executor_android.so`. After source-profile ownership moved into Funnel, Bloodborne recreated its `Game:Main`, JIT cache, GPU communication/scheduler/presenter, FMOD, audio output, and worker threads without a fatal process or Java exception. The device reported `vivo V2546A` and an Adreno Vulkan implementation; Mali results were not used for acceptance.
+The same hash was measured inside Vivo application storage at `files/runtime/liblsx4_executor_android.so`. After the Android-only prune, Bloodborne resumed an in-game scene with 331,483 JIT blocks, 7,413 draws/s, 144 submits/s, 13 presents/s, and 13 FPS at the observation point. Its separate game process recreated `Game:Main`, `Jit:Cache`, GPU communication/scheduler/presenter, FMOD, audio output, and worker threads with zero fatal events. The device reported `vivo V2546A` and an Adreno Vulkan implementation; Mali results were not used for acceptance.
 
 ## Optimization order
 
@@ -117,7 +115,7 @@ The same hash was measured inside Vivo application storage at `files/runtime/lib
 
 This is the heavier layer and the first target for profiling because it owns most compiled objects and most CPU/GPU-facing emulation work.
 
-1. Remove Android target work that exists only for desktop UI, desktop discovery, updater, Discord, USB, or unsupported host platforms. Prefer CMake source gating so Funnel can retain desktop code without compiling it into Android.
+1. Keep the Funnel repository Android-only. New desktop UI, discovery, updater, Discord, packaging, or unsupported host-platform dependencies must not enter its source graph.
 2. Profile Vulkan submission, fence ownership, command-buffer batching, resource residency, texture conversion, and page-fault paths. Optimize contracts rather than game-specific signatures.
 3. Reduce memory duplication between guest memory, buffer cache, texture cache, staging allocations, and shader artifacts. Use residency budgets and generation tracking before adding eviction heuristics.
 4. Reduce shader compilation and pipeline creation on gameplay threads through persistent artifacts, asynchronous compilation, canonical pipeline keys, and bounded background work.
@@ -142,6 +140,6 @@ Cross-layer changes require measurements from both sides. The main candidates ar
 - Do not restore desktop/emulation files under client `src`.
 - Do not add a client include path ahead of Funnel for `common`, `core`, `video_core`, `shader_recompiler`, `input`, or `imgui`.
 - Do not bypass `lsx4_arm_desktop_layer.cmake` with direct desktop source paths in the root target.
-- Do not restore a desktop source inventory in the root `CMakeLists.txt`; source selection and exclusions belong to Funnel.
+- Do not restore a desktop source inventory in the root `CMakeLists.txt`; Android source ownership belongs to Funnel.
 - Build and hash the `.so`, install the APK with data preservation, deploy that exact `.so`, and verify the on-device hash before compatibility testing.
 - Test at least native initialization, a cached title launch, live JIT execution, GPU submission, and frame completion after a boundary change.

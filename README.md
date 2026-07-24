@@ -96,7 +96,7 @@ Contributions are welcome. Bug reports, compatibility results, performance trace
 | `externals/` | Native build dependencies |
 | `cmake/` | Android native build support |
 | `scripts/` | Android dependency build helpers |
-| `funnel-arm/` | Funnel ARM-adapted desktop/emulation layer and authoritative Android source profile used by the native target |
+| `funnel-arm/` | Android/ARM-adapted emulation layer and authoritative native source profile; desktop distributions and duplicate externals are intentionally absent |
 | `assets/` | Project artwork |
 
 ## Android application
