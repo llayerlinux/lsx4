@@ -123,9 +123,7 @@ bool WriteSyntheticNextGenEboot(const char* const path) {
     emit({0x66, 0x48, 0x0f, 0x7e, 0xcf});
     emit({0x0f, 0x01, 0xfa});
     emit({0x0f, 0x01, 0xfb});
-    // mov rdi, qword ptr fs:[-0x20] -- main-module Variant II TLS.
     emit({0x64, 0x48, 0x8b, 0x3c, 0x25, 0xe0, 0xff, 0xff, 0xff});
-    // mov rsi, qword ptr fs:[0] -- TCB self pointer.
     emit({0x64, 0x48, 0x8b, 0x34, 0x25, 0x00, 0x00, 0x00, 0x00});
     const auto call_offset = code.size();
     emit({0xff, 0x15, 0x00, 0x00, 0x00, 0x00});
@@ -251,7 +249,6 @@ bool WriteSyntheticNextGenModule(const char* const path) {
 
     std::array<Elf64_Phdr, 3> programs{};
     programs[0].p_type = PT_LOAD;
-    // Real PS5 modules commonly mark text PF_X without an explicit PF_R.
     programs[0].p_flags = PF_X;
     programs[0].p_offset = segment_offset;
     programs[0].p_vaddr = 0;
@@ -398,7 +395,7 @@ Function Resolve(void* const library, const char* const name) {
     return reinterpret_cast<Function>(dlsym(library, name));
 }
 
-} // namespace
+}
 
 int main(const int argc, char** const argv) {
     if (argc != 2) {

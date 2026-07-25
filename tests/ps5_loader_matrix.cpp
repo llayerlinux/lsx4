@@ -507,7 +507,7 @@ std::vector<Elf64_Dyn> BasicDynamic() {
     return dynamic;
 }
 
-} // namespace
+}
 
 int main(const int argc, char** const argv) {
     if (argc != 2) {

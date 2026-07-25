@@ -9,8 +9,6 @@ set(LSX4_ARM_DESKTOP_LAYER_DIR "${LSX4_ROOT}/funnel-arm")
 include("${LSX4_ARM_DESKTOP_LAYER_DIR}/cmake/lsx4_arm_desktop_layer.cmake")
 include("${LSX4_ARM_DESKTOP_LAYER_DIR}/cmake/lsx4_ps5_desktop_layer.cmake")
 
-# Script mode cannot use CONFIGURE_DEPENDS, so reproduce the PS4 manifest's
-# source roots without changing the production PS4 function.
 file(GLOB_RECURSE ps4_common_sources
     "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/*.cpp")
 file(GLOB_RECURSE ps4_core_sources

@@ -4651,9 +4651,6 @@ public:
         }
 #endif
 #if defined(LSX4_PS5_DESKTOP_PATH)
-        // A PS5 runtime can unload one process image and start another in the
-        // same host thread. Never carry a deferred native fault or helper
-        // diagnostic across that process boundary.
         g_jit_fault_resume_frame = nullptr;
         g_jit_deferred_guest_fault = {};
         g_helper_fault_message.clear();
@@ -19312,12 +19309,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 code->mov(code->x11, dynamic_hle_slab_base);
                                 code->sub(code->x11, code->x10, code->x11);
 #ifdef LSX4_PS5_DESKTOP_PATH
-                                // Avoid asking Xbyak_aarch64 to materialize the
-                                // power-of-two slab mask. Its logical-immediate
-                                // probe rotates a 64-bit value by zero via a
-                                // shift-by-64 expression. Comparing against the
-                                // exclusive end is equivalent for the non-zero
-                                // unsigned slab size.
                                 code->mov(code->x12, dynamic_hle_slab_size);
                                 code->cmp(code->x11, code->x12);
                                 code->blo(dynamic_slow_semantic);
@@ -20478,10 +20469,6 @@ LsxStackLease BorrowGuestStackWindow() {
         InitializeGuestStackReservoir(arena);
     }
 #if defined(LSX4_PS5_DESKTOP_PATH)
-    // The isolated PS5 runtime clears its mapping registry between process
-    // sessions, while this host thread intentionally retains the already
-    // mapped stack reservoir. Re-publish that persistent mapping before the
-    // first synthetic return slot is written in the new session.
     executor_lsx4_android_note_guest_stack_window(
         arena.low,
         static_cast<std::uint64_t>(arena.top - arena.low),
@@ -20743,10 +20730,6 @@ LsxStackLease InitializeGuestEntryFrame(LsxMachineImage& state,
                 StoreGuestScalar(guest_rsp + index * sizeof(std::uint64_t),
                                  entry_parameters[index], sizeof(std::uint64_t));
             }
-            // The process-entry frame reserves a third qword for the root
-            // return sentinel. Stack reservoirs persist across launches, so
-            // relying on a value left by an earlier lease can make the final
-            // RET branch to stale argc/argv data (commonly address 0x1).
             StoreGuestScalar(
                 guest_rsp + entry_parameters.size() *
                                 sizeof(std::uint64_t),
@@ -25929,8 +25912,6 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         }
         const std::size_t width = transaction.Width();
         if (fma->scalar) {
-            // VEX scalar FMA merges bits 127:lane from SRC1 and clears the
-            // physical YMM tail when the XMM destination is published.
             result = lhs;
         }
         const std::size_t execute_width =

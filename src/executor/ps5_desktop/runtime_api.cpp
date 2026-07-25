@@ -87,8 +87,6 @@ constexpr std::size_t Ps5ProgramNameBufferSize = 0x200;
 constexpr std::size_t Ps5LibcNeedFlagOffset = 0x300;
 constexpr std::size_t Ps5LibcInternalNeedFlagOffset = 0x304;
 constexpr std::size_t Ps5ProcessEntryParamsOffset = 0x320;
-// SharpEmu's FreeBSD/AMD64 Variant II model reserves a sizeable static-TLS
-// prefix because real PS5 module sets exceed a host page.
 constexpr std::size_t Ps5StaticTlsReservation = 0x20000;
 constexpr std::size_t Ps5TcbAndDtvSize = 0x4000;
 constexpr std::size_t Ps5TlsRegionSize =
@@ -103,15 +101,6 @@ struct RegisteredMapping {
     bool internal{};
 };
 
-// Every guest load and store resolves its mapping here, while a running title
-// keeps tens of thousands of small heap mappings alive.  The registry is
-// therefore ordered by base address: a lookup examines the few predecessors of
-// the address instead of the whole registry.  Mappings never overlap, so the
-// containing entry is normally the immediate predecessor; a small probe budget
-// absorbs the rare adjacent-registration case.  Large mappings live in a
-// second, much shorter index because a wide region can sit arbitrarily far
-// below the address it covers, which is exactly the case a bounded probe of
-// the main index cannot reach.
 class GuestMappingRegistry {
 public:
     static constexpr std::uint64_t WideMappingBytes = 1ull << 20;
@@ -127,10 +116,6 @@ public:
             narrow != nullptr) {
             return narrow;
         }
-        // A wide mapping can begin far below the address it covers, so the
-        // bounded probe that suits the dense small-mapping index would miss
-        // it.  This index stays short because only megabyte-scale regions
-        // land here, so it is searched in full.
         return FindIn(wide_, address, byte_count, access,
                       std::numeric_limits<std::size_t>::max());
     }
@@ -462,19 +447,12 @@ struct RuntimeState {
     std::uint64_t guest_address_limit{0x10000000000ull};
     std::uint64_t preferred_image_base{Ps5ImageBase};
     Lsx4Ps5RuntimeCallbacks callbacks{};
-    // Guest accesses resolve a mapping on every read and write, so the
-    // registry is ordered by base address instead of scanned linearly.  A
-    // title that keeps tens of thousands of small heap mappings alive turned
-    // the previous vector scan into the dominant cost of the whole runtime.
     GuestMappingRegistry mappings;
     std::vector<LoadedProgram> programs;
     std::vector<GuestThreadContext> threads;
     std::unordered_map<std::uint64_t, HleBinding> hle_bindings;
     std::vector<DirectAllocation> direct_allocations;
     std::vector<OwnedGuestMapping> owned_guest_mappings;
-    // A running title keeps a very large number of small allocations
-    // alive, and free/realloc look them up by guest address.  Keying the
-    // registry by that address keeps both operations constant time.
     std::unordered_map<std::uint64_t, LibcHeapAllocation>
         libc_heap_allocations;
     std::vector<std::thread> guest_host_threads;
@@ -889,12 +867,6 @@ bool HasAccessLocked(const std::uint64_t address,
            g_runtime.mappings.Find(address, byte_count, access) != nullptr;
 }
 
-// Guest code walks the same region for long stretches: command buffers,
-// vertex and index data, textures and stacks are all revisited word by word.
-// Remembering the last mapping that satisfied a thread lets the common access
-// skip both the registry lookup and the runtime mutex.  The generation stamp
-// makes the cache self-invalidating: any registration or removal retires every
-// cached entry at once.
 struct GuestAccessCacheEntry {
     std::uint64_t generation{};
     std::uint64_t address{};
@@ -904,10 +876,6 @@ struct GuestAccessCacheEntry {
 
 thread_local GuestAccessCacheEntry g_guest_access_cache{};
 
-// Boot-time HLE tracing: PS5_TRACE_HLE=1 records every bridged call with its
-// resolved symbol and the value handed back to the guest.  Guest bootstrap code
-// feeds one call's result straight into the next call's arguments, so the
-// returned values are the only way to see where a chain first goes wrong.
 bool Ps5TraceHleEnabled() {
     static const bool enabled = [] {
         const char* const requested = std::getenv("PS5_TRACE_HLE");
@@ -916,9 +884,6 @@ bool Ps5TraceHleEnabled() {
     return enabled;
 }
 
-// Diagnostic escape hatch: PS5_MAPPING_STRICT=1 restores the fully serialized
-// lookup so a suspected regression can be attributed to the fast path rather
-// than to unrelated runtime changes.
 bool GuestAccessCacheEnabled() {
     static const bool enabled = [] {
         const char* const strict = std::getenv("PS5_MAPPING_STRICT");
@@ -939,11 +904,6 @@ bool HasCachedAccess(const std::uint64_t address,
            address - cached.address <= cached.byte_count - byte_count;
 }
 
-// The transfer itself stays inside the registry lock on the slow path.  A
-// mapping is unmapped only after it has been removed under that same lock, so
-// holding it across the copy is what keeps a concurrent free from pulling the
-// pages out from under an in-flight transfer.  A cache hit proves the mapping
-// was live at the current generation and repeats the copy without the lock.
 bool CopyGuestBytes(const std::uint64_t address, void* const destination,
                     const void* const source, const std::size_t byte_count,
                     const std::uint32_t access) {
@@ -1159,8 +1119,6 @@ bool CreateThreadContextLocked(
         }
     }
 
-    // FreeBSD/AMD64 TCB plus the compact DTV layout used by SharpEmu:
-    // generation, maximum module ID, then one pointer per module.
     const auto dtv_address = fs_base + 0x100;
     const std::uint64_t generation =
         static_cast<std::uint64_t>(tls_programs.size());
@@ -1488,37 +1446,26 @@ int LoaderUnregisterMapping(void*, const std::uint64_t address,
 }
 
 bool PreferPs5BuiltinHle(const std::string_view symbol) {
-    // SharpEmu registers these libc/runtime exports as HLE and resolves them
-    // before the LLE module exports. Keeping the same priority is important:
-    // the bundled libc allocator expects kernel-maintained heap state that is
-    // intentionally not part of this isolated runtime. Its process-wide
-    // atexit registry must also stay outside the guest libc: PS5 bootstrap
-    // entries commonly return after spawning the real game thread, and
-    // allowing guest libc to finalize at that point destroys globals that the
-    // game thread is already using.
     constexpr std::array<std::string_view, 19> symbols{
-        "gQX+4GDQjpM", // malloc
-        "tIhsqj0qsFE", // free
-        "2X5agFjKxMc", // calloc
-        "Y7aJ1uydPMo", // realloc
-        "Ujf3KzMvRmI", // memalign
-        "2Btkg8k24Zg", // aligned_alloc
-        "cVSk9y8URbc", // posix_memalign
-        // FILE objects from the bundled libc eventually require kernel state
-        // that is outside the isolated runtime.  SharpEmu gives its stdio HLE
-        // the same precedence and backs FILE* with guest-addressable storage.
-        "xeYO4u7uyJ0", // fopen
-        "rQFVBXp-Cxg", // fseek
-        "Qazy8LmXTvw", // ftell
-        "uodLYyUip20", // fclose
-        "lbB+UlZqVG0", // fread
-        "bzQExy189ZI", // _init_env
-        "8G2LB+A3rzg", // atexit
-        "tsvEmnenz48", // __cxa_atexit
-        "H2e8t5ScQGc", // __cxa_finalize
-        "kbw4UHHSYy0", // __pthread_cxa_finalize
-        "uMei1W9uyNo", // exit
-        "XKRegsFpEpk", // catchReturnFromMain
+        "gQX+4GDQjpM",
+        "tIhsqj0qsFE",
+        "2X5agFjKxMc",
+        "Y7aJ1uydPMo",
+        "Ujf3KzMvRmI",
+        "2Btkg8k24Zg",
+        "cVSk9y8URbc",
+        "xeYO4u7uyJ0",
+        "rQFVBXp-Cxg",
+        "Qazy8LmXTvw",
+        "uodLYyUip20",
+        "lbB+UlZqVG0",
+        "bzQExy189ZI",
+        "8G2LB+A3rzg",
+        "tsvEmnenz48",
+        "H2e8t5ScQGc",
+        "kbw4UHHSYy0",
+        "uMei1W9uyNo",
+        "XKRegsFpEpk",
     };
     return std::ranges::contains(symbols, symbol);
 }
@@ -2163,10 +2110,6 @@ bool TryResolveGuestPath(
     if (root.empty()) {
         return false;
     }
-    // Console paths commonly contain a redundant separator after the mount
-    // name (for example "/app0//shaders/presenter.vert").  A leading
-    // separator in std::filesystem::path would turn the suffix into an
-    // absolute host path and discard the sandbox root.
     while (!relative.empty() &&
            (relative.front() == '/' || relative.front() == '\\')) {
         relative.remove_prefix(1);
@@ -3257,7 +3200,6 @@ constexpr std::uint32_t AgcRFlip = 0x17;
 constexpr std::uint32_t AgcRReleaseMem = 0x18;
 constexpr std::uint32_t AgcRDmaData = 0x19;
 constexpr std::uint32_t AgcCbSetShRegisterRangeMarker = 0x6875000d;
-// Gen5 context-register layout, kept aligned with SharpEmu's AGC decoder.
 constexpr std::uint32_t AgcCbTargetMask = 0x8e;
 constexpr std::uint32_t AgcCbBlend0Control = 0x1e0;
 constexpr std::uint32_t AgcCbColor0Base = 0x318;
@@ -3632,8 +3574,6 @@ bool TryAgcPatchDmaDataAddress(
         }
     }
 
-    // Newer Gen5 SDKs can pass the address of the 64-bit patch field
-    // directly instead of the packet base. Void Terrarium uses this form.
     result = command_or_field != 0 &&
                      TryWriteGuestValue(command_or_field, value)
         ? 0
@@ -3677,8 +3617,6 @@ bool TryAgcPatchWaitRegMemAddress(
         }
     }
 
-    // Newer Gen5 SDKs can pass the address payload field itself instead of
-    // the packet base. Void Terrarium uses this form for its first wait.
     result = command_or_field != 0 &&
                      TryWriteGuestValue(command_or_field, address)
         ? 0
@@ -4165,9 +4103,6 @@ bool TryReadAgcCpuVertexBuffer(
         (static_cast<std::uint64_t>(
              draw.sh_es_user_data[1] & 0xffu) << 32u) |
             draw.sh_es_user_data[0]};
-    // Unity's regular mesh layout starts its buffer descriptor table at
-    // SRT+0x180; a smaller legacy layout used by the earlier splash path
-    // places it at +0x80.
     std::array<std::uint32_t, 4> last_descriptor{};
     std::uint64_t used_srt_address{};
     std::uint64_t used_descriptor_offset{};
@@ -4213,10 +4148,6 @@ bool TryReadAgcCpuVertexBuffer(
             const auto candidate_elements = descriptor[2];
             const auto candidate_unified_format =
                 (descriptor[3] >> 12u) & 0x7fu;
-            // C40 packs the position descriptor index/format into s4 and a
-            // second UNORM8 attribute selector into s5. Both selectors may
-            // reference the same table entry, so unlike BAA its valid stream
-            // does not require two distinct adjacent sibling descriptors.
             bool has_unity_vertex_group =
                 !unity_ui_shader ||
                 (unity_aee_shader &&
@@ -4313,10 +4244,6 @@ bool TryReadAgcCpuVertexBuffer(
                         sizeof(value));
                     return value;
                 };
-            // BAA consumes object/world coordinates and applies two shader
-            // matrices later. Valid gameplay quads can therefore be many
-            // viewport widths away before projection. Keep a corruption
-            // guard, but do not reject them using screen-space limits.
             const auto position_limit_x =
                 unity_world_sprite_shader
                 ? 10000000.0f
@@ -4420,10 +4347,6 @@ bool TryReadAgcCpuVertexBuffer(
             return true;
         };
     if (unity_aee_shader) {
-        // SharpEmu maps NGG user data at s8.  For this AEE shader s16:s17
-        // names the resource-descriptor table and s18:s19 names the small
-        // parameter block.  The shader selects the vertex resource with
-        // (dword(s18 + 8) & 0x1f) * 16 before its first buffer load.
         const auto descriptor_table =
             (static_cast<std::uint64_t>(
                  draw.sh_gs_user_data[9] & 0xffu) << 32u) |
@@ -4446,15 +4369,6 @@ bool TryReadAgcCpuVertexBuffer(
                 descriptor_table, descriptor_offset);
         }
     } else if (unity_ui_shader) {
-        // This Unity NGG shader maps hardware GS user data at s8. Its scalar
-        // chain is:
-        //   s48 = *(s14:s15)
-        //   s106 = (s48 & 0x1f) << 4
-        //   s[0:3] = *(s12:s13 + s106)
-        //   buffer_load_format_xyzw ... s[0:3]  (PC 0xe4)
-        // s12:s13 are GS user data 4/5 (EUD base) and s14:s15 are
-        // GS user data 6/7 (SRT base). ES user data is also retained as a
-        // diagnostic fallback for non-NGG register programming.
         const std::array<std::pair<std::uint64_t, std::uint64_t>, 2>
             table_bases{{
                 {
@@ -4647,13 +4561,6 @@ bool TryReadAgcCpuVertexBuffer(
              {UINT64_C(0x180), UINT64_C(0x80)}) {
             (void)try_descriptor(srt_address, descriptor_offset);
         }
-        // Unity can relocate the mesh descriptor within a generated SRT.
-        // Shader resource descriptors are addressed by byte PC (SharpEmu
-        // resolves the position stream at PC 0xe4 for this Unity shader),
-        // so they are not necessarily 16-byte aligned relative to the
-        // exported SRT pointer. Search dword boundaries and retain only the
-        // highest-scoring descriptor whose referenced geometry is finite,
-        // non-degenerate, on-screen, and has plausible UVs.
         for (std::uint64_t descriptor_offset = 0;
              descriptor_offset < UINT64_C(0x200);
              descriptor_offset += 4u) {
@@ -4759,8 +4666,6 @@ bool TryReadAgcCpuTextureElements(
         return false;
     }
 
-    // AMD AddrLib's GFX10_SW_4K_S pattern. The coordinate is a texel for
-    // ordinary images and a 4x4 compression block for BC images.
     std::array<std::uint32_t, 12> x_masks{};
     std::array<std::uint32_t, 12> y_masks{};
     std::uint32_t block_width{};
@@ -5209,9 +5114,6 @@ bool TryCompositeAgcCpuDraw(
         if (vertex_stride == 16u &&
             (draw.sh_es_program_lo & UINT32_C(0xfff)) ==
                 UINT32_C(0xc40)) {
-            // C40 loads its only interpolant as UNORM8x4 from byte offset 12.
-            // The first two channels are the atlas coordinates. Texture color
-            // is not multiplied by this packed attribute in the CPU fallback.
             vertices[index].u =
                 static_cast<float>(source[12u]) / 255.0f;
             vertices[index].v =
@@ -5253,11 +5155,6 @@ bool TryCompositeAgcCpuDraw(
             for (auto& channel : vertices[index].color) {
                 channel = std::clamp(channel, 0.0f, 1.0f);
             }
-            // Unity's ordinary Gen5 UI sprites use this float4 slot for
-            // alpha while their pixel shader samples RGB without tinting.
-            // Splash frames are the exception: their dedicated 1920x1080
-            // overlay uses an opaque black companion layer to hide the
-            // already prepared menu scene.
             if (ignore_black_rgb_tint &&
                 vertices[index].color[0] == 0.0f &&
                 vertices[index].color[1] == 0.0f &&
@@ -5289,14 +5186,6 @@ bool TryCompositeAgcCpuDraw(
     if (vertex_shader_suffix == UINT32_C(0xbaa) ||
         vertex_shader_suffix == UINT32_C(0xaee) ||
         vertex_shader_suffix == UINT32_C(0xc40)) {
-        // Unity's BAA NGG shader applies two row-major float4x4 matrices
-        // before exporting position:
-        //   object = M0 * float4(position.xyz, 1)
-        //   clip   = M1 * object
-        // s8:s11 is the constant-buffer descriptor and the shader loads the
-        // 32 matrix dwords from offsets 0 and 64.  Applying those matrices is
-        // essential for world sprites; their raw vertices are deliberately
-        // outside the viewport and cannot be treated as screen coordinates.
         const auto transform_address =
             static_cast<std::uint64_t>(
                 draw.sh_gs_user_data[0]) |
@@ -5461,9 +5350,6 @@ bool TryCompositeAgcCpuDraw(
         if (maximum_x < 0.0f || maximum_y < 0.0f ||
             minimum_x >= static_cast<float>(FrameWidth) ||
             minimum_y >= static_cast<float>(FrameHeight)) {
-            // A fully off-screen layer is complete without decoding its
-            // texture. Gameplay uses dozens of 2K BC3 terrain tiles, so this
-            // avoids cache churn and repeated detiling on Android.
             if (draw_ordinal < 64u) {
                 frame.rendered_draw_mask |=
                     UINT64_C(1) << draw_ordinal;
@@ -5818,10 +5704,6 @@ bool TryCompositeAgcCpuDraw(
         }
     }
     if (covered_pixels == 0) {
-        // A fully transparent UI quad is a valid no-op, not a failed layer.
-        // Count it as handled so it cannot make an otherwise complete frame
-        // fail quality gating.  Geometry that rasterizes no pixels remains a
-        // real failure and is kept out of the success mask.
         if (rasterized_pixels != 0u ||
             positions_are_render_target_coordinates) {
             if (draw_ordinal < 64u) {
@@ -6018,10 +5900,6 @@ bool TryApplyAgcCpuClearOrCopy(
         return false;
     }
 
-    // Unity's Gen5 fullscreen clear shader consumes four float constants
-    // through a 16-byte scalar buffer descriptor. The diagnostic descriptor
-    // decoder sees that buffer as a 5x1 linear texture, which uniquely
-    // distinguishes this pass from sampled-image draws.
     if (draw.draw_count == 3u &&
         draw.texture_address != 0 &&
         draw.texture_width == 5u &&
@@ -6105,10 +5983,6 @@ bool TryApplyAgcCpuClearOrCopy(
                     CpuFrameHeight,
                 packed);
             const std::lock_guard lock{g_runtime.mutex};
-            // A clear starts assembly of the next software frame. Keep it
-            // separate from the last published surface so a valid scene
-            // cannot be replaced by a flat clear while later DCBs are still
-            // being decoded.
             g_runtime.agc_cpu_working_surfaces[
                 draw.render_target_address] =
                 std::move(software_clear);
@@ -6135,8 +6009,6 @@ bool TryApplyAgcCpuClearOrCopy(
         return true;
     }
 
-    // The following fullscreen quad is the final AGC blit from the
-    // intermediate display-sized RT into the buffer named by RFlip.
     if (draw.draw_count == 4u &&
         draw.texture_address != 0 &&
         draw.texture_width == draw.render_target_width &&
@@ -6205,10 +6077,6 @@ bool TryApplyAgcCpuClearOrCopy(
 }
 
 #ifdef __ANDROID__
-// A title that renders at 3840x2160 costs about 33 MiB per presented frame in
-// each stage that walks the surface.  Presenting a decimated copy keeps the
-// visible result on a phone panel while removing most of that traffic, and the
-// swapchain blit performs the final scale on the GPU.
 std::uint32_t PresenterDecimationStep(const std::uint32_t width,
                                       const std::uint32_t height) {
     static const std::uint32_t cap_height = [] {
@@ -6236,9 +6104,6 @@ std::uint32_t PresenterDecimationStep(const std::uint32_t width,
     return step;
 }
 
-// Row-parallel work keeps the presentation stage off the critical path of a
-// single core.  The surface is read-only here and every row writes a disjoint
-// destination range, so the split needs no further synchronization.
 template <typename RowWork>
 void RunPresenterRows(const std::uint32_t rows, RowWork&& work) {
     const auto hardware = std::thread::hardware_concurrency();
@@ -6295,9 +6160,6 @@ bool TryReadGuestPresenterRgba(
         return false;
     }
 
-    // Exact GFX10 64 KiB R_X equation for Oberon's RB+ topology at
-    // four bytes per element. This is the same mode-27 equation used by
-    // SharpEmu's GnmTiling detiler. A block is 128x128 RGBA pixels.
     constexpr std::uint32_t XMask[16]{
         0u, 0u, 1u << 0u, 1u << 1u,
         0u, 0u, 1u << 2u, 0u,
@@ -6396,10 +6258,6 @@ bool TryReadGuestPresenterRgba(
             const auto source_block_base =
                 block_y_base + block_x * block_pixel_stride;
             for (std::uint32_t x = block_left; x < block_right; ++x) {
-                // The assembled axis terms can address past the end of the
-                // staged surface, which faulted while presenting.  Out-of-
-                // range elements are dropped instead of clamped so that the
-                // pixels the equation does resolve keep their exact values.
                 const auto source =
                     source_block_base +
                     (x_terms[x] ^ y_term);
@@ -6419,9 +6277,6 @@ void PresentGuestTextureToAndroid(
     const GuestPresenterTexture& texture,
     const std::shared_ptr<AgcCpuFrame>& cpu_frame,
     const std::uint64_t flip_count) {
-    // Use every flip by default for best gameplay responsiveness.
-    // This can be throttled with PS5_ANDROID_PRESENT_DIVISOR>1 for
-    // diagnostics when needed.
     static const std::uint64_t presentation_divisor = []() -> std::uint64_t {
         const char* divisor =
             std::getenv("PS5_ANDROID_PRESENT_DIVISOR");
@@ -6729,12 +6584,6 @@ void ObserveAgcFlip(const std::int32_t handle,
                 g_runtime.agc_cpu_surfaces.end()) {
                 cpu_frame = software_surface->second;
             }
-            // Unity can submit several DCBs around RFlip.  Resolve the
-            // capture queued by the previous flip now, after the remaining
-            // DCBs had a full presentation interval to finish.  Looking the
-            // surface up here (instead of snapshotting it when queued) is
-            // important: every completed DCB replaces the immutable shared
-            // frame stored at this address.
             if (g_runtime.agc_cpu_pending_capture_target != 0) {
                 resolved_capture_target =
                     g_runtime.agc_cpu_pending_capture_target;
@@ -6761,9 +6610,6 @@ void ObserveAgcFlip(const std::int32_t handle,
                 }
                 g_runtime.agc_cpu_pending_capture_target = 0;
             }
-            // Queue the current intermediate target for the next real flip.
-            // This one-frame latency prevents partially assembled DCB bursts
-            // from becoming visible as stripes or flashing fragments.
             if (g_runtime.agc_cpu_capture_active &&
                 g_runtime.agc_cpu_capture_target != 0) {
                 g_runtime.agc_cpu_pending_capture_target =
@@ -6964,10 +6810,6 @@ void ObserveAgcFlip(const std::int32_t handle,
 bool TryAgcDriverSubmitDcb(
     const Lsx4::Translation::HleBridgeRequest& request,
     std::uint64_t& result) {
-    // AGC queue parser state is persistent across submissions. Unity commonly
-    // programs render targets in one DCB and emits the draw in the next one.
-    // Serialize the isolated graphics queue so each submit observes and
-    // publishes an exact state snapshot in guest order.
     const std::lock_guard submit_lock{g_agc_submit_mutex};
     const auto packet_address = request.integer_arguments[0];
     std::uint64_t command_address{};
@@ -7202,11 +7044,6 @@ skip_packet_diagnostic_log:
                 if (destination_supported &&
                     destination_address != 0 &&
                     operation_supported) {
-                    // RELEASE_MEM is a GPU-completion fence.  Publishing it
-                    // while this software queue is still consuming dynamic
-                    // vertex/texture rings lets Unity recycle and overwrite
-                    // those buffers mid-frame.  Commit it only after every
-                    // draw in this DCB has been consumed.
                     deferred_release_writes.push_back({
                         .standard_packet = standard_packet,
                         .destination_selection = destination,
@@ -7753,19 +7590,11 @@ skip_packet_diagnostic_log:
             }
             diagnostic_flip = flip;
             has_diagnostic_flip = true;
-            // Defer presentation until the second pass has composed every
-            // draw and persisted the completed software surface below.
-            // Unity embeds RFlip in the same DCB that finishes the frame;
-            // observing it here would therefore present the previous frame.
         }
         offset += length;
     }
     const auto is_cpu_draw_candidate =
         [](const AgcDiagnosticDraw& draw) {
-            // Unity C40/EC38 is an untextured fullscreen colour pass: EC38
-            // only exports interpolated attribute 0.  Treating the stale
-            // texture descriptor as a sampled image needlessly detiles a
-            // 16 MiB atlas and can cover the composed scene with black.
             if ((draw.sh_es_program_lo & UINT32_C(0xfff)) ==
                     UINT32_C(0xc40) &&
                 (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
@@ -7791,10 +7620,6 @@ skip_packet_diagnostic_log:
         };
     cpu_render_decided = std::ranges::any_of(
         diagnostic_draws, is_cpu_draw_candidate);
-    // A Unity scene is assembled through a burst of small DCB submissions
-    // into the same render target.  The clear pass selects one whole frame
-    // at the presentation throttle; every DCB belonging to that selected
-    // frame must then be composed through its final blit.
     if (cpu_render_decided) {
         const std::lock_guard lock{g_runtime.mutex};
         if (g_runtime.agc_cpu_capture_active) {
@@ -7822,10 +7647,6 @@ skip_packet_diagnostic_log:
                     is_cpu_target_relevant(draw);
             });
     if (cpu_render_allowed) {
-        // Decoding a tiled 2048x1024 atlas costs millions of address
-        // calculations. Atlases remain immutable for a title, so retain them
-        // across DCB submissions. Render targets and full-size intermediates
-        // are mutable and must never be reused from this cache.
         std::erase_if(
             cpu_texture_cache,
             [&](const AgcCpuDecodedTexture& texture) {
@@ -8061,10 +7882,6 @@ skip_packet_diagnostic_log:
     }
     {
         const std::lock_guard lock{g_runtime.mutex};
-        // Preserve intermediate contributions in a private working surface.
-        // Unity builds gameplay frames across multiple DCBs, but neither a
-        // clear nor a partial DCB may replace an already published complete
-        // surface.
         for (const auto& [surface_target, surface] :
              cpu_command_surfaces) {
             if (surface_target == 0 ||
@@ -8194,9 +8011,6 @@ skip_packet_diagnostic_log:
         }
         std::ranges::sort(
             ranked, std::greater<>{});
-        // The submit rate and the size of the guest bookkeeping tables are
-        // the two numbers that tell whether the runtime is losing throughput
-        // to registry growth rather than to real GPU work.
         static std::mutex rate_mutex;
         static std::chrono::steady_clock::time_point rate_mark{};
         static std::uint64_t rate_count{};
@@ -8902,13 +8716,6 @@ bool TryGuestPthreadAttributeOperation(
         return true;
     }
 
-    // Every remaining case reads or writes a caller-supplied attribute object,
-    // so a null attribute address is invalid for those symbols.  The check has
-    // to stay scoped to them: this dispatcher is consulted for every bridged
-    // symbol, and an unscoped guard also answered for unrelated calls whose
-    // first argument is legitimately zero.  sceKernelGetDirectMemorySize takes
-    // no arguments, so it was rejected here and the guest fed the returned
-    // error straight into sceKernelAllocateDirectMemory as its search bound.
     constexpr std::array<std::string_view, 26> AttributeObjectSymbols{
         "8+s5BzZjxSg", "JaRMy+QcpeU", "txHtngJ+eyc", "Ru36fiTtJzA",
         "-fA+7ZlGDQs", "0qOtCR-ZHck", "VUT1ZSrHT0I", "JNkVVsVDmOk",
@@ -9553,9 +9360,6 @@ bool TryGuestConditionVariableOperation(
             static_cast<std::uint32_t>(
                 request.integer_arguments[2])};
     } else if (symbol == "27bAgiJmOh0") {
-        // POSIX absolute-timespec waits are not used by the current title.
-        // A bounded wait preserves mutex release/reacquisition without
-        // treating an opaque guest pointer as a duration.
         timeout = std::chrono::milliseconds(1);
     }
 
@@ -10215,9 +10019,6 @@ bool TryMapDirectMemory(
         host_protection |= PROT_READ;
     }
     if ((orbis_protection & 0x02u) != 0) {
-        // Arm64 writable pages are readable in practice, and PS5 titles use
-        // CPU_WRITE encodings (for example 0xc2/0xf2) for allocator metadata
-        // that is immediately read back through kernel in/out pointers.
         guest_protection |=
             LSX4_PS5_GUEST_READ | LSX4_PS5_GUEST_WRITE;
         host_protection |= PROT_READ | PROT_WRITE;
@@ -10598,9 +10399,6 @@ bool TryInvokeBuiltinHle(
         symbol == "tsvEmnenz48" ||
         symbol == "H2e8t5ScQGc" ||
         symbol == "kbw4UHHSYy0") {
-        // Match SharpEmu's runtime boundary. In particular,
-        // __cxa_atexit must not populate guest libc's process-wide teardown
-        // list while the bootstrap entry is about to hand off to a pthread.
         result = 0;
         return true;
     }
@@ -10735,9 +10533,6 @@ bool TryInvokeBuiltinHle(
             return true;
         }
         const auto close_status = std::fclose(stream);
-        // Match SharpEmu's mixed HLE/LLE stdio boundary: native libc helpers
-        // may still inspect a FILE object after the host stream is closed.
-        // The densely packed guest handle remains zero-backed until reset.
         result = close_status == 0
             ? 0
             : static_cast<std::uint64_t>(
@@ -10996,8 +10791,6 @@ bool TryInvokeBuiltinHle(
         return true;
     }
     if (symbol == "p5EcQeEeJAE") {
-        // The isolated runtime owns its heap implementation. Preserve the
-        // application heap API registration ABI while retaining that owner.
         result = 0;
         return true;
     }
@@ -12121,9 +11914,6 @@ bool TryInvokeBuiltinHle(
             }
             if (queue->second.empty()) {
                 const std::uint32_t zero{};
-                // TryWriteGuestValue acquires g_runtime.mutex itself. Release
-                // the queue lock before writing the timeout count or this
-                // path deadlocks every runtime user behind the same mutex.
                 lock.unlock();
                 if (out_count != 0) {
                     (void)TryWriteGuestValue(out_count, zero);
@@ -12560,7 +12350,6 @@ void ResetPs5TranslationSession() noexcept {
             "", "ps5-session-" + std::to_string(generation),
             generation, false);
     } catch (...) {
-        // Unload/reset must remain noexcept from the public ABI perspective.
     }
 }
 
@@ -12573,8 +12362,6 @@ int RuntimeStrcmp(const char* left, const char* right) {
 
 std::uint64_t InvokeAndroidFallbackHle(
     void*, const Lsx4Ps5HleCall* const call) {
-    // Built-in HLE runs after this callback and overrides its return value.
-    // Unknown imports deliberately retain the diagnostic policy of zero.
 #ifdef __ANDROID__
     if (call != nullptr) {
         const auto symbol = HleSymbol(call->function);
@@ -12644,7 +12431,7 @@ std::uint64_t InvokeAndroidFallbackHle(
     return 0;
 }
 
-} // namespace
+}
 
 extern "C" const char* executor_lsx4_ps5_runtime_abi() {
     return "lsx4-ps5-runtime/7";
@@ -14462,4 +14249,4 @@ std::uintptr_t ResolvedLeafBridgeEntry() noexcept {
         &ExecutorJitResolvedLeafHleCallback);
 }
 
-} // namespace Lsx4::Translation
+}

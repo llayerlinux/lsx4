@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Generated mechanically from SharpEmu Gen5 register-default tables.
 
 static constexpr std::array<AgcRegisterDefaultRecord, 205> AgcPrimaryRegisterDefaults{{
     {0u, 0u, 0u, 0xE24F806Du, 0u, 0x202u, 0x00CC0010u},

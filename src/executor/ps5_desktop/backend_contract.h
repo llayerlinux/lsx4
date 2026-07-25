@@ -17,4 +17,4 @@ struct BackendCompatibility {
 
 [[nodiscard]] BackendCompatibility InspectBackendCompatibility() noexcept;
 
-} // namespace Lsx4::Ps5Desktop
+}

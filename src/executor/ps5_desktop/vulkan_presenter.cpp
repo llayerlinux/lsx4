@@ -688,10 +688,6 @@ bool SubmitFrame(Presenter& presenter,
         const auto fence_status = vkGetFenceStatus(
             presenter.device, presenter.fence);
         if (fence_status == VK_NOT_READY) {
-            // Keep input and CPU threads moving when the GPU is already
-            // processing the previous frame. The stale contents are still
-            // on screen; presenting this frame would block and worsen
-            // interactivity.
             return true;
         }
         if (fence_status != VK_SUCCESS) {
@@ -868,7 +864,7 @@ bool SubmitFrame(Presenter& presenter,
     return true;
 }
 
-}  // namespace
+}
 
 bool PresentVulkanFrame(ANativeWindow* const window,
                         const std::uint8_t* const rgba,
@@ -930,6 +926,6 @@ void ResetVulkanPresenter() {
     DestroyPresenter(g_presenter);
 }
 
-}  // namespace Lsx4::Ps5Desktop
+}
 
 #endif
