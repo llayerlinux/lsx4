@@ -58,4 +58,12 @@
     <string name="game_menu_opacity">Opacité des commandes</string>
     <string name="game_menu_opacity_value">%1$d%%</string>
     <string name="game_menu_exit">Quitter vers la bibliothèque</string>
+    <string name="category_managed_optimizations">Optimisations contrôlées</string>
+    <string name="category_managed_optimizations_summary">Chemins ARM rapides facultatifs avec risques de compatibilité</string>
+    <string name="optimization_arm_gpu_fast_path">Chemin GPU ARM rapide</string>
+    <string name="optimization_arm_gpu_fast_path_hint">Achemine les constantes de shader via la mémoire GPU directe et retire les diagnostics Funnel de chaque draw et submit. Les performances peuvent augmenter, mais certains pilotes peuvent présenter des défauts graphiques ou des plantages. Redémarrez le jeu après modification.</string>
+    <string name="optimization_coarse_fragment_2x2">Ombrage grossier des fragments 2×2</string>
+    <string name="optimization_coarse_fragment_2x2_hint">Exécute une invocation du fragment shader pour chaque groupe de pixels 2×2. Cela peut fortement réduire la charge GPU, mais diminue les détails fins et peut altérer certains effets. Redémarrez le jeu après modification.</string>
+    <string name="optimization_disable_vk_robustness">Désactiver les contrôles Vulkan robustness</string>
+    <string name="optimization_disable_vk_robustness_hint">Supprime la protection des limites des tampons et images GPU. Les jeux riches en shaders peuvent accélérer, mais un accès invalide peut corrompre l’image ou planter le pilote. Redémarrez le jeu après modification.</string>
 </resources>

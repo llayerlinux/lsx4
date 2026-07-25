@@ -13,6 +13,7 @@ import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.InsetDrawable;
 import android.graphics.drawable.StateListDrawable;
 import android.net.Uri;
 import android.os.Bundle;
@@ -57,6 +58,9 @@ public final class SettingsActivity extends Activity {
     public static final String K_KEEP_AWAKE = "keep_awake";
     public static final String K_AUTO_LAUNCH_STORE = "auto_launch_store";
     public static final String K_PERSISTENT_JIT_CACHE = "persistent_jit_cache";
+    public static final String K_ARM_GPU_FAST_PATH = "managed_arm_gpu_fast_path";
+    public static final String K_COARSE_FRAGMENT_2X2 = "managed_coarse_fragment_2x2";
+    public static final String K_DISABLE_VK_ROBUSTNESS = "managed_disable_vk_robustness";
     private static final String K_LEGACY_PERSISTENT_JIT_CACHE =
             "jit_persistent_jit_cache";
     public static final String K_DISABLE_DYNAMIC_SHADOWS = "disable_dynamic_shadows";
@@ -179,6 +183,9 @@ public final class SettingsActivity extends Activity {
                 case "cache":
                     buildCache(root);
                     break;
+                case "managed_optimizations":
+                    buildManagedOptimizations(root);
+                    break;
                 case "other":
                     buildOther(root);
                     break;
@@ -214,6 +221,8 @@ public final class SettingsActivity extends Activity {
 
         root.addView(category(R.string.category_graphics, R.string.category_graphics_summary,
                 "graphics"));
+        root.addView(category(R.string.category_managed_optimizations,
+                R.string.category_managed_optimizations_summary, "managed_optimizations"));
         root.addView(category(R.string.category_audio, R.string.category_audio_summary, "audio"));
         root.addView(category(R.string.category_controls, R.string.category_controls_summary,
                 "controls"));
@@ -495,6 +504,28 @@ public final class SettingsActivity extends Activity {
         root.addView(hint(getString(R.string.cache_hint)));
     }
 
+    private void buildManagedOptimizations(LinearLayout root) {
+        root.addView(preferenceCheck(R.string.optimization_arm_gpu_fast_path,
+                K_ARM_GPU_FAST_PATH, false));
+        TextView warning = hint(getString(R.string.optimization_arm_gpu_fast_path_hint));
+        warning.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(warning);
+
+        root.addView(preferenceCheck(R.string.optimization_coarse_fragment_2x2,
+                K_COARSE_FRAGMENT_2X2, false));
+        TextView coarseFragmentWarning = hint(
+                getString(R.string.optimization_coarse_fragment_2x2_hint));
+        coarseFragmentWarning.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(coarseFragmentWarning);
+
+        root.addView(preferenceCheck(R.string.optimization_disable_vk_robustness,
+                K_DISABLE_VK_ROBUSTNESS, false));
+        TextView robustnessWarning = hint(
+                getString(R.string.optimization_disable_vk_robustness_hint));
+        robustnessWarning.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(robustnessWarning);
+    }
+
     private void buildOther(LinearLayout root) {
         root.addView(preferenceCheck(R.string.debug_hud, K_PERF_HUD, false));
         if (!TestModeManager.isDebugBuild(this)) {
@@ -582,6 +613,8 @@ public final class SettingsActivity extends Activity {
             case "audio": return getString(R.string.category_audio);
             case "controls": return getString(R.string.category_controls);
             case "cache": return getString(R.string.category_cache);
+            case "managed_optimizations":
+                return getString(R.string.category_managed_optimizations);
             case "other": return getString(R.string.category_other);
             default: return getString(R.string.settings_title);
         }
@@ -626,12 +659,13 @@ public final class SettingsActivity extends Activity {
         control.setText(text);
         control.setTextSize(15);
         control.setTextColor(0xffe3e8ef);
-        control.setButtonDrawable(createCheckBoxButtonDrawable(this));
-        control.setCompoundDrawablePadding(dp(10));
+        control.setButtonDrawable(new InsetDrawable(
+                createCheckBoxButtonDrawable(this), dp(18), 0, dp(4), 0));
+        control.setCompoundDrawablePadding(dp(12));
         control.setGravity(Gravity.CENTER_VERTICAL);
-        control.setMinHeight(dp(60));
+        control.setMinHeight(dp(64));
         control.setChecked(checked);
-        control.setPadding(dp(18), dp(12), dp(16), dp(12));
+        control.setPadding(dp(12), dp(14), dp(22), dp(14));
         control.setBackground(cardBackground(0xff1b2026, 0xff2d3640, 14));
         return control;
     }

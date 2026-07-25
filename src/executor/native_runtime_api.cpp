@@ -4807,6 +4807,7 @@ std::atomic<std::uint64_t> g_live_hle_flight_seq{0};
 struct ExecutorCurrentHleContext {
     std::uint64_t guest_rsp = 0;
     std::uint64_t guest_return = 0;
+    std::array<std::uint64_t, 8> floating_arguments{};
     const char* name = nullptr;
     const char* symbol = nullptr;
 };
@@ -4816,12 +4817,14 @@ thread_local ExecutorCurrentHleContext g_executor_current_hle_context{};
 struct ScopedExecutorCurrentHleContext {
     ExecutorCurrentHleContext previous{};
 
-    ScopedExecutorCurrentHleContext(const std::uint64_t guest_rsp, const char* name,
-                                    const char* symbol)
+    ScopedExecutorCurrentHleContext(
+        const std::uint64_t guest_rsp, const char* name, const char* symbol,
+        const std::array<std::uint64_t, 8>& floating_arguments)
         : previous(g_executor_current_hle_context) {
         g_executor_current_hle_context = {
             .guest_rsp = guest_rsp,
             .guest_return = GuestReturnAddress(guest_rsp),
+            .floating_arguments = floating_arguments,
             .name = name,
             .symbol = symbol,
         };
@@ -5177,6 +5180,21 @@ extern "C" int executor_live_get_current_hle_guest_rsp(std::uint64_t* guest_rsp)
         return entry.rsp != 0 ? 0 : -1;
     }
     return -1;
+}
+
+extern "C" int executor_live_get_current_hle_floating_arguments(
+    std::uint64_t* values, const std::size_t capacity) {
+    if (values == nullptr || capacity == 0 ||
+        g_executor_current_hle_context.guest_rsp == 0) {
+        return -1;
+    }
+    const std::size_t count =
+        std::min(capacity, g_executor_current_hle_context.floating_arguments.size());
+    std::copy_n(g_executor_current_hle_context.floating_arguments.begin(), count, values);
+    if (capacity > count) {
+        std::fill(values + count, values + capacity, 0);
+    }
+    return static_cast<int>(count);
 }
 
 extern "C" void executor_live_log_fiber_transition(
@@ -6165,7 +6183,8 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
     const std::uint64_t arg1, const std::uint64_t arg2, const std::uint64_t arg3,
     const std::uint64_t arg4, const std::uint64_t arg5, const std::uint64_t guest_rsp,
     const std::uint64_t xmm0, const std::uint64_t xmm1, const std::uint64_t xmm2,
-    const std::uint64_t xmm3) {
+    const std::uint64_t xmm3, const std::uint64_t xmm4, const std::uint64_t xmm5,
+    const std::uint64_t xmm6, const std::uint64_t xmm7) {
     (void)bridge_source;
     std::atomic_thread_fence(std::memory_order_acquire);
     const auto& target_metadata = GetExecutorHleTargetMetadata(native_function);
@@ -6228,7 +6247,8 @@ static std::uint64_t ExecutorMappedHleBridgeCallbackCommon(
     }
 
     PublishCurrentJitGcRegisterRootsAtHleBoundary();
-    ScopedExecutorCurrentHleContext current_hle_context(guest_rsp, name, symbol_name);
+    ScopedExecutorCurrentHleContext current_hle_context(
+        guest_rsp, name, symbol_name, {xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7});
     const std::uint64_t hle_guest_thread =
         g_box64_current_guest_thread ? g_box64_current_guest_thread() : 0;
     ScopedExecutorHleGuestThreadBind guest_thread_bind(hle_guest_thread, name, symbol_name);
@@ -7000,11 +7020,12 @@ static std::uint64_t ExecutorHleBridgeCallbackCatching(
     const std::uint64_t arg1, const std::uint64_t arg2, const std::uint64_t arg3,
     const std::uint64_t arg4, const std::uint64_t arg5, const std::uint64_t guest_rsp,
     const std::uint64_t xmm0, const std::uint64_t xmm1, const std::uint64_t xmm2,
-    const std::uint64_t xmm3) {
+    const std::uint64_t xmm3, const std::uint64_t xmm4, const std::uint64_t xmm5,
+    const std::uint64_t xmm6, const std::uint64_t xmm7) {
     try {
         return ExecutorMappedHleBridgeCallbackCommon(bridge_source, native_function, arg0, arg1,
                                                      arg2, arg3, arg4, arg5, guest_rsp, xmm0,
-                                                     xmm1, xmm2, xmm3);
+                                                     xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7);
     } catch (const std::exception& e) {
         const char* name = FindHleTargetName(native_function);
         NativeLog(ANDROID_LOG_ERROR,
@@ -7042,7 +7063,7 @@ extern "C" std::uint64_t ExecutorBox64HleBridgeCallback(const std::uint64_t nati
                                                         const std::uint64_t xmm3) {
     return ExecutorHleBridgeCallbackCatching("box64_hle_bridge", native_function, arg0, arg1,
                                              arg2, arg3, arg4, arg5, guest_rsp, xmm0, xmm1,
-                                             xmm2, xmm3);
+                                             xmm2, xmm3, 0, 0, 0, 0);
 }
 
 extern "C" std::uint64_t ExecutorJitHleBridgeCallback(const std::uint64_t native_function,
@@ -7056,10 +7077,14 @@ extern "C" std::uint64_t ExecutorJitHleBridgeCallback(const std::uint64_t native
                                                            const std::uint64_t xmm0,
                                                            const std::uint64_t xmm1,
                                                            const std::uint64_t xmm2,
-                                                           const std::uint64_t xmm3) {
+                                                           const std::uint64_t xmm3,
+                                                           const std::uint64_t xmm4,
+                                                           const std::uint64_t xmm5,
+                                                           const std::uint64_t xmm6,
+                                                           const std::uint64_t xmm7) {
     return ExecutorHleBridgeCallbackCatching("jit_hle_bridge", native_function, arg0,
                                              arg1, arg2, arg3, arg4, arg5, guest_rsp, xmm0,
-                                             xmm1, xmm2, xmm3);
+                                             xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7);
 }
 
 extern "C" int executor_jit_lookup_leaf_hle_thunk(
@@ -18176,7 +18201,9 @@ std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request) {
         request.integer_arguments[2], request.integer_arguments[3],
         request.integer_arguments[4], request.integer_arguments[5], request.guest_stack,
         request.floating_arguments[0], request.floating_arguments[1],
-        request.floating_arguments[2], request.floating_arguments[3]);
+        request.floating_arguments[2], request.floating_arguments[3],
+        request.floating_arguments[4], request.floating_arguments[5],
+        request.floating_arguments[6], request.floating_arguments[7]);
 }
 
 std::uintptr_t SelectiveLeafBridgeEntry() noexcept {
@@ -22883,6 +22910,39 @@ extern "C" int executor_lsx4_runtime_set_audio_enabled(const int enabled) {
     return 0;
 }
 
+extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
+                                                               const int enabled) {
+    constexpr int ArmGpuFastPath = 1;
+    constexpr int CoarseFragmentShading = 2;
+    constexpr int DisableVkRobustness = 3;
+    const bool active = enabled != 0;
+    const char* option_name = nullptr;
+    switch (option) {
+    case ArmGpuFastPath:
+        Config::setManagedGpuFastPath(active);
+        option_name = "arm_gpu_fast_path";
+        break;
+    case CoarseFragmentShading:
+        Config::setManagedCoarseFragmentShading(active);
+        option_name = "coarse_fragment_2x2";
+        break;
+    case DisableVkRobustness:
+        Config::setManagedDisableVkRobustness(active);
+        option_name = "disable_vk_robustness";
+        break;
+    default:
+        return -1;
+    }
+    NativeLog(ANDROID_LOG_INFO,
+              "[EXECUTOR_MANAGED_OPTIMIZATION] option=%s enabled=%d directMemory=%d "
+              "vkDiagnostics=%d coarseFragment=%d disableRobustness=%d",
+              option_name, active ? 1 : 0, Config::directMemoryAccess() ? 1 : 0,
+              Config::managedGpuFastPath() ? 0 : 1,
+              Config::managedCoarseFragmentShading() ? 1 : 0,
+              Config::managedDisableVkRobustness() ? 1 : 0);
+    return 0;
+}
+
 extern "C" int executor_lsx4_runtime_audio_probe_tone() {
     constexpr int sample_rate = 48000;
     constexpr int frames = 1024;
@@ -23205,7 +23265,7 @@ extern "C" int executor_jit_guest_range_selftest() {
 
 extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
                                                    std::size_t value_count) {
-    constexpr std::size_t kValueCount = 18;
+    constexpr std::size_t kValueCount = 21;
     if (values == nullptr || value_count < kValueCount) {
         return -1;
     }
@@ -23230,6 +23290,9 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
     values[15] = cpu.stored_native_captured;
     values[16] = cpu.stored_ir_written;
     values[17] = cpu.stored_native_written;
+    values[18] = Config::managedGpuFastPath() ? 1 : 0;
+    values[19] = Config::managedCoarseFragmentShading() ? 1 : 0;
+    values[20] = Config::managedDisableVkRobustness() ? 1 : 0;
     return static_cast<int>(kValueCount);
 }
 
@@ -23273,12 +23336,12 @@ extern "C" int executor_jit_hle_fp_bridge_selftest() {
     };
     const auto invoke_unary = [&](const std::uint64_t target, const double value) {
         return ExecutorJitHleBridgeCallback(target, 0, 0, 0, 0, 0, 0, 0,
-                                                  to_raw(value), 0, 0, 0);
+                                            to_raw(value), 0, 0, 0, 0, 0, 0, 0);
     };
     const auto invoke_binary = [&](const std::uint64_t target, const double lhs,
                                    const double rhs) {
         return ExecutorJitHleBridgeCallback(target, 0, 0, 0, 0, 0, 0, 0,
-                                                  to_raw(lhs), to_raw(rhs), 0, 0);
+                                            to_raw(lhs), to_raw(rhs), 0, 0, 0, 0, 0, 0);
     };
 
     const auto exp_target = reinterpret_cast<std::uint64_t>(

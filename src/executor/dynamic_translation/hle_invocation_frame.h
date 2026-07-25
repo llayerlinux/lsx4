@@ -12,7 +12,7 @@ namespace Executor::Jit {
 
 struct HleInvocationFrame {
     std::array<std::uint64_t, 6> integer_arguments{};
-    std::array<std::uint64_t, 4> floating_arguments{};
+    std::array<std::uint64_t, 8> floating_arguments{};
     std::array<std::uint64_t, 6> preserved_registers{};
 
     [[nodiscard]] static HleInvocationFrame Capture(

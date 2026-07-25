@@ -3,7 +3,7 @@
 
 #include "executor/dynamic_translation/guest_mapping_policy.h"
 
-#include "core/memory.h"
+#include "executor/dynamic_translation/runtime_bridge_api.h"
 
 #include <limits>
 
@@ -21,15 +21,7 @@ bool IsGuestAddressRange(const std::uint64_t address,
 }
 
 bool IsExecutableGuestAddress(const std::uint64_t address) noexcept {
-    Core::MemoryManager* const memory = Core::Memory::Instance();
-    if (address == 0 || memory == nullptr || !memory->IsValidMapping(address, 1)) {
-        return false;
-    }
-    u32 protection = 0;
-    const int query_result =
-        memory->QueryProtection(address, nullptr, nullptr, &protection);
-    const auto execute_bit = static_cast<u32>(Core::MemoryProt::CpuExec);
-    return query_result == 0 && (protection & execute_bit) != 0;
+    return address != 0 && ExecutorJitIsExecutableGuestAddress(address);
 }
 
 }
