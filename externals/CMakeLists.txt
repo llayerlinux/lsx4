@@ -50,7 +50,7 @@ file(GLOB LIBATRAC9_SOURCES LibAtrac9/C/src/*.c)
 list(FILTER LIBATRAC9_SOURCES EXCLUDE REGEX "LibAtrac9/C/src/bit_reader\\.c$")
 list(APPEND LIBATRAC9_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/lsx4-overrides/LibAtrac9/bit_reader.c")
 add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES})
-target_include_directories(LibAtrac9 INTERFACE LibAtrac9/C/src)
+target_include_directories(LibAtrac9 PUBLIC LibAtrac9/C/src)
 
 if (NOT TARGET ZLIB::ZLIB)
     set(ZLIB_ENABLE_TESTS OFF)
