@@ -88,4 +88,12 @@
     <string name="game_menu_opacity">Opacidad de los controles</string>
     <string name="game_menu_opacity_value">%1$d%%</string>
     <string name="game_menu_exit">Salir a la biblioteca</string>
+    <string name="category_managed_optimizations">Optimizaciones administradas</string>
+    <string name="category_managed_optimizations_summary">Rutas ARM rápidas opcionales con posibles incompatibilidades</string>
+    <string name="optimization_arm_gpu_fast_path">Ruta rápida ARM GPU</string>
+    <string name="optimization_arm_gpu_fast_path_hint">Envía las constantes de sombreado mediante memoria GPU directa y elimina el diagnóstico de Funnel de cada draw y submit. Puede mejorar el rendimiento, pero algunos controladores pueden mostrar errores gráficos o fallos. Reinicia el juego después de cambiarla.</string>
+    <string name="optimization_coarse_fragment_2x2">Sombreado de fragmentos 2×2</string>
+    <string name="optimization_coarse_fragment_2x2_hint">Ejecuta una invocación del fragment shader por cada grupo de píxeles 2×2. Puede reducir mucho la carga de la GPU, pero disminuye el detalle fino y puede alterar algunos efectos. Reinicia el juego después de cambiarla.</string>
+    <string name="optimization_disable_vk_robustness">Desactivar comprobaciones Vulkan robustness</string>
+    <string name="optimization_disable_vk_robustness_hint">Elimina la protección de límites de búferes e imágenes de la GPU. Puede acelerar juegos con sombreadores pesados, pero un acceso inválido puede corromper los gráficos o bloquear el controlador. Reinicia el juego después de cambiarla.</string>
 </resources>

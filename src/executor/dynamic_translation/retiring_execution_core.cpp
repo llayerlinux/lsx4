@@ -28,8 +28,6 @@
 #include "executor/dynamic_translation/trace_memory.h"
 #include "native_artifact_layout.h"
 #include "common/content_fingerprint.h"
-#include "core/aerolib/stubs.h"
-#include "core/memory.h"
 
 #include "common/x86_decoder.h"
 #include <xbyak_aarch64/xbyak_aarch64.h>
@@ -611,6 +609,10 @@ bool IsJitWideHotDirectV5Mnemonic(const X86Mnemonic mnemonic) {
     case X86_MNEMONIC_VRCPPS:
     case X86_MNEMONIC_VRSQRTPS:
     case X86_MNEMONIC_VBROADCASTSS:
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    case X86_MNEMONIC_VPBROADCASTW:
+    case X86_MNEMONIC_VPBROADCASTQ:
+#endif
     case X86_MNEMONIC_PINSRB:
     case X86_MNEMONIC_PINSRW:
     case X86_MNEMONIC_PINSRD:
@@ -4648,9 +4650,19 @@ public:
             });
         }
 #endif
+#if defined(LSX4_PS5_DESKTOP_PATH)
+        // A PS5 runtime can unload one process image and start another in the
+        // same host thread. Never carry a deferred native fault or helper
+        // diagnostic across that process boundary.
+        g_jit_fault_resume_frame = nullptr;
+        g_jit_deferred_guest_fault = {};
+        g_helper_fault_message.clear();
+#endif
         LsxMachineImage state{};
         ResetGuestRunCompletion();
         const LsxStackLease frame = InitializeGuestEntryFrame(state, guest_rip, ctx);
+        const std::uint64_t root_entry_sp =
+            ReadGuestGpr64(state, LsxGpr::Rsp);
         const std::uint64_t synthetic_return_sp =
             frame.current_sp & ~std::uint64_t{0xf};
         auto** const active_block_slot = &g_active_block;
@@ -4990,10 +5002,19 @@ public:
             const bool synthetic_frame_complete =
                 result == kUnwindTerminatorAddress && ctx.stack_args_enabled != 2 &&
                 ReadGuestGpr64(state, LsxGpr::Rsp) == synthetic_return_sp;
-            if (result == kUnwindTerminatorAddress &&
-                (synthetic_frame_complete ||
-                 TranslationHasFeature(
-                     block.flags, TranslationFeature::ReturnTerminator))) {
+            const bool process_entry_frame_complete =
+                ctx.stack_args_enabled == 2 &&
+                TranslationHasFeature(
+                    block.flags, TranslationFeature::ReturnTerminator) &&
+                ReadGuestGpr64(state, LsxGpr::Rsp) ==
+                    root_entry_sp + sizeof(std::uint64_t) &&
+                result == LoadGuestScalar(
+                              root_entry_sp, sizeof(std::uint64_t));
+            if ((result == kUnwindTerminatorAddress &&
+                 (synthetic_frame_complete ||
+                  TranslationHasFeature(
+                      block.flags, TranslationFeature::ReturnTerminator))) ||
+                process_entry_frame_complete) {
                 static std::atomic<std::uint64_t> mapped_return_events{0};
                 const std::uint64_t ticket =
                     Lsx4::Translation::ClaimDiagnosticTicket(mapped_return_events);
@@ -8537,14 +8558,27 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                (ir.operands[1].type == X86_OPERAND_TYPE_MEMORY &&
                 (ir.operands[1].size == 128 || ir.operands[1].size == 256));
     };
-    const auto is_native_broadcast_ss = [](const LsxDecodedOp& ir) {
+    const auto is_native_scalar_broadcast = [](const LsxDecodedOp& ir) {
+        const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
         if (!ir.can_execute_vector || ir.operand_count != 2 ||
-            static_cast<X86Mnemonic>(ir.mnemonic) != X86_MNEMONIC_VBROADCASTSS) {
+            (mnemonic != X86_MNEMONIC_VBROADCASTSS
+#if defined(LSX4_PS5_DESKTOP_PATH)
+             && mnemonic != X86_MNEMONIC_VPBROADCASTW
+             && mnemonic != X86_MNEMONIC_VPBROADCASTQ
+#endif
+             )) {
             return false;
         }
         const auto& source = ir.operands[1];
+        const auto element_bits =
+            mnemonic == X86_MNEMONIC_VPBROADCASTW
+            ? 16u
+            : (mnemonic == X86_MNEMONIC_VBROADCASTSS
+                   ? 32u
+                   : 64u);
         const bool scalar_memory =
-            source.type == X86_OPERAND_TYPE_MEMORY && source.size == 32;
+            source.type == X86_OPERAND_TYPE_MEMORY &&
+            source.size == element_bits;
         return IsXmmOperand(ir.operands.front()) &&
                (IsXmmOperand(source) || scalar_memory);
     };
@@ -9087,7 +9121,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                  is_native_variable_blend(ir) ||
                  is_native_vector_move_mask(ir) ||
                  is_native_packed_reciprocal(ir) ||
-                 is_native_broadcast_ss(ir) ||
+                 is_native_scalar_broadcast(ir) ||
                  is_native_vector_insert_element(ir) ||
                  is_native_packed_multiply(ir) ||
                  is_native_packed_extend(ir) ||
@@ -16217,7 +16251,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emitted_simd_fast += emitted ? 1u : 0u;
                         continue;
                     }
-                    if (is_native_broadcast_ss(ir)) {
+                    if (is_native_scalar_broadcast(ir)) {
+                        const auto mnemonic =
+                            static_cast<X86Mnemonic>(ir.mnemonic);
+                        const bool word =
+                            mnemonic == X86_MNEMONIC_VPBROADCASTW;
+                        const bool qword =
+                            mnemonic == X86_MNEMONIC_VPBROADCASTQ;
                         std::uint32_t destination_offset = 0;
                         std::uint32_t destination_width = 0;
                         emitted = vector_register_state_offset(
@@ -16232,9 +16272,22 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                           source_width) &&
                                       source_width >= 16;
                             if (emitted) {
-                                code->ldr(code->w10,
-                                          Xbyak_aarch64::ptr(code->x19,
-                                                            source_offset));
+                                if (qword) {
+                                    code->ldr(
+                                        code->x10,
+                                        Xbyak_aarch64::ptr(
+                                            code->x19, source_offset));
+                                } else if (word) {
+                                    code->ldrh(
+                                        code->w10,
+                                        Xbyak_aarch64::ptr(
+                                            code->x19, source_offset));
+                                } else {
+                                    code->ldr(
+                                        code->w10,
+                                        Xbyak_aarch64::ptr(
+                                            code->x19, source_offset));
+                                }
                             }
                         } else if (emitted) {
                             emitted = emit_read_operand(ir, source, code->x10);
@@ -16244,7 +16297,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             emitted = false;
                             continue;
                         }
-                        code->dup(code->v0.s4, code->w10);
+                        if (qword) {
+                            code->dup(code->v0.d2, code->x10);
+                        } else if (word) {
+                            code->dup(code->v0.h8, code->w10);
+                        } else {
+                            code->dup(code->v0.s4, code->w10);
+                        }
                         emitted = emit_vector_store_pair(ir, ir.operands[0], code->q0,
                                                          code->q0,
                                                          destination_width);
@@ -19233,9 +19292,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         Xbyak_aarch64::Label dynamic_target_ready;
 #ifdef __ANDROID__
                         const std::uint64_t dynamic_hle_slab_base =
-                            Core::AeroLib::EnsureAndroidX64ZeroStubSlab();
+                            executor_jit_ensure_hle_thunk_slab();
                         const std::uint64_t dynamic_hle_slab_size =
-                            Core::AeroLib::GetAndroidX64ZeroStubSlabSize();
+                            executor_jit_hle_thunk_slab_size();
 #else
                         constexpr std::uint64_t dynamic_hle_slab_base = 0;
                         constexpr std::uint64_t dynamic_hle_slab_size = 0;
@@ -19252,9 +19311,21 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 dynamic_hle_slab_size != 0) {
                                 code->mov(code->x11, dynamic_hle_slab_base);
                                 code->sub(code->x11, code->x10, code->x11);
+#ifdef LSX4_PS5_DESKTOP_PATH
+                                // Avoid asking Xbyak_aarch64 to materialize the
+                                // power-of-two slab mask. Its logical-immediate
+                                // probe rotates a 64-bit value by zero via a
+                                // shift-by-64 expression. Comparing against the
+                                // exclusive end is equivalent for the non-zero
+                                // unsigned slab size.
+                                code->mov(code->x12, dynamic_hle_slab_size);
+                                code->cmp(code->x11, code->x12);
+                                code->blo(dynamic_slow_semantic);
+#else
                                 code->mov(code->x12, dynamic_hle_slab_size - 1);
                                 code->cmp(code->x11, code->x12);
                                 code->bls(dynamic_slow_semantic);
+#endif
                             }
                             code->lsr(code->x11, code->x10, 40);
                             code->cbnz(code->x11, dynamic_slow_semantic);
@@ -19850,7 +19921,7 @@ struct JitStableNativeTarget {
 std::span<const JitStableNativeTarget> JitStableNativeTargets() noexcept {
     static const std::array targets = {
         JitStableNativeTarget{JitStableNativeTargetId::LibcStrcmp,
-            reinterpret_cast<std::uint64_t>(&Core::AeroLib::ExecutorLibcStrcmp)},
+            executor_jit_stable_libc_strcmp()},
         JitStableNativeTarget{JitStableNativeTargetId::HleBridgeMarker,
             reinterpret_cast<std::uint64_t>(&ExecuteJitHleBridgeMarker)},
         JitStableNativeTarget{JitStableNativeTargetId::InterpreterInstructionEntry,
@@ -20406,6 +20477,16 @@ LsxStackLease BorrowGuestStackWindow() {
     if (arena.top == nullptr) {
         InitializeGuestStackReservoir(arena);
     }
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    // The isolated PS5 runtime clears its mapping registry between process
+    // sessions, while this host thread intentionally retains the already
+    // mapped stack reservoir. Re-publish that persistent mapping before the
+    // first synthetic return slot is written in the new session.
+    executor_lsx4_android_note_guest_stack_window(
+        arena.low,
+        static_cast<std::uint64_t>(arena.top - arena.low),
+        "jit_guest_stack");
+#endif
 
     const std::uint64_t slot_stride = GuestStackSlotStride(arena);
     const std::uint64_t reservoir_size =
@@ -20662,6 +20743,14 @@ LsxStackLease InitializeGuestEntryFrame(LsxMachineImage& state,
                 StoreGuestScalar(guest_rsp + index * sizeof(std::uint64_t),
                                  entry_parameters[index], sizeof(std::uint64_t));
             }
+            // The process-entry frame reserves a third qword for the root
+            // return sentinel. Stack reservoirs persist across launches, so
+            // relying on a value left by an earlier lease can make the final
+            // RET branch to stale argc/argv data (commonly address 0x1).
+            StoreGuestScalar(
+                guest_rsp + entry_parameters.size() *
+                                sizeof(std::uint64_t),
+                kUnwindTerminatorAddress, sizeof(std::uint64_t));
             JitLog("[LSX4_ENTRY_FRAME] parameters=0x%llx first=0x%llx second=0x%llx stack=0x%llx alignment_base=0x%llx",
                         LogU64(ctx.args[0]),
                         LogU64(entry_parameters[0]),
@@ -21457,6 +21546,49 @@ std::uint8_t* XmmLane(LsxMachineImage& state, const std::size_t index) {
     return index < state.ymm.size() ? state.ymm[index].data() : nullptr;
 }
 
+#if defined(LSX4_PS5_DESKTOP_PATH)
+constexpr std::uint64_t Sse4aFieldMask(const std::uint32_t length) noexcept {
+    return length >= 64 ? std::numeric_limits<std::uint64_t>::max()
+                        : (UINT64_C(1) << length) - 1u;
+}
+
+constexpr std::uint32_t Sse4aFieldLength(
+    const std::uint64_t encoded) noexcept {
+    const auto length = static_cast<std::uint32_t>(encoded) & 0x3fu;
+    return length == 0 ? 64u : length;
+}
+
+constexpr std::uint64_t ExtractSse4aField(
+    const std::uint64_t source, const std::uint64_t encoded_length,
+    const std::uint64_t encoded_index) noexcept {
+    const auto index = static_cast<std::uint32_t>(encoded_index) & 0x3fu;
+    const auto requested = Sse4aFieldLength(encoded_length);
+    const auto available = std::min(requested, 64u - index);
+    return (source >> index) & Sse4aFieldMask(available);
+}
+
+constexpr std::uint64_t InsertSse4aField(
+    const std::uint64_t destination, const std::uint64_t source,
+    const std::uint64_t encoded_length,
+    const std::uint64_t encoded_index) noexcept {
+    const auto index = static_cast<std::uint32_t>(encoded_index) & 0x3fu;
+    const auto requested = Sse4aFieldLength(encoded_length);
+    const auto available = std::min(requested, 64u - index);
+    const auto low_mask = Sse4aFieldMask(available);
+    const auto destination_mask = low_mask << index;
+    return (destination & ~destination_mask) |
+           ((source & low_mask) << index);
+}
+
+static_assert(ExtractSse4aField(UINT64_C(0xfedcba9876543210), 8, 8) ==
+              UINT64_C(0x32));
+static_assert(ExtractSse4aField(UINT64_C(0xfedcba9876543210), 0, 0) ==
+              UINT64_C(0xfedcba9876543210));
+static_assert(InsertSse4aField(UINT64_C(0xffff0000ffff0000),
+                              UINT64_C(0x1234), 16, 16) ==
+              UINT64_C(0xffff000012340000));
+#endif
+
 void ExecuteSignedMultiplyInstruction(LsxMachineImage& state,
                                       const LsxDecodedOp& instruction) {
     const auto operands = std::span{instruction.operands}.first(
@@ -21900,6 +22032,92 @@ bool WriteVector128(LsxMachineImage& state, const DecodeSummary& instruction,
     return true;
 }
 
+#if defined(LSX4_PS5_DESKTOP_PATH)
+bool ReadSse4aControl(const LsxMachineImage& state,
+                      const LsxDecodedOp& instruction,
+                      const std::size_t control_index,
+                      std::uint64_t& length, std::uint64_t& index) {
+    if (control_index >= instruction.operand_count) {
+        return false;
+    }
+    const auto& control = instruction.operands[control_index];
+    if (control.type == X86_OPERAND_TYPE_IMMEDIATE) {
+        if (control_index + 1u >= instruction.operand_count ||
+            instruction.operands[control_index + 1u].type !=
+                X86_OPERAND_TYPE_IMMEDIATE) {
+            return false;
+        }
+        length = control.imm.value.u;
+        index = instruction.operands[control_index + 1u].imm.value.u;
+        return true;
+    }
+    VectorRegisterImage image{};
+    if (!ReadVector128(state, instruction.decoded, control, image)) {
+        return false;
+    }
+    length = image[8] & 0x3fu;
+    index = image[9] & 0x3fu;
+    return true;
+}
+
+bool ExecuteSse4aBitField(LsxMachineImage& state,
+                          const LsxDecodedOp& instruction,
+                          const X86Mnemonic mnemonic) {
+    const bool extract = mnemonic == X86_MNEMONIC_EXTRQ;
+    const std::size_t minimum_operands = extract ? 1u : 2u;
+    if (instruction.operand_count < minimum_operands ||
+        !IsXmmOperand(instruction.operands[0]) ||
+        (!extract && !IsXmmOperand(instruction.operands[1]))) {
+        return false;
+    }
+
+    VectorRegisterImage destination{};
+    if (!ReadVector128(state, instruction.decoded,
+                       instruction.operands[0], destination)) {
+        return false;
+    }
+
+    const std::size_t control_index =
+        extract ? 1u : 2u;
+    std::uint64_t length{};
+    std::uint64_t index{};
+    if (instruction.operand_count == minimum_operands) {
+        if (extract) {
+            return false;
+        }
+        if (!ReadSse4aControl(state, instruction, 1u, length, index)) {
+            return false;
+        }
+    } else if (!ReadSse4aControl(
+                   state, instruction,
+                   extract ? 1u : control_index, length, index)) {
+        return false;
+    }
+
+    auto destination_low =
+        LoadUnaligned<std::uint64_t>(destination.data());
+    if (extract) {
+        destination_low =
+            ExtractSse4aField(destination_low, length, index);
+        StoreUnaligned<std::uint64_t>(destination.data(), destination_low);
+        StoreUnaligned<std::uint64_t>(
+            destination.data() + sizeof(std::uint64_t), UINT64_C(0));
+    } else {
+        VectorRegisterImage source{};
+        if (!ReadVector128(state, instruction.decoded,
+                           instruction.operands[1], source)) {
+            return false;
+        }
+        destination_low = InsertSse4aField(
+            destination_low, LoadUnaligned<std::uint64_t>(source.data()),
+            length, index);
+        StoreUnaligned<std::uint64_t>(destination.data(), destination_low);
+    }
+    return WriteVector128(
+        state, instruction.decoded, instruction.operands[0], destination);
+}
+#endif
+
 void StoreExtractedVectorLane(LsxMachineImage& state,
                               const LsxDecodedOp& instruction,
                               const std::uint64_t value,
@@ -22134,6 +22352,215 @@ bool IsPackedFloatArithMnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
+enum class PackedFmaOperandOrder : std::uint8_t {
+    DestinationSource2Source1,
+    Source1DestinationSource2,
+    Source1Source2Destination,
+};
+
+struct PackedFmaPlan {
+    PackedFmaOperandOrder order;
+    std::size_t lane_bytes;
+    bool scalar{};
+    bool negate_product{};
+    bool subtract_addend{};
+};
+
+std::optional<PackedFmaPlan> PlanPackedFma(const X86Mnemonic mnemonic) {
+    switch (mnemonic) {
+    case X86_MNEMONIC_VFMADD132PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1, sizeof(float)};
+    case X86_MNEMONIC_VFMADD213PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2, sizeof(float)};
+    case X86_MNEMONIC_VFMADD231PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination, sizeof(float)};
+    case X86_MNEMONIC_VFMADD132PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1, sizeof(double)};
+    case X86_MNEMONIC_VFMADD213PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2, sizeof(double)};
+    case X86_MNEMONIC_VFMADD231PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination, sizeof(double)};
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    case X86_MNEMONIC_VFMADD132SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(float), true};
+    case X86_MNEMONIC_VFMADD213SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(float), true};
+    case X86_MNEMONIC_VFMADD231SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(float), true};
+    case X86_MNEMONIC_VFMADD132SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(double), true};
+    case X86_MNEMONIC_VFMADD213SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(double), true};
+    case X86_MNEMONIC_VFMADD231SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(double), true};
+    case X86_MNEMONIC_VFMSUB132PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(float), false, false, true};
+    case X86_MNEMONIC_VFMSUB213PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(float), false, false, true};
+    case X86_MNEMONIC_VFMSUB231PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(float), false, false, true};
+    case X86_MNEMONIC_VFMSUB132PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(double), false, false, true};
+    case X86_MNEMONIC_VFMSUB213PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(double), false, false, true};
+    case X86_MNEMONIC_VFMSUB231PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(double), false, false, true};
+    case X86_MNEMONIC_VFMSUB132SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(float), true, false, true};
+    case X86_MNEMONIC_VFMSUB213SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(float), true, false, true};
+    case X86_MNEMONIC_VFMSUB231SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(float), true, false, true};
+    case X86_MNEMONIC_VFMSUB132SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(double), true, false, true};
+    case X86_MNEMONIC_VFMSUB213SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(double), true, false, true};
+    case X86_MNEMONIC_VFMSUB231SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(double), true, false, true};
+    case X86_MNEMONIC_VFNMADD132PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(float), false, true, false};
+    case X86_MNEMONIC_VFNMADD213PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(float), false, true, false};
+    case X86_MNEMONIC_VFNMADD231PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(float), false, true, false};
+    case X86_MNEMONIC_VFNMADD132PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(double), false, true, false};
+    case X86_MNEMONIC_VFNMADD213PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(double), false, true, false};
+    case X86_MNEMONIC_VFNMADD231PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(double), false, true, false};
+    case X86_MNEMONIC_VFNMADD132SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(float), true, true, false};
+    case X86_MNEMONIC_VFNMADD213SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(float), true, true, false};
+    case X86_MNEMONIC_VFNMADD231SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(float), true, true, false};
+    case X86_MNEMONIC_VFNMADD132SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(double), true, true, false};
+    case X86_MNEMONIC_VFNMADD213SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(double), true, true, false};
+    case X86_MNEMONIC_VFNMADD231SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(double), true, true, false};
+    case X86_MNEMONIC_VFNMSUB132PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(float), false, true, true};
+    case X86_MNEMONIC_VFNMSUB213PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(float), false, true, true};
+    case X86_MNEMONIC_VFNMSUB231PS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(float), false, true, true};
+    case X86_MNEMONIC_VFNMSUB132PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(double), false, true, true};
+    case X86_MNEMONIC_VFNMSUB213PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(double), false, true, true};
+    case X86_MNEMONIC_VFNMSUB231PD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(double), false, true, true};
+    case X86_MNEMONIC_VFNMSUB132SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(float), true, true, true};
+    case X86_MNEMONIC_VFNMSUB213SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(float), true, true, true};
+    case X86_MNEMONIC_VFNMSUB231SS:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(float), true, true, true};
+    case X86_MNEMONIC_VFNMSUB132SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::DestinationSource2Source1,
+            sizeof(double), true, true, true};
+    case X86_MNEMONIC_VFNMSUB213SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1DestinationSource2,
+            sizeof(double), true, true, true};
+    case X86_MNEMONIC_VFNMSUB231SD:
+        return PackedFmaPlan{
+            PackedFmaOperandOrder::Source1Source2Destination,
+            sizeof(double), true, true, true};
+#endif
+    default:
+        return std::nullopt;
+    }
+}
+
 [[gnu::always_inline]] inline bool IsPackedFloatAddSubMnemonic(
     const X86Mnemonic mnemonic) {
     switch (mnemonic) {
@@ -22234,6 +22661,11 @@ bool IsVectorBroadcastMnemonic(const X86Mnemonic mnemonic) {
         [[fallthrough]];
     case X86_MNEMONIC_VBROADCASTF128:
     case X86_MNEMONIC_VBROADCASTI128:
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    case X86_MNEMONIC_VPBROADCASTW:
+    case X86_MNEMONIC_VPBROADCASTD:
+    case X86_MNEMONIC_VPBROADCASTQ:
+#endif
         return true;
     default:
         return false;
@@ -22241,7 +22673,14 @@ bool IsVectorBroadcastMnemonic(const X86Mnemonic mnemonic) {
 }
 
 std::size_t VectorBroadcastElementBytes(const X86Mnemonic mnemonic) {
-    if (mnemonic == X86_MNEMONIC_VBROADCASTSD) {
+    if (mnemonic == X86_MNEMONIC_VPBROADCASTW) {
+        return 2;
+    }
+    if (mnemonic == X86_MNEMONIC_VBROADCASTSD
+#if defined(LSX4_PS5_DESKTOP_PATH)
+        || mnemonic == X86_MNEMONIC_VPBROADCASTQ
+#endif
+    ) {
         return 8;
     }
     if (mnemonic == X86_MNEMONIC_VBROADCASTF128 ||
@@ -22997,8 +23436,16 @@ bool IsPermilMnemonic(const X86Mnemonic mnemonic) {
 }
 
 bool IsPerm2F128Mnemonic(const X86Mnemonic mnemonic) {
-    return mnemonic == X86_MNEMONIC_VPERM2F128;
+    return mnemonic == X86_MNEMONIC_VPERM2F128 ||
+           mnemonic == X86_MNEMONIC_VPERM2I128;
 }
+
+#if defined(LSX4_PS5_DESKTOP_PATH)
+bool IsPermuteQwordImmediateMnemonic(const X86Mnemonic mnemonic) {
+    return mnemonic == X86_MNEMONIC_VPERMPD ||
+           mnemonic == X86_MNEMONIC_VPERMQ;
+}
+#endif
 
 bool IsInsertPsMnemonic(const X86Mnemonic mnemonic) {
     return mnemonic == X86_MNEMONIC_INSERTPS ||
@@ -23723,6 +24170,15 @@ bool IsPackedElementShiftMnemonic(const X86Mnemonic mnemonic) {
     }
 }
 
+#if defined(LSX4_PS5_DESKTOP_PATH)
+bool IsPackedVariableShiftMnemonic(const X86Mnemonic mnemonic) {
+    return mnemonic == X86_MNEMONIC_VPSLLVD ||
+           mnemonic == X86_MNEMONIC_VPSRLVD ||
+           mnemonic == X86_MNEMONIC_VPSLLVQ ||
+           mnemonic == X86_MNEMONIC_VPSRLVQ;
+}
+#endif
+
 [[gnu::always_inline]] inline bool IsVexPackedElementShiftMnemonic(
     const X86Mnemonic mnemonic) {
     switch (mnemonic) {
@@ -24332,6 +24788,16 @@ bool CanExecuteVectorInstruction(const LsxDecodedOp& ir) {
                    (!vex || is_vector(1)) &&
                    (is_immediate(count) || is_vector_source(count));
         }
+#if defined(LSX4_PS5_DESKTOP_PATH)
+        if (IsPackedVariableShiftMnemonic(mnemonic))
+            return binary_vector(true);
+        if (IsPermuteQwordImmediateMnemonic(mnemonic)) {
+            return ir.operand_count == 3 && is_vector(0) &&
+                   is_vector_source(1) && is_immediate(2) &&
+                   ir.operands[0].size == 256 &&
+                   ir.operands[1].size == 256;
+        }
+#endif
         if (IsPackedByteShiftMnemonic(mnemonic)) {
             const bool vex = IsVexPackedByteShiftMnemonic(mnemonic);
             return ir.operand_count >= (vex ? 3u : 2u) && is_vector(0) &&
@@ -24340,10 +24806,33 @@ bool CanExecuteVectorInstruction(const LsxDecodedOp& ir) {
         if (IsVectorAlignRightMnemonic(mnemonic)) {
             const bool vex = IsVexVectorAlignRightMnemonic(mnemonic);
             const std::size_t right = vex ? 2u : 1u;
+            const std::uint32_t width = ir.operands[0].size;
             return binary_with_immediate(vex) && ir.operand_count == right + 2 &&
-                   ir.operands[0].size == 128 && ir.operands[right].size == 128 &&
+                   (width == 128 || (vex && width == 256)) &&
+                   ir.operands[right].size == width &&
                    (!vex || (ir.decoded.encoding == X86_INSTRUCTION_ENCODING_VEX &&
-                             ir.operands[1].size == 128));
+                             ir.operands[1].size == width));
+        }
+        if (const auto fma = PlanPackedFma(mnemonic)) {
+            if (ir.operand_count != 3 || ir.decoded.encoding !=
+                    X86_INSTRUCTION_ENCODING_VEX ||
+                !is_vector(0) || !is_vector(1) || !is_vector_source(2)) {
+                return false;
+            }
+            const std::uint32_t width = ir.operands[0].size;
+            if (fma->scalar) {
+                const auto& source2 = ir.operands[2];
+                const bool valid_source2 =
+                    is_vector(2)
+                        ? source2.size == 128
+                        : source2.size == fma->lane_bytes * 8u;
+                return width == 128 &&
+                       ir.operands[1].size == 128 &&
+                       valid_source2;
+            }
+            return (width == 128 || width == 256) &&
+                   ir.operands[1].size == width &&
+                   ir.operands[2].size == width;
         }
         if (IsPackedFloatArithMnemonic(mnemonic))
             return binary_vector(IsVexPackedFloatArithMnemonic(mnemonic));
@@ -24865,8 +25354,16 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         return transaction.TransformBinary(
             has_distinct_left,
             [displacement](auto* out, const auto* left, const auto* right,
-                           const std::size_t) {
-                return VectorSemantic::AlignRight128(out, left, right, displacement);
+                           const std::size_t bytes) {
+                if (!VectorSemantic::AlignRight128(
+                        out, left, right, displacement)) {
+                    return false;
+                }
+                return bytes == 16 ||
+                       (bytes == 32 &&
+                        VectorSemantic::AlignRight128(
+                            out + 16, left + 16, right + 16,
+                            displacement));
             });
     }
 
@@ -25048,6 +25545,81 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         }
         return transaction.Publish();
     }
+
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    if (IsPackedVariableShiftMnemonic(mnemonic)) {
+        const bool shift_left =
+            mnemonic == X86_MNEMONIC_VPSLLVD ||
+            mnemonic == X86_MNEMONIC_VPSLLVQ;
+        const bool qword =
+            mnemonic == X86_MNEMONIC_VPSLLVQ ||
+            mnemonic == X86_MNEMONIC_VPSRLVQ;
+        return transaction.TransformBinary(
+            true,
+            [shift_left, qword](auto* const output,
+                                const auto* const values,
+                                const auto* const counts,
+                                const std::size_t byte_count) {
+                const std::size_t ElementBytes =
+                    qword ? sizeof(std::uint64_t)
+                          : sizeof(std::uint32_t);
+                if (byte_count % ElementBytes != 0) {
+                    return false;
+                }
+                for (std::size_t offset = 0;
+                     offset < byte_count; offset += ElementBytes) {
+                    if (qword) {
+                        const auto value =
+                            LoadUnaligned<std::uint64_t>(
+                                values + offset);
+                        const auto count =
+                            LoadUnaligned<std::uint64_t>(
+                                counts + offset);
+                        StoreUnaligned<std::uint64_t>(
+                            output + offset,
+                            count < 64u
+                                ? (shift_left ? value << count
+                                              : value >> count)
+                                : 0u);
+                    } else {
+                        const auto value =
+                            LoadUnaligned<std::uint32_t>(
+                                values + offset);
+                        const auto count =
+                            LoadUnaligned<std::uint32_t>(
+                                counts + offset);
+                        StoreUnaligned<std::uint32_t>(
+                            output + offset,
+                            count < 32u
+                                ? (shift_left ? value << count
+                                              : value >> count)
+                                : 0u);
+                    }
+                }
+                return true;
+            });
+    }
+
+    if (IsPermuteQwordImmediateMnemonic(mnemonic)) {
+        if (!transaction.Read(1, lhs)) {
+            return false;
+        }
+        constexpr std::size_t QwordBytes =
+            sizeof(std::uint64_t);
+        constexpr std::size_t QwordCount = 4;
+        const auto control = transaction.Immediate8(2);
+        for (std::size_t lane = 0; lane < QwordCount; ++lane) {
+            const auto source_lane =
+                static_cast<std::size_t>(
+                    (control >> (lane * 2u)) & 0x3u);
+            std::memcpy(
+                result.data() + lane * QwordBytes,
+                lhs.data() + source_lane * QwordBytes,
+                QwordBytes);
+        }
+        return transaction.Publish();
+    }
+#endif
 
     if (IsPackedByteShiftMnemonic(mnemonic)) {
         return transaction.TransformByteShift(
@@ -25323,6 +25895,89 @@ bool ExecuteVectorInstruction(LsxMachineImage& state, const LsxDecodedOp& ir,
         TransferSelectedGuestLanes(
             base, result, selected, lane_bytes,
             MaskedGuestTransferDirection::ReadIntoVector);
+        return transaction.Publish();
+    }
+
+    if (const auto fma = PlanPackedFma(mnemonic)) {
+        if (!transaction.Read(0, transaction.control) ||
+            !transaction.Read(1, lhs)) {
+            return false;
+        }
+        if (fma->scalar &&
+            ir.operands[2].type == X86_OPERAND_TYPE_MEMORY) {
+            if (fma->lane_bytes == sizeof(float)) {
+                std::uint32_t scalar{};
+                if (!ReadScalar32(
+                        state, ir.decoded, ir.operands[2],
+                        scalar)) {
+                    return false;
+                }
+                StoreUnaligned<std::uint32_t>(
+                    rhs.data(), scalar);
+            } else {
+                std::uint64_t scalar{};
+                if (!ReadScalar64(
+                        state, ir.decoded, ir.operands[2],
+                        scalar)) {
+                    return false;
+                }
+                StoreUnaligned<std::uint64_t>(
+                    rhs.data(), scalar);
+            }
+        } else if (!transaction.Read(2, rhs)) {
+            return false;
+        }
+        const std::size_t width = transaction.Width();
+        if (fma->scalar) {
+            // VEX scalar FMA merges bits 127:lane from SRC1 and clears the
+            // physical YMM tail when the XMM destination is published.
+            result = lhs;
+        }
+        const std::size_t execute_width =
+            fma->scalar ? fma->lane_bytes : width;
+        const auto execute_lanes = [&]<typename Float>() {
+            for (std::size_t offset = 0; offset < execute_width;
+                 offset += sizeof(Float)) {
+                const Float destination =
+                    LoadUnaligned<Float>(transaction.control.data() + offset);
+                const Float source1 = LoadUnaligned<Float>(lhs.data() + offset);
+                const Float source2 = LoadUnaligned<Float>(rhs.data() + offset);
+                Float multiplicand1{};
+                Float multiplicand2{};
+                Float addend{};
+                switch (fma->order) {
+                case PackedFmaOperandOrder::DestinationSource2Source1:
+                    multiplicand1 = destination;
+                    multiplicand2 = source2;
+                    addend = source1;
+                    break;
+                case PackedFmaOperandOrder::Source1DestinationSource2:
+                    multiplicand1 = source1;
+                    multiplicand2 = destination;
+                    addend = source2;
+                    break;
+                case PackedFmaOperandOrder::Source1Source2Destination:
+                    multiplicand1 = source1;
+                    multiplicand2 = source2;
+                    addend = destination;
+                    break;
+                }
+                if (fma->negate_product) {
+                    multiplicand1 = -multiplicand1;
+                }
+                if (fma->subtract_addend) {
+                    addend = -addend;
+                }
+                StoreUnaligned<Float>(
+                    result.data() + offset,
+                    std::fma(multiplicand1, multiplicand2, addend));
+            }
+        };
+        if (fma->lane_bytes == sizeof(float)) {
+            execute_lanes.template operator()<float>();
+        } else {
+            execute_lanes.template operator()<double>();
+        }
         return transaction.Publish();
     }
 
@@ -26935,8 +27590,9 @@ std::optional<bool> ValidateSpecialIntegerOperands(
     };
     switch (operation) {
     case X86_MNEMONIC_BEXTR:
+    case X86_MNEMONIC_BZHI:
         return writable_register(0) && readable_lane(1) &&
-               instruction.operand_count >= 3;
+               readable_lane(2) && instruction.operand_count >= 3;
     case X86_MNEMONIC_BLSI:
     case X86_MNEMONIC_BLSR:
     case X86_MNEMONIC_BSF:
@@ -27032,6 +27688,7 @@ bool CanInterpretInstruction(const LsxDecodedOp& ir) {
     case X86_MNEMONIC_CMPXCHG:
     case X86_MNEMONIC_CMPXCHG16B:
     case X86_MNEMONIC_BEXTR:
+    case X86_MNEMONIC_BZHI:
     case X86_MNEMONIC_BLSI:
         [[fallthrough]];
     case X86_MNEMONIC_BLSR:
@@ -27063,6 +27720,12 @@ bool CanInterpretInstruction(const LsxDecodedOp& ir) {
     case X86_MNEMONIC_RDTSC:
     case X86_MNEMONIC_RDTSCP:
     case X86_MNEMONIC_XGETBV:
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    case X86_MNEMONIC_EXTRQ:
+    case X86_MNEMONIC_INSERTQ:
+    case X86_MNEMONIC_MONITORX:
+    case X86_MNEMONIC_MWAITX:
+#endif
     case X86_MNEMONIC_FNSTCW:
     case X86_MNEMONIC_FLDCW:
     case X86_MNEMONIC_STMXCSR:
@@ -27328,6 +27991,14 @@ bool CanInterpretInstruction(const LsxDecodedOp& ir) {
     case X86_MNEMONIC_VPUNPCKHWD:
     case X86_MNEMONIC_VPUNPCKHDQ:
     case X86_MNEMONIC_VPUNPCKHQDQ:
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    case X86_MNEMONIC_VPERMPD:
+    case X86_MNEMONIC_VPERMQ:
+    case X86_MNEMONIC_VPSLLVD:
+    case X86_MNEMONIC_VPSRLVD:
+    case X86_MNEMONIC_VPSLLVQ:
+    case X86_MNEMONIC_VPSRLVQ:
+#endif
         return CanExecuteVectorInstruction(ir);
     case X86_MNEMONIC_MOVSS:
     case X86_MNEMONIC_VMOVSS:
@@ -27561,7 +28232,7 @@ std::uint64_t ExecuteJitHleBridgeMarker(LsxMachineImage& state,
             : (IsPlausibleHleGuestReturn(current_guest_return_after_hle)
                    ? current_guest_return_after_hle
                    : 0);
-    std::array<std::uint64_t, 4> floating_arguments{};
+    std::array<std::uint64_t, 8> floating_arguments{};
     for (std::size_t lane = 0; lane != floating_arguments.size(); ++lane) {
         floating_arguments[lane] =
             LoadUnaligned<std::uint64_t>(state.ymm[lane].data());
@@ -27695,8 +28366,8 @@ bool IsJitHleThunkAddressCandidate(const std::uint64_t thunk) {
         return false;
     }
 #ifdef __ANDROID__
-    const std::uint64_t slab_base = Core::AeroLib::GetAndroidX64ZeroStubSlabBase();
-    const std::uint64_t slab_size = Core::AeroLib::GetAndroidX64ZeroStubSlabSize();
+    const std::uint64_t slab_base = executor_jit_hle_thunk_slab_base();
+    const std::uint64_t slab_size = executor_jit_hle_thunk_slab_size();
     if (slab_base != 0 && slab_size != 0 && thunk >= slab_base &&
         thunk - slab_base < slab_size) {
         return true;
@@ -28586,6 +29257,14 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
     case X86_MNEMONIC_VPUNPCKHWD:
     case X86_MNEMONIC_VPUNPCKHDQ:
     case X86_MNEMONIC_VPUNPCKHQDQ:
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    case X86_MNEMONIC_VPERMPD:
+    case X86_MNEMONIC_VPERMQ:
+    case X86_MNEMONIC_VPSLLVD:
+    case X86_MNEMONIC_VPSRLVD:
+    case X86_MNEMONIC_VPSLLVQ:
+    case X86_MNEMONIC_VPSRLVQ:
+#endif
         return ExecuteVectorInstruction(*state, *ir) ? 0 : kRunStopMarker;
     case X86_MNEMONIC_MOVSS:
     case X86_MNEMONIC_VMOVSS:
@@ -28821,6 +29500,18 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
         WriteGuestGpr32(*state, LsxGpr::Rdx, static_cast<std::uint32_t>(xcr0 >> 32u));
         return 0;
     }
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    case X86_MNEMONIC_EXTRQ:
+    case X86_MNEMONIC_INSERTQ:
+        return ExecuteSse4aBitField(*state, *ir, mnemonic)
+            ? 0
+            : kRunStopMarker;
+    case X86_MNEMONIC_MONITORX:
+        return 0;
+    case X86_MNEMONIC_MWAITX:
+        std::this_thread::yield();
+        return 0;
+#endif
     case X86_MNEMONIC_FNSTCW:
     case X86_MNEMONIC_FLDCW:
     case X86_MNEMONIC_STMXCSR:
@@ -29063,6 +29754,37 @@ std::uint64_t InterpretDecodedInstructionCore(LsxMachineImage* state,
                     {*state, dst_state_offset, inputs[0],
                      static_cast<std::uint32_t>(inputs[1]), destination.size});
             }
+        }
+        return 0;
+    case X86_MNEMONIC_BZHI:
+        if (ir->operand_count >= 3) {
+            const auto& destination = ir->operands.front();
+            const auto width = destination.size;
+            const auto source =
+                LoadOperandValue(
+                    *state, ir->decoded, ir->operands[1], false) &
+                TruncateToOperandWidth(~UINT64_C(0), width);
+            const auto index = static_cast<std::uint32_t>(
+                LoadOperandValue(
+                    *state, ir->decoded, ir->operands[2], false) &
+                UINT64_C(0xff));
+            const auto mask =
+                index >= width
+                    ? TruncateToOperandWidth(~UINT64_C(0), width)
+                    : (index == 0
+                           ? UINT64_C(0)
+                           : (UINT64_C(1) << index) - 1);
+            const auto value = source & mask;
+            std::uint64_t flags{};
+            if (value == 0) {
+                flags |= kFlagZf;
+            }
+            if (index >= width) {
+                flags |= kFlagCf;
+            }
+            StoreStatusFlags(*state, flags);
+            StoreOperandValue(
+                *state, ir->decoded, destination, value, true);
         }
         return 0;
     case X86_MNEMONIC_BLSI:
@@ -36172,6 +36894,160 @@ std::string ExerciseTranslationEngineJson() {
                     std::memory_order_relaxed) > faultable_simd_writeback_before;
         }
 
+        const std::array<std::uint8_t, 11>
+            generic_vpbroadcastq_dreaming_sarah = {
+                0xc4, 0xe2, 0x79, 0x59, 0xc0,
+                0xc5, 0xfa, 0x7f, 0x00,
+                0xeb, 0x00,
+            };
+        const bool generic_vpbroadcastq_dreaming_sarah_ok =
+            run_generic_simd_case(
+                generic_vpbroadcastq_dreaming_sarah, 3, 1,
+                [](LsxMachineImage& state,
+                   std::array<std::uint8_t, 128>& memory) {
+                    constexpr std::uint64_t lane =
+                        UINT64_C(0x8070605040302010);
+                    WriteGuestGpr64(
+                        state, LsxGpr::Rax,
+                        reinterpret_cast<std::uint64_t>(
+                            memory.data()));
+                    std::memcpy(
+                        state.ymm[0].data(), &lane, sizeof(lane));
+                    std::fill(
+                        state.ymm[0].begin() + sizeof(lane),
+                        state.ymm[0].end(), UINT8_C(0xee));
+                },
+                [](const LsxMachineImage&,
+                   const std::array<std::uint8_t, 128>& memory) {
+                    constexpr std::uint64_t lane =
+                        UINT64_C(0x8070605040302010);
+                    std::uint64_t low{};
+                    std::uint64_t high{};
+                    std::memcpy(&low, memory.data(), sizeof(low));
+                    std::memcpy(
+                        &high, memory.data() + sizeof(low),
+                        sizeof(high));
+                    return low == lane && high == lane;
+                });
+
+        const std::array<std::uint8_t, 12>
+            generic_vpermq_dreaming_sarah = {
+                0xc4, 0xe3, 0xfd, 0x00, 0xdb, 0xe8,
+                0xc5, 0xfe, 0x7f, 0x18,
+                0xeb, 0x00,
+            };
+        const bool generic_vpermq_dreaming_sarah_ok =
+            run_generic_simd_case(
+                generic_vpermq_dreaming_sarah, 3, 1,
+                [](LsxMachineImage& state,
+                   std::array<std::uint8_t, 128>& memory) {
+                    WriteGuestGpr64(
+                        state, LsxGpr::Rax,
+                        reinterpret_cast<std::uint64_t>(
+                            memory.data()));
+                    constexpr std::array<std::uint64_t, 4> lanes = {
+                        UINT64_C(0x1111111111111111),
+                        UINT64_C(0x2222222222222222),
+                        UINT64_C(0x3333333333333333),
+                        UINT64_C(0x4444444444444444),
+                    };
+                    std::memcpy(
+                        state.ymm[3].data(), lanes.data(),
+                        sizeof(lanes));
+                },
+                [](const LsxMachineImage&,
+                   const std::array<std::uint8_t, 128>& memory) {
+                    constexpr std::array<std::uint64_t, 4>
+                        expected = {
+                            UINT64_C(0x1111111111111111),
+                            UINT64_C(0x3333333333333333),
+                            UINT64_C(0x3333333333333333),
+                            UINT64_C(0x4444444444444444),
+                        };
+                    return std::memcmp(
+                               memory.data(), expected.data(),
+                               sizeof(expected)) == 0;
+                });
+
+        const std::array<std::uint8_t, 12>
+            generic_vpermpd_dreaming_sarah = {
+                0xc4, 0xe3, 0xfd, 0x01, 0xd2, 0x4e,
+                0xc5, 0xfe, 0x7f, 0x10,
+                0xeb, 0x00,
+            };
+        const bool generic_vpermpd_dreaming_sarah_ok =
+            run_generic_simd_case(
+                generic_vpermpd_dreaming_sarah, 3, 1,
+                [](LsxMachineImage& state,
+                   std::array<std::uint8_t, 128>& memory) {
+                    WriteGuestGpr64(
+                        state, LsxGpr::Rax,
+                        reinterpret_cast<std::uint64_t>(
+                            memory.data()));
+                    constexpr std::array<std::uint64_t, 4> lanes = {
+                        UINT64_C(0x1111111111111111),
+                        UINT64_C(0x2222222222222222),
+                        UINT64_C(0x3333333333333333),
+                        UINT64_C(0x4444444444444444),
+                    };
+                    std::memcpy(
+                        state.ymm[2].data(), lanes.data(),
+                        sizeof(lanes));
+                },
+                [](const LsxMachineImage&,
+                   const std::array<std::uint8_t, 128>& memory) {
+                    constexpr std::array<std::uint64_t, 4>
+                        expected = {
+                            UINT64_C(0x3333333333333333),
+                            UINT64_C(0x4444444444444444),
+                            UINT64_C(0x1111111111111111),
+                            UINT64_C(0x2222222222222222),
+                        };
+                    return std::memcmp(
+                               memory.data(), expected.data(),
+                               sizeof(expected)) == 0;
+                });
+
+        const std::array<std::uint8_t, 11>
+            generic_vpsllvd_dreaming_sarah = {
+                0xc4, 0xe2, 0x6d, 0x47, 0xd0,
+                0xc5, 0xfe, 0x7f, 0x10,
+                0xeb, 0x00,
+            };
+        const bool generic_vpsllvd_dreaming_sarah_ok =
+            run_generic_simd_case(
+                generic_vpsllvd_dreaming_sarah, 3, 1,
+                [](LsxMachineImage& state,
+                   std::array<std::uint8_t, 128>& memory) {
+                    WriteGuestGpr64(
+                        state, LsxGpr::Rax,
+                        reinterpret_cast<std::uint64_t>(
+                            memory.data()));
+                    constexpr std::array<std::uint32_t, 8> values = {
+                        1u, 3u, 5u, 7u, 9u, 11u, 13u, 15u,
+                    };
+                    constexpr std::array<std::uint32_t, 8> counts = {
+                        0u, 1u, 4u, 31u, 32u, 33u, 8u, 16u,
+                    };
+                    std::memcpy(
+                        state.ymm[2].data(), values.data(),
+                        sizeof(values));
+                    std::memcpy(
+                        state.ymm[0].data(), counts.data(),
+                        sizeof(counts));
+                },
+                [](const LsxMachineImage&,
+                   const std::array<std::uint8_t, 128>& memory) {
+                    constexpr std::array<std::uint32_t, 8>
+                        expected = {
+                            1u, 6u, 80u, UINT32_C(0x80000000),
+                            0u, 0u, 3328u, 983040u,
+                        };
+                    return std::memcmp(
+                               memory.data(), expected.data(),
+                               sizeof(expected)) == 0;
+                });
+
         const std::uint64_t vector_kernel_fast_before =
             g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t vector_kernel_semantic_before =
@@ -37886,6 +38762,10 @@ std::string ExerciseTranslationEngineJson() {
             g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 simd_semantic_before;
         const bool generic_simd_native_ok = generic_simd_ymm_native_ok &&
+            generic_vpbroadcastq_dreaming_sarah_ok &&
+            generic_vpermq_dreaming_sarah_ok &&
+            generic_vpermpd_dreaming_sarah_ok &&
+            generic_vpsllvd_dreaming_sarah_ok &&
             generic_vector_kernel_native_ok && generic_scalar_predicate_native_ok &&
             generic_lddqu_vlddqu_native_ok && generic_maskmovdqu_native_ok &&
             generic_psadbw_vpsadbw_native_ok &&
@@ -38144,6 +39024,25 @@ std::string ExerciseTranslationEngineJson() {
                 WriteGuestGpr64(state, LsxGpr::Rcx,
                                  controls[iteration & 3u]);
             });
+        const std::array<std::uint8_t, 5> generic_bzhi_r64 = {
+            0xc4, 0xe2, 0xe0, 0xf5, 0xf6,
+        };
+        const bool generic_bzhi_semantic_ok = run_generic_scalar_case(
+            generic_bzhi_r64, 1, 1,
+            [](LsxMachineImage& state, const std::uint32_t iteration) {
+                constexpr std::array<std::uint64_t, 4> indices = {
+                    0u, 13u, 64u, 0x141u,
+                };
+                state.rflags = 0xa57u;
+                WriteGuestGpr64(
+                    state, LsxGpr::Rsi,
+                    0xfedcba9876543210ull ^
+                        (static_cast<std::uint64_t>(iteration) *
+                         0x1111111111111111ull));
+                WriteGuestGpr64(
+                    state, LsxGpr::Rbx,
+                    indices[iteration & 3u]);
+            });
         const std::array<std::uint8_t, 10> generic_blsi_blsr_r32 = {
             0xc4, 0xe2, 0x78, 0xf3, 0xdb,
             0xc4, 0xe2, 0x78, 0xf3, 0xcb,
@@ -38215,7 +39114,8 @@ std::string ExerciseTranslationEngineJson() {
             generic_scalar_extended_sequence_native_ok &&
             generic_imul_r32_r32_native_ok && generic_imul_r16_r16_native_ok &&
             generic_imul_r64_r64_native_ok && generic_imul_inline_ok &&
-            generic_bextr_inline_ok && generic_blsi_blsr_inline_ok &&
+            generic_bextr_inline_ok && generic_bzhi_semantic_ok &&
+            generic_blsi_blsr_inline_ok &&
             generic_movbe_inline_ok && generic_div_r32_inline_ok &&
             generic_idiv_r32_inline_ok;
 
@@ -38616,14 +39516,13 @@ std::string ExerciseTranslationEngineJson() {
 
 #ifdef __ANDROID__
         const std::uint64_t generic_indirect_hle_thunk =
-            Core::AeroLib::GetAndroidX64HleStubForNative(
+            executor_jit_get_hle_stub_for_native(
                 "jit-indirect-control-hle-gate-strcmp",
-                reinterpret_cast<std::uint64_t>(
-                    &Core::AeroLib::ExecutorLibcStrcmp));
+                executor_jit_stable_libc_strcmp());
         const std::uint64_t generic_indirect_hle_slab_base =
-            Core::AeroLib::GetAndroidX64ZeroStubSlabBase();
+            executor_jit_hle_thunk_slab_base();
         const std::uint64_t generic_indirect_hle_slab_size =
-            Core::AeroLib::GetAndroidX64ZeroStubSlabSize();
+            executor_jit_hle_thunk_slab_size();
         const bool generic_indirect_hle_in_slab_ok =
             generic_indirect_hle_slab_base != 0 &&
             generic_indirect_hle_slab_size != 0 &&
@@ -38638,8 +39537,7 @@ std::string ExerciseTranslationEngineJson() {
             executor_jit_lookup_hle_thunk(
                 generic_indirect_hle_thunk,
                 &generic_indirect_hle_native) != 0 &&
-            generic_indirect_hle_native == reinterpret_cast<std::uint64_t>(
-                &Core::AeroLib::ExecutorLibcStrcmp);
+            generic_indirect_hle_native == executor_jit_stable_libc_strcmp();
         const std::array<char, 6> generic_indirect_hle_lhs = {
             'a', 'l', 'p', 'h', 'a', 0,
         };
@@ -39627,6 +40525,11 @@ std::uint64_t ExecuteGuest(const std::uint64_t address,
     packet.stack_base = request.supplied_stack_base;
     packet.stack_size = request.supplied_stack_bytes;
     return Executor::Jit::DispatchGuestOnArm64(address, packet);
+}
+
+bool CompleteCurrentGuestExecution(
+    const std::uint64_t result) noexcept {
+    return Executor::Jit::SignalGuestRunCompletion(result);
 }
 
 void ConfigureArtifactStore(const std::string& directory,

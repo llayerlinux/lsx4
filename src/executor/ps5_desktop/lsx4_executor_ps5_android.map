@@ -1,0 +1,6 @@
+LSX4_PS5_RUNTIME_7.0 {
+    global:
+        executor_lsx4_ps5_*;
+    local:
+        *;
+};

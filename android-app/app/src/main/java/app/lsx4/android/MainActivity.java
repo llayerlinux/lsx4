@@ -93,6 +93,8 @@ public class MainActivity extends Activity {
     private static final String EXTRA_AUTOINIT_RUNTIME = "autoinit_runtime";
     private static final String EXTRA_SCAN_GAME_PATH = "scan_game_path";
     private static final String EXTRA_LAUNCH_GAME_PATH = "launch_game_path";
+    private static final String EXTRA_GAME_PLATFORM = "game_platform";
+    private static final String PLATFORM_PS5 = "ps5";
     private static final String EXTRA_TRANSLATOR_GUEST_ELF_PATH = "translator_guest_elf_path";
     private static final String EXTRA_TRANSLATOR_BRIDGE_LAUNCH = "translator_bridge_launch";
     private static final String EXTRA_JAVA_TRANSLATOR_SMOKE = "java_translator_smoke";
@@ -161,6 +163,7 @@ public class MainActivity extends Activity {
     private TextView backendLabel;
     private File runtimeFile;
     private boolean runtimeLoaded;
+    private boolean ps5Runtime;
     private Surface currentSurface;
     private SurfaceView renderSurfaceView;
     private int pixelCopyFrameIndex;
@@ -395,9 +398,12 @@ public class MainActivity extends Activity {
         Log.i(TAG, "Lifecycle onCreate fullscreen=" + wantsFullscreenRender());
         setVolumeControlStream(AudioManager.STREAM_MUSIC);
         fullscreenRender = wantsFullscreenRender();
+        ps5Runtime = PLATFORM_PS5.equalsIgnoreCase(
+                getIntent().getStringExtra(EXTRA_GAME_PLATFORM));
         configureLandscapeWindow();
 
         SharedPreferences appSettings = getSharedPreferences(SettingsActivity.PREFS, MODE_PRIVATE);
+        applyExtremePerformanceProfile(appSettings);
         liveSettings = appSettings;
         liveSettings.registerOnSharedPreferenceChangeListener(liveSettingsListener);
         try {
@@ -414,7 +420,10 @@ public class MainActivity extends Activity {
             enableFullscreenRenderMode();
         }
 
-        runtimeFile = new File(new File(getFilesDir(), "runtime"), "liblsx4_executor_android.so");
+        runtimeFile = new File(new File(getFilesDir(), "runtime"),
+                ps5Runtime
+                        ? "liblsx4_executor_ps5_android.so"
+                        : "liblsx4_executor_android.so");
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -664,6 +673,16 @@ public class MainActivity extends Activity {
         }
         boolean wasFullscreen = fullscreenRender;
         setIntent(intent);
+        boolean nextPs5Runtime = PLATFORM_PS5.equalsIgnoreCase(
+                intent.getStringExtra(EXTRA_GAME_PLATFORM));
+        if (ps5Runtime != nextPs5Runtime) {
+            ps5Runtime = nextPs5Runtime;
+            runtimeLoaded = false;
+            runtimeFile = new File(new File(getFilesDir(), "runtime"),
+                    ps5Runtime
+                            ? "liblsx4_executor_ps5_android.so"
+                            : "liblsx4_executor_android.so");
+        }
         boolean nextFullscreen = wantsFullscreenRender();
         if (wasFullscreen && !nextFullscreen) {
             nextFullscreen = true;
@@ -829,8 +848,16 @@ public class MainActivity extends Activity {
                 intentFlag(EXTRA_VALIDATE_EMBEDDED_BOX64_MAPPED_ENTRY) ||
                 intentFlag(EXTRA_RUN_EMBEDDED_BOX64_MAPPED_ENTRY);
         loadRuntimeFromFile("Existing sandbox runtime");
+        if (!runtimeLoaded) {
+            append("Aborting automation: runtime failed to load.");
+            return;
+        }
         if (intentFlag(EXTRA_AUTOINIT_RUNTIME) || isBareLaunch() || hasIntentAutomationExtras()) {
             initializeRuntime();
+            if (!runtimeLoaded) {
+                append("Runtime failed during initialization.");
+                return;
+            }
         }
         String probeDlopenPath = getIntent().getStringExtra(EXTRA_PROBE_DLOPEN_PATH);
         if (probeDlopenPath != null && !probeDlopenPath.isEmpty()) {
@@ -851,10 +878,11 @@ public class MainActivity extends Activity {
             runTranslatorGuestElf(guestElfPath);
         }
         String scanPath = getIntent().getStringExtra(EXTRA_SCAN_GAME_PATH);
-        if (scanPath != null && !scanPath.isEmpty()) {
+        String launchPath = getIntent().getStringExtra(EXTRA_LAUNCH_GAME_PATH);
+        if (scanPath != null && !scanPath.isEmpty()
+                && !(ps5Runtime && scanPath.equals(launchPath))) {
             scanGamePath(scanPath);
         }
-        String launchPath = getIntent().getStringExtra(EXTRA_LAUNCH_GAME_PATH);
         if (launchPath != null && !launchPath.isEmpty()) {
             activeGamePath = launchPath;
             if (useTranslatorBridge) {
@@ -2631,6 +2659,23 @@ public class MainActivity extends Activity {
         }
     }
 
+    private void applyExtremePerformanceProfile(SharedPreferences appSettings) {
+        if (appSettings == null) {
+            return;
+        }
+        SharedPreferences.Editor editor = appSettings.edit();
+        editor.putInt(SettingsActivity.K_RES_MODE, SettingsActivity.RES_360P);
+        editor.putBoolean(SettingsActivity.K_DISABLE_DYNAMIC_SHADOWS, true);
+        editor.putBoolean(SettingsActivity.K_DISABLE_SSAO, true);
+        editor.putBoolean(SettingsActivity.K_DISABLE_MOTION_BLUR, true);
+        editor.putBoolean(SettingsActivity.K_DISABLE_DEPTH_OF_FIELD, true);
+        editor.putBoolean(SettingsActivity.K_DISABLE_ANTI_ALIASING, true);
+        editor.putBoolean(SettingsActivity.K_DISABLE_CHROMATIC_ABERRATION, true);
+        editor.putBoolean(SettingsActivity.K_PERSISTENT_JIT_CACHE, true);
+        editor.apply();
+        Log.i(TAG, "Extreme performance profile enabled: 360p + heavy graphics effects disabled");
+    }
+
     private static boolean isGraphicsPatchPreference(String key) {
         return SettingsActivity.K_DISABLE_DYNAMIC_SHADOWS.equals(key)
                 || SettingsActivity.K_DISABLE_SSAO.equals(key)
@@ -2738,10 +2783,21 @@ public class MainActivity extends Activity {
         long drawRate = counterRate(current, previous, 6);
         long submitRate = counterRate(current, previous, 8);
         long presentRate = counterRate(current, previous, 10);
+        StringBuilder managedOptimization = new StringBuilder();
+        if (current.length > 18 && current[18] != 0) {
+            managedOptimization.append("  ARM-GPU");
+        }
+        if (current.length > 19 && current[19] != 0) {
+            managedOptimization.append("  VRS2x2");
+        }
+        if (current.length > 20 && current[20] != 0) {
+            managedOptimization.append("  NO-RB");
+        }
         debugHudFps.setText(String.format(Locale.US, "FPS %,d", presentRate));
         debugHud.setText(String.format(Locale.US,
-                "time %02d:%02d  blocks %,d (+%,d/s)  draw %,d/s  submit %,d/s  present %,d/s",
-                minutes, seconds, current[0], generatedRate, drawRate, submitRate, presentRate));
+                "time %02d:%02d  blocks %,d (+%,d/s)  draw %,d/s  submit %,d/s  present %,d/s%s",
+                minutes, seconds, current[0], generatedRate, drawRate, submitRate, presentRate,
+                managedOptimization));
     }
 
     private String describePersistentCache(long[] stats) {
@@ -3864,7 +3920,9 @@ public class MainActivity extends Activity {
 
     private void sendPadButton(int mask, boolean pressed, boolean hostFeedback) {
         try {
-            int result = RuntimeBridge.setPadButton(mask, pressed);
+            int result = ps5Runtime
+                    ? RuntimeBridge.setPs5PadButton(mask, pressed)
+                    : RuntimeBridge.setPadButton(mask, pressed);
             updateHelperPadState(mask, pressed);
             String line = String.format(Locale.US,
                     "Pad input: {\"mask\":\"0x%08x\",\"pressed\":%s,\"result\":%d}",
@@ -3889,7 +3947,9 @@ public class MainActivity extends Activity {
     private void sendPadAxis(int axis, int value, boolean verbose) {
         try {
             int clamped = Math.max(0, Math.min(255, value));
-            int result = RuntimeBridge.setPadAxis(axis, clamped);
+            int result = ps5Runtime
+                    ? RuntimeBridge.setPs5PadAxis(axis, clamped)
+                    : RuntimeBridge.setPadAxis(axis, clamped);
             updateHelperPadAxis(axis, clamped);
             if (verbose) {
                 String line = String.format(Locale.US,
@@ -3977,22 +4037,69 @@ public class MainActivity extends Activity {
     }
 
     private void loadRuntimeFromFile(String label) {
+        if (runtimeFile == null) {
+            append("Runtime load skipped: runtime file path is unavailable.");
+            runtimeLoaded = false;
+            return;
+        }
+        if (!runtimeFile.isFile()) {
+            append("Runtime file missing: " + runtimeFile.getAbsolutePath());
+            if (ps5Runtime) {
+                append("PS5 runtime is not present in sandbox. Install PS5 runtime or run on a build that includes it.");
+            }
+            runtimeLoaded = false;
+            return;
+        }
         try {
             append(label + ": " + runtimeFile.getAbsolutePath());
-            append(RuntimeBridge.load(runtimeFile.getAbsolutePath()));
+            append(ps5Runtime
+                    ? RuntimeBridge.loadPs5(runtimeFile.getAbsolutePath())
+                    : RuntimeBridge.load(runtimeFile.getAbsolutePath()));
             runtimeLoaded = true;
-            RuntimeBridge.setAudioEnabled(SettingsActivity.prefs(this).getBoolean(
-                    SettingsActivity.K_AUDIO, true));
-            replayExternalGamepadState();
+            if (!ps5Runtime) {
+                applyManagedOptimizations();
+                RuntimeBridge.setAudioEnabled(SettingsActivity.prefs(this).getBoolean(
+                        SettingsActivity.K_AUDIO, true));
+                replayExternalGamepadState();
+            }
             runOnUiThread(this::updateBackendLabel);
-            append("ABI: " + RuntimeBridge.abi());
-            append("Version: " + RuntimeBridge.version());
-            append("System: " + RuntimeBridge.systemInfo());
+            if (ps5Runtime) {
+                append("ABI: " + RuntimeBridge.ps5Abi());
+                append("PS5 runtime status: " + RuntimeBridge.ps5Status());
+            } else {
+                append("ABI: " + RuntimeBridge.abi());
+                append("Version: " + RuntimeBridge.version());
+                append("System: " + RuntimeBridge.systemInfo());
+            }
             attachSurfaceIfReady();
-        } catch (Exception e) {
-            runtimeLoaded = false;
+        } catch (Throwable e) {
             append("Runtime load failed: " + e.getMessage());
+            if (ps5Runtime && e instanceof UnsatisfiedLinkError) {
+                append("PS5 runtime is missing required native library. Install PS5 runtime or use build with embedded PS5 binary.");
+            }
+            runtimeLoaded = false;
         }
+    }
+
+    private void applyManagedOptimizations() {
+        SharedPreferences preferences = SettingsActivity.prefs(this);
+        boolean armGpuFastPath = preferences.getBoolean(
+                SettingsActivity.K_ARM_GPU_FAST_PATH, false);
+        boolean coarseFragment2x2 = preferences.getBoolean(
+                SettingsActivity.K_COARSE_FRAGMENT_2X2, false);
+        boolean disableVkRobustness = preferences.getBoolean(
+                SettingsActivity.K_DISABLE_VK_ROBUSTNESS, false);
+        int armResult = RuntimeBridge.setManagedOptimization(
+                RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH, armGpuFastPath);
+        int coarseResult = RuntimeBridge.setManagedOptimization(
+                RuntimeBridge.MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2, coarseFragment2x2);
+        int robustnessResult = RuntimeBridge.setManagedOptimization(
+                RuntimeBridge.MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS,
+                disableVkRobustness);
+        Log.i(TAG, "EXECUTOR_MANAGED_OPTIMIZATION armGpuFastPath=" + armGpuFastPath
+                + " coarseFragment2x2=" + coarseFragment2x2
+                + " disableVkRobustness=" + disableVkRobustness
+                + " results=" + armResult + "/" + coarseResult + "/" + robustnessResult);
     }
 
     private void initializeRuntime() {
@@ -4005,8 +4112,15 @@ public class MainActivity extends Activity {
             materializeGraphicsEffectSettings(root);
             materializeRenderResolutionSetting(root);
             writeNativeTranslatorPath(root);
-            int result = RuntimeBridge.initialize(root.getAbsolutePath(), "local");
+            int result = ps5Runtime
+                    ? RuntimeBridge.initializePs5(root.getAbsolutePath(), "local")
+                    : RuntimeBridge.initialize(root.getAbsolutePath(), "local");
             append("Initialize result: " + result);
+            if (ps5Runtime) {
+                attachSurfaceIfReady();
+                append("PS5 runtime status: " + RuntimeBridge.ps5Status());
+                return;
+            }
             append("Firmware status: " + RuntimeBridge.firmwareStatus());
             append("AArch64 JIT self-test skipped in the interactive app; use the headless native probe.");
             append("Vortek ashmem ring selftest result: " + RuntimeBridge.vortekRingSelfTest());
@@ -4021,8 +4135,9 @@ public class MainActivity extends Activity {
             }
             append("Audio status: " + RuntimeBridge.audioStatus());
             append("Runtime status: " + RuntimeBridge.status());
-        } catch (Exception e) {
+        } catch (Throwable e) {
             append("Initialize failed: " + e.getMessage());
+            runtimeLoaded = false;
         }
     }
 
@@ -4057,9 +4172,13 @@ public class MainActivity extends Activity {
 
     private void scanGamePath(String path) {
         try {
-            int result = RuntimeBridge.scanGame(path);
+            int result = ps5Runtime
+                    ? RuntimeBridge.scanPs5Game(path)
+                    : RuntimeBridge.scanGame(path);
             append("Scan game result: " + result);
-            append("Runtime status: " + RuntimeBridge.status());
+            append("Runtime status: " + (ps5Runtime
+                    ? RuntimeBridge.ps5Status()
+                    : RuntimeBridge.status()));
         } catch (Exception e) {
             append("Scan game failed: " + e.getMessage());
         }
@@ -4067,6 +4186,13 @@ public class MainActivity extends Activity {
 
     private void launchGamePathJit(String path) {
         try {
+            if (ps5Runtime) {
+                append("PS5 runtime status before launch: " + RuntimeBridge.ps5Status());
+                int result = RuntimeBridge.launchPs5GameJit(path);
+                append("PS5 launch result: " + result);
+                append("PS5 runtime status after launch: " + RuntimeBridge.ps5Status());
+                return;
+            }
             materializeJitPersistentJitCacheSetting(
                     new File(getFilesDir(), "lsx4-home"));
             materializeGraphicsEffectSettings(
@@ -4316,8 +4442,12 @@ public class MainActivity extends Activity {
         }
 
         try {
-            int result = RuntimeBridge.attachSurface(currentSurface);
-            setSurfaceStatus("Surface attached: " + RuntimeBridge.surfaceInfo());
+            int result = ps5Runtime
+                    ? RuntimeBridge.attachPs5Surface(currentSurface)
+                    : RuntimeBridge.attachSurface(currentSurface);
+            setSurfaceStatus(ps5Runtime
+                    ? "PS5 presenter surface attached"
+                    : "Surface attached: " + RuntimeBridge.surfaceInfo());
             append("Attach surface result: " + result);
         } catch (Exception e) {
             setSurfaceStatus("Surface attach failed: " + e.getMessage());
@@ -4615,7 +4745,11 @@ public class MainActivity extends Activity {
         }
 
         try {
-            RuntimeBridge.detachSurface();
+            if (ps5Runtime) {
+                RuntimeBridge.detachPs5Surface();
+            } else {
+                RuntimeBridge.detachSurface();
+            }
             setSurfaceStatus(getString(R.string.surface_detached));
             append("Surface detached.");
         } catch (Exception e) {

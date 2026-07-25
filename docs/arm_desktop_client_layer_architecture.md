@@ -109,6 +109,23 @@ The verified native library was:
 
 The same hash was measured inside Vivo application storage at `files/runtime/liblsx4_executor_android.so`. After the Android-only prune, Bloodborne resumed an in-game scene with 331,483 JIT blocks, 7,413 draws/s, 144 submits/s, 13 presents/s, and 13 FPS at the observation point. Its separate game process recreated `Game:Main`, `Jit:Cache`, GPU communication/scheduler/presenter, FMOD, audio output, and worker threads with zero fatal events. The device reported `vivo V2546A` and an Adreno Vulkan implementation; Mali results were not used for acceptance.
 
+### Managed Funnel optimization proof
+
+The Android settings screen exposes three experimental switches under `Managed optimizations`: `ARM GPU fast path`, `2x2 coarse fragment shading`, and `Disable Vulkan robustness checks`. They are disabled by default and applied when the runtime is loaded, so changing them requires restarting the game. The runtime HUD appends `ARM-GPU`, `VRS2x2`, and `NO-RB` for the active native options.
+
+The option crosses the intended ownership boundary instead of implementing a client-side approximation:
+
+1. `SettingsActivity` persists the client preference and `MainActivity` publishes it through `RuntimeBridge`.
+2. `executor_lsx4_runtime_set_managed_optimization` transfers the value into Funnel-owned `Config` state.
+3. Funnel shader collection and SPIR-V context emission consume `Config::directMemoryAccess()` and use the direct GPU-memory constant path.
+4. Funnel Vulkan rasterization and scheduling omit per-draw journals, color-target tracing, submit-reason accounting, and submit-latency timing while the ARM GPU fast path is active. Correctness-critical color-target lifetime tracking remains enabled.
+5. The coarse-fragment option requests `VK_KHR_fragment_shading_rate`, verifies `pipelineFragmentShadingRate`, verifies a supported 2x2 rate, and applies it to graphics command buffers. It can reduce fragment invocations by up to 75 percent when fragment shading is the limiting work, at the cost of visibly coarser fine detail.
+6. The no-robustness option disables core buffer robustness, Vulkan 1.3 image robustness, and `VK_EXT_robustness2` buffer/image checks when the Vulkan device is created. Null descriptors remain enabled. Invalid guest shader accesses can therefore cause corruption or a driver failure.
+
+The verified fast-path native library has SHA-256 `F623A61111D4E5EEC1E474B67460823A22B239DFF6E0ACA3EEB9C6448FE5F1A2`; the installed Vivo copy had the same hash. Runtime markers changed from `directMemory=0 vkDiagnostics=1` to `directMemory=1 vkDiagnostics=0`. Bloodborne reached gameplay without a fatal event or visible corruption. In comparable steady samples, the disabled path completed approximately 11.6 frames/s and the enabled path approximately 13.1 frames/s, an observed gain of about 12%. Individual HUD captures showed 12 FPS disabled and 14 FPS enabled. This result is device, scene, cache, and thermal-state dependent and is not a universal performance guarantee.
+
+The extended managed build has SHA-256 `BB7C4C5579B7E44F190EFFF81FF5DA53F89667F7AEF89F8674A74323D5A34178`; the installed Vivo copy had the same hash. The device reported `pipelineFeature=1 rate=2x2` and `robustness disabled=1`. Bloodborne reached gameplay without a fatal event. With all three options enabled, a comparable steady sample averaged approximately 15.1 frames/s. This is about 15 percent above the ARM GPU fast path alone and about 30 percent above the original disabled sample. Coarse 2x2 shading visibly reduces fine foliage and edge detail, as expected, so it remains an explicit quality/performance trade-off rather than a default.
+
 ## Optimization order
 
 ### 1. Optimize Funnel ARM first
@@ -143,3 +160,8 @@ Cross-layer changes require measurements from both sides. The main candidates ar
 - Do not restore a desktop source inventory in the root `CMakeLists.txt`; Android source ownership belongs to Funnel.
 - Build and hash the `.so`, install the APK with data preservation, deploy that exact `.so`, and verify the on-device hash before compatibility testing.
 - Test at least native initialization, a cached title launch, live JIT execution, GPU submission, and frame completion after a boundary change.
+
+## Related postmortems
+
+- [Android audio compatibility](android_audio_compatibility_postmortem.md)
+- [Android guest-memory frame flicker](android_guest_memory_frame_flicker_postmortem.md)

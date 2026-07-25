@@ -21,6 +21,7 @@ using str_fn = const char* (*)();
 using init_fn = int (*)(const char*, const char*);
 using path_fn = int (*)(const char*);
 using int_fn = int (*)(int);
+using option_fn = int (*)(int, int);
 using json_report_fn = int (*)(const char*);
 using noarg_int_fn = int (*)();
 using pad_button_fn = int (*)(unsigned int, int);
@@ -40,6 +41,16 @@ using runtime_hud_stats_fn = int (*)(std::uint64_t*, std::size_t);
 
 std::mutex g_mutex;
 void* g_runtime = nullptr;
+void* g_ps5_runtime = nullptr;
+str_fn g_ps5_abi = nullptr;
+str_fn g_ps5_status = nullptr;
+init_fn g_ps5_initialize = nullptr;
+attach_surface_fn g_ps5_attach_surface = nullptr;
+detach_surface_fn g_ps5_detach_surface = nullptr;
+path_fn g_ps5_scan_game = nullptr;
+path_fn g_ps5_launch_game_jit = nullptr;
+pad_button_fn g_ps5_set_pad_button = nullptr;
+pad_axis_fn g_ps5_set_pad_axis = nullptr;
 str_fn g_abi = nullptr;
 str_fn g_version = nullptr;
 str_fn g_system_info = nullptr;
@@ -83,6 +94,7 @@ pad_axis_fn g_set_pad_axis = nullptr;
 pad_touch_fn g_set_touchpad = nullptr;
 noarg_int_fn g_audio_init = nullptr;
 int_fn g_set_audio_enabled = nullptr;
+option_fn g_set_managed_optimization = nullptr;
 noarg_int_fn g_audio_probe_tone = nullptr;
 str_fn g_audio_status = nullptr;
 
@@ -186,6 +198,20 @@ template <typename T>
 T resolve_optional(const char* name)
 {
     return reinterpret_cast<T>(dlsym(g_runtime, name));
+}
+
+template <typename T>
+T resolve_ps5_required(JNIEnv* env, const char* name)
+{
+    void* symbol = dlsym(g_ps5_runtime, name);
+    if (!symbol)
+    {
+        std::string error = "Missing PS5 runtime symbol: ";
+        error += name;
+        env->ThrowNew(env->FindClass("java/lang/UnsatisfiedLinkError"), error.c_str());
+        return nullptr;
+    }
+    return reinterpret_cast<T>(symbol);
 }
 
 const char* call_or_empty(str_fn fn)
@@ -466,6 +492,8 @@ Java_app_lsx4_android_RuntimeBridge_load(JNIEnv* env, jclass, jstring path)
     g_audio_init = resolve_optional<noarg_int_fn>("executor_lsx4_runtime_audio_init");
     g_set_audio_enabled =
         resolve_optional<int_fn>("executor_lsx4_runtime_set_audio_enabled");
+    g_set_managed_optimization = resolve_optional<option_fn>(
+        "executor_lsx4_runtime_set_managed_optimization");
     g_audio_probe_tone =
         resolve_optional<noarg_int_fn>("executor_lsx4_runtime_audio_probe_tone");
     g_audio_status = resolve_optional<str_fn>("executor_lsx4_runtime_audio_status");
@@ -481,6 +509,186 @@ Java_app_lsx4_android_RuntimeBridge_load(JNIEnv* env, jclass, jstring path)
     __android_log_print(ANDROID_LOG_INFO, "LSX4", "Loaded runtime: %s",
                         loaded_path.c_str());
     return to_jstring(env, "Loaded runtime: " + loaded_path);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_loadPs5(JNIEnv* env, jclass, jstring path)
+{
+    const char* raw_path = env->GetStringUTFChars(path, nullptr);
+    if (!raw_path)
+    {
+        return to_jstring(env, "PS5 runtime path is empty.");
+    }
+
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_ps5_runtime)
+    {
+        dlclose(g_ps5_runtime);
+        g_ps5_runtime = nullptr;
+    }
+
+    g_ps5_runtime = dlopen(raw_path, RTLD_NOW | RTLD_LOCAL);
+    std::string loaded_path = raw_path;
+    env->ReleaseStringUTFChars(path, raw_path);
+    if (!g_ps5_runtime)
+    {
+        std::string error = "PS5 dlopen failed: ";
+        error += dlerror();
+        env->ThrowNew(env->FindClass("java/lang/UnsatisfiedLinkError"), error.c_str());
+        return nullptr;
+    }
+
+    g_ps5_abi = resolve_ps5_required<str_fn>(
+        env, "executor_lsx4_ps5_runtime_abi");
+    g_ps5_status = resolve_ps5_required<str_fn>(
+        env, "executor_lsx4_ps5_runtime_status");
+    g_ps5_initialize = resolve_ps5_required<init_fn>(
+        env, "executor_lsx4_ps5_runtime_initialize_android");
+    g_ps5_attach_surface = resolve_ps5_required<attach_surface_fn>(
+        env, "executor_lsx4_ps5_runtime_attach_surface");
+    g_ps5_detach_surface = resolve_ps5_required<detach_surface_fn>(
+        env, "executor_lsx4_ps5_runtime_detach_surface");
+    g_ps5_scan_game = resolve_ps5_required<path_fn>(
+        env, "executor_lsx4_ps5_runtime_scan_game");
+    g_ps5_launch_game_jit = resolve_ps5_required<path_fn>(
+        env, "executor_lsx4_ps5_runtime_launch_game_jit");
+    g_ps5_set_pad_button = resolve_ps5_required<pad_button_fn>(
+        env, "executor_lsx4_ps5_runtime_set_pad_button");
+    g_ps5_set_pad_axis = resolve_ps5_required<pad_axis_fn>(
+        env, "executor_lsx4_ps5_runtime_set_pad_axis");
+    if (env->ExceptionCheck())
+    {
+        return nullptr;
+    }
+
+    __android_log_print(ANDROID_LOG_INFO, "LSX4",
+                        "Loaded isolated PS5 runtime: %s",
+                        loaded_path.c_str());
+    return to_jstring(env, "Loaded isolated PS5 runtime: " + loaded_path);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_ps5Abi(JNIEnv* env, jclass)
+{
+    return to_jstring(env, call_or_empty(g_ps5_abi));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_app_lsx4_android_RuntimeBridge_ps5Status(JNIEnv* env, jclass)
+{
+    return to_jstring(env, call_or_empty(g_ps5_status));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_initializePs5(
+    JNIEnv* env, jclass, jstring root_dir, jstring user_id)
+{
+    if (!g_ps5_initialize)
+    {
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                      "PS5 runtime is not loaded.");
+        return -1;
+    }
+    const char* raw_root = env->GetStringUTFChars(root_dir, nullptr);
+    const char* raw_user = env->GetStringUTFChars(user_id, nullptr);
+    const int result = g_ps5_initialize(
+        raw_root ? raw_root : "", raw_user ? raw_user : "");
+    if (raw_user)
+    {
+        env->ReleaseStringUTFChars(user_id, raw_user);
+    }
+    if (raw_root)
+    {
+        env->ReleaseStringUTFChars(root_dir, raw_root);
+    }
+    return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_attachPs5Surface(
+    JNIEnv* env, jclass, jobject surface)
+{
+    if (!g_ps5_attach_surface)
+    {
+        return -2;
+    }
+    if (!surface)
+    {
+        env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"),
+                      "Surface is null.");
+        return -1;
+    }
+    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+    if (!window)
+    {
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                      "Could not obtain ANativeWindow from PS5 Surface.");
+        return -1;
+    }
+    const int result = g_ps5_attach_surface(window);
+    ANativeWindow_release(window);
+    return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_detachPs5Surface(JNIEnv*, jclass)
+{
+    return g_ps5_detach_surface ? g_ps5_detach_surface() : -2;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_scanPs5Game(
+    JNIEnv* env, jclass, jstring path)
+{
+    if (!g_ps5_scan_game)
+    {
+        return -2;
+    }
+    const char* raw_path = env->GetStringUTFChars(path, nullptr);
+    const int result = g_ps5_scan_game(raw_path ? raw_path : "");
+    if (raw_path)
+    {
+        env->ReleaseStringUTFChars(path, raw_path);
+    }
+    return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_launchPs5GameJit(
+    JNIEnv* env, jclass, jstring path)
+{
+    if (!g_ps5_launch_game_jit)
+    {
+        return -2;
+    }
+    const char* raw_path = env->GetStringUTFChars(path, nullptr);
+    const int result = g_ps5_launch_game_jit(raw_path ? raw_path : "");
+    if (raw_path)
+    {
+        env->ReleaseStringUTFChars(path, raw_path);
+    }
+    return result;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_setPs5PadButton(
+    JNIEnv*, jclass, jint button_mask, jboolean pressed)
+{
+    return g_ps5_set_pad_button
+        ? g_ps5_set_pad_button(
+              static_cast<unsigned int>(button_mask),
+              pressed ? 1 : 0)
+        : -2;
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_setPs5PadAxis(
+    JNIEnv*, jclass, jint axis, jint value)
+{
+    return g_ps5_set_pad_axis
+        ? g_ps5_set_pad_axis(
+              static_cast<int>(axis), static_cast<int>(value))
+        : -2;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -891,6 +1099,15 @@ Java_app_lsx4_android_RuntimeBridge_setAudioEnabled(JNIEnv*, jclass, jboolean en
 }
 
 extern "C" JNIEXPORT jint JNICALL
+Java_app_lsx4_android_RuntimeBridge_setManagedOptimization(JNIEnv*, jclass, jint option,
+                                                           jboolean enabled)
+{
+    return g_set_managed_optimization
+               ? g_set_managed_optimization(static_cast<int>(option), enabled ? 1 : 0)
+               : -2;
+}
+
+extern "C" JNIEXPORT jint JNICALL
 Java_app_lsx4_android_RuntimeBridge_audioProbeTone(JNIEnv*, jclass)
 {
     if (!g_audio_probe_tone)
@@ -999,7 +1216,7 @@ Java_app_lsx4_android_RuntimeBridge_jitStatus(JNIEnv* env, jclass)
 extern "C" JNIEXPORT jlongArray JNICALL
 Java_app_lsx4_android_RuntimeBridge_runtimeHudStats(JNIEnv* env, jclass)
 {
-    constexpr std::size_t kValueCapacity = 18;
+    constexpr std::size_t kValueCapacity = 21;
     std::uint64_t values[kValueCapacity]{};
     const int returned_count =
         g_runtime_hud_stats ? g_runtime_hud_stats(values, kValueCapacity) : 0;
