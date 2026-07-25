@@ -25,6 +25,7 @@ import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.widget.ImageView;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.PopupMenu;
 import android.widget.ProgressBar;
@@ -32,6 +33,8 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
+import org.apache.commons.compress.archivers.sevenz.SevenZFile;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
@@ -40,6 +43,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.RandomAccessFile;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
@@ -54,6 +58,8 @@ import java.util.Locale;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 public final class LauncherUi {
     private static final String TAG = "LSX4.Library";
@@ -64,6 +70,9 @@ public final class LauncherUi {
     private static final int MENU_IMPORT_PKG = 5102;
     private static final String EXTRA_EMBEDDED_AARCH64_JIT_BACKEND =
             "embedded_aarch64_jit_backend";
+    private static final String EXTRA_GAME_PLATFORM = "game_platform";
+    private static final String PLATFORM_PS4 = "ps4";
+    private static final String PLATFORM_PS5 = "ps5";
     private static final Pattern TITLE_ID = Pattern.compile("[A-Z0-9]{9}");
     private static final int MAX_SFO_BYTES = 1024 * 1024;
     private static final int COPY_BUFFER_BYTES = 1024 * 1024;
@@ -248,7 +257,7 @@ public final class LauncherUi {
         } else {
             runJob(activity.getString(R.string.import_copying_pkg), () -> {
                 try {
-                    return importPkg(uri);
+                    return importSelectedFile(uri);
                 } finally {
                     releaseReadPermission(uri);
                 }
@@ -388,20 +397,33 @@ public final class LauncherUi {
         if (eboot == null || sceSys == null) {
             throw new IOException("выбранная папка должна содержать eboot.bin и sce_sys");
         }
-        SafNode param = findDirectChild(treeUri, sceSys.uri, "param.sfo", false);
-        if (param == null) {
-            throw new IOException("в sce_sys отсутствует param.sfo");
+        SafNode paramSfo = findDirectChild(treeUri, sceSys.uri, "param.sfo", false);
+        SafNode paramJson = findDirectChild(treeUri, sceSys.uri, "param.json", false);
+        if (paramSfo == null && paramJson == null) {
+            throw new IOException("в sce_sys отсутствует param.sfo или param.json");
         }
         if (eboot.size >= 0 && eboot.size < 4) {
             throw new IOException("eboot.bin пуст или обрезан");
         }
 
-        byte[] sourceSfo = readUriLimited(resolver, param.uri, MAX_SFO_BYTES);
-        String titleId = normalizeTitleId(PkgInstaller.sfoString(sourceSfo, "TITLE_ID"));
-        if (!isValidTitleId(titleId)) {
-            throw new IOException("некорректный TITLE_ID в param.sfo");
+        String platform;
+        String titleId;
+        String title;
+        if (paramJson != null) {
+            Ps5Metadata metadata = readPs5Metadata(
+                    readUriLimited(resolver, paramJson.uri, MAX_SFO_BYTES));
+            platform = PLATFORM_PS5;
+            titleId = metadata.titleId;
+            title = metadata.title;
+        } else {
+            byte[] sourceSfo = readUriLimited(resolver, paramSfo.uri, MAX_SFO_BYTES);
+            platform = PLATFORM_PS4;
+            titleId = normalizeTitleId(PkgInstaller.sfoString(sourceSfo, "TITLE_ID"));
+            title = cleanSfoString(PkgInstaller.sfoString(sourceSfo, "TITLE"));
         }
-        String title = cleanSfoString(PkgInstaller.sfoString(sourceSfo, "TITLE"));
+        if (!isValidTitleId(titleId)) {
+            throw new IOException("некорректный title ID");
+        }
 
         File home = homeDir();
         File appRoot = appInstallRoot();
@@ -424,18 +446,23 @@ public final class LauncherUi {
                     new HashSet<>());
 
             File stagedEboot = checkedChild(staging, "eboot.bin");
-            File stagedSfo = checkedChild(checkedChild(staging, "sce_sys"), "param.sfo");
+            File stagedSceSys = checkedChild(staging, "sce_sys");
+            File stagedParam = checkedChild(
+                    stagedSceSys,
+                    PLATFORM_PS5.equals(platform) ? "param.json" : "param.sfo");
             if (!isPlausibleEboot(stagedEboot, staging)
-                    || !safeRegularFileWithin(stagedSfo, staging)) {
+                    || !safeRegularFileWithin(stagedParam, staging)) {
                 throw new IOException("копия игры не прошла проверку структуры");
             }
-            String copiedId = readSfoValue(stagedSfo, "TITLE_ID");
+            String copiedId = PLATFORM_PS5.equals(platform)
+                    ? readPs5Metadata(readFileLimited(stagedParam, MAX_SFO_BYTES)).titleId
+                    : readSfoValue(stagedParam, "TITLE_ID");
             if (!titleId.equals(copiedId)) {
-                throw new IOException("TITLE_ID изменился во время копирования");
+                throw new IOException("title ID изменился во время копирования");
             }
 
             writeInstallManifest(staging, titleId, title, treeUri.toString(), true,
-                    "saf-extracted-tree");
+                    "saf-extracted-tree", platform);
             installStagingTree(staging, destination, stagingRoot);
             installed = true;
         } finally {
@@ -446,6 +473,288 @@ public final class LauncherUi {
 
         return activity.getString(R.string.import_directory_success,
                 displayTitle(title, titleId), titleId, copied.files, formatBytes(copied.bytes));
+    }
+
+    private String importSelectedFile(Uri uri) throws Exception {
+        String displayName = queryDisplayName(uri);
+        String lowerName = displayName == null ? "" : displayName.toLowerCase(Locale.ROOT);
+        if (lowerName.endsWith(".rar") || lowerName.endsWith(".7z")
+                || lowerName.endsWith(".zip")) {
+            return importArchive(uri, displayName, lowerName);
+        }
+        return importPkg(uri);
+    }
+
+    private String importArchive(Uri uri, String displayName, String lowerName) throws Exception {
+        File home = homeDir();
+        File inbox = checkedChild(home, "archive-inbox");
+        File stagingRoot = checkedChild(home, "import-staging");
+        ensureDirectory(inbox);
+        ensureDirectory(stagingRoot);
+
+        String fallback = lowerName.endsWith(".rar") ? "import.rar"
+                : lowerName.endsWith(".7z") ? "import.7z" : "import.zip";
+        String safeName = safeFileName(displayName, fallback);
+        File archiveFile = uniqueChild(inbox, safeName);
+        File extractionRoot = checkedChild(stagingRoot,
+                "archive-" + Long.toUnsignedString(System.nanoTime()));
+        ensureDirectory(extractionRoot);
+
+        long copied = 0;
+        boolean installed = false;
+        try {
+            long declaredSize = querySize(uri);
+            long copyBudget = availableImportBudget(inbox);
+            if (declaredSize > copyBudget) {
+                throw new IOException("недостаточно свободного места для архива (нужно "
+                        + formatBytes(declaredSize) + ")");
+            }
+            copied = copyUriToFile(uri, archiveFile, copyBudget);
+            postStatus("Распаковка " + safeName + "…");
+
+            CopyProgress extracted = new CopyProgress(availableImportBudget(stagingRoot));
+            if (lowerName.endsWith(".rar")) {
+                extractRar(archiveFile, extractionRoot, extracted);
+            } else if (lowerName.endsWith(".7z")) {
+                extractSevenZip(archiveFile, extractionRoot, extracted);
+            } else {
+                extractZip(archiveFile, extractionRoot, extracted);
+            }
+
+            File gameRoot = findExtractedGameRoot(extractionRoot, 0);
+            if (gameRoot == null) {
+                throw new IOException("архив не содержит eboot.bin и sce_sys/param.json");
+            }
+            File eboot = checkedChild(gameRoot, "eboot.bin");
+            File sceSys = checkedChild(gameRoot, "sce_sys");
+            File paramJson = checkedChild(sceSys, "param.json");
+            File paramSfo = checkedChild(sceSys, "param.sfo");
+            boolean ps5 = safeRegularFileWithin(paramJson, gameRoot);
+            if (!isPlausibleEboot(eboot, gameRoot)
+                    || (!ps5 && !safeRegularFileWithin(paramSfo, gameRoot))) {
+                throw new IOException("распакованная игра не прошла проверку структуры");
+            }
+
+            String platform;
+            String titleId;
+            String title;
+            if (ps5) {
+                Ps5Metadata metadata = readPs5Metadata(
+                        readFileLimited(paramJson, MAX_SFO_BYTES));
+                platform = PLATFORM_PS5;
+                titleId = metadata.titleId;
+                title = metadata.title;
+            } else {
+                platform = PLATFORM_PS4;
+                titleId = readSfoValue(paramSfo, "TITLE_ID");
+                title = readSfoValue(paramSfo, "TITLE");
+            }
+            if (!isValidTitleId(titleId)) {
+                throw new IOException("некорректный title ID в архиве");
+            }
+
+            File appRoot = appInstallRoot();
+            ensureDirectory(appRoot);
+            File destination = checkedChild(appRoot, titleId);
+            if (destination.exists() || Files.isSymbolicLink(destination.toPath())) {
+                throw new IOException("игра " + titleId + " уже установлена");
+            }
+            writeInstallManifest(gameRoot, titleId, title, uri.toString(), true,
+                    "archive-import", platform);
+            installStagingTree(gameRoot, destination, stagingRoot);
+            installed = true;
+
+            return "Импортирована " + displayTitle(title, titleId) + " (" + titleId + "), "
+                    + extracted.files + " файлов, " + formatBytes(extracted.bytes)
+                    + " распаковано из " + formatBytes(copied);
+        } finally {
+            if (archiveFile.exists() && !archiveFile.delete()) {
+                Log.w(TAG, "Не удалось удалить временный архив " + archiveFile.getName());
+            }
+            if (extractionRoot.exists()) {
+                try {
+                    deleteTreeWithin(extractionRoot, stagingRoot);
+                } catch (IOException cleanupError) {
+                    if (!installed) {
+                        throw cleanupError;
+                    }
+                    Log.w(TAG, "Не удалось очистить staging архива", cleanupError);
+                }
+            }
+        }
+    }
+
+    private void extractRar(File archiveFile, File destination, CopyProgress progress)
+            throws Exception {
+        checkCancelled();
+        int result = RuntimeBridge.extractRarArchive(
+                archiveFile.getAbsolutePath(), destination.getAbsolutePath(),
+                progress.maxBytes, MAX_IMPORT_FILES);
+        if (result != 0) {
+            throw new IOException("UnRAR завершился с кодом " + result);
+        }
+        accountExtractedTree(destination, destination, progress, 0);
+    }
+
+    private void accountExtractedTree(File path, File boundary, CopyProgress progress, int depth)
+            throws Exception {
+        checkCancelled();
+        if (depth > MAX_TREE_DEPTH) {
+            throw new IOException("слишком глубокий путь после распаковки");
+        }
+        ensureWithin(path, boundary);
+        if (Files.isSymbolicLink(path.toPath())) {
+            throw new IOException("символические ссылки в архиве запрещены");
+        }
+        if (path.isFile()) {
+            progress.reserveNode(false);
+            progress.reserveFile(path.length());
+            progress.addExtracted(path.length());
+            return;
+        }
+        if (!path.isDirectory()) {
+            throw new IOException("некорректный объект после распаковки");
+        }
+        if (!path.equals(boundary)) {
+            progress.reserveNode(true);
+        }
+        File[] children = path.listFiles();
+        if (children == null) {
+            throw new IOException("не удалось прочитать распакованный каталог");
+        }
+        for (File child : children) {
+            accountExtractedTree(child, boundary, progress, depth + 1);
+        }
+    }
+
+    private void extractSevenZip(File archiveFile, File destination, CopyProgress progress)
+            throws Exception {
+        try (SevenZFile archive = new SevenZFile(archiveFile)) {
+            SevenZArchiveEntry entry;
+            byte[] buffer = new byte[COPY_BUFFER_BYTES];
+            while ((entry = archive.getNextEntry()) != null) {
+                checkCancelled();
+                File output = archiveOutput(destination, entry.getName(),
+                        entry.isDirectory(), progress);
+                if (entry.isDirectory()) {
+                    ensureDirectory(output);
+                    continue;
+                }
+                long declared = entry.getSize();
+                progress.reserveFile(declared);
+                ensureDirectory(output.getParentFile());
+                try (OutputStream stream = new BudgetOutputStream(
+                        new FileOutputStream(output), progress, declared)) {
+                    int count;
+                    while ((count = archive.read(buffer)) != -1) {
+                        stream.write(buffer, 0, count);
+                    }
+                } catch (Exception error) {
+                    output.delete();
+                    throw error;
+                }
+            }
+        }
+    }
+
+    private void extractZip(File archiveFile, File destination, CopyProgress progress)
+            throws Exception {
+        try (ZipInputStream archive = new ZipInputStream(new FileInputStream(archiveFile))) {
+            byte[] buffer = new byte[COPY_BUFFER_BYTES];
+            ZipEntry entry;
+            while ((entry = archive.getNextEntry()) != null) {
+                checkCancelled();
+                File output = archiveOutput(destination, entry.getName(),
+                        entry.isDirectory(), progress);
+                if (entry.isDirectory()) {
+                    ensureDirectory(output);
+                    continue;
+                }
+                long declared = entry.getSize();
+                progress.reserveFile(declared);
+                ensureDirectory(output.getParentFile());
+                try (OutputStream stream = new BudgetOutputStream(
+                        new FileOutputStream(output), progress, declared)) {
+                    int count;
+                    while ((count = archive.read(buffer)) != -1) {
+                        stream.write(buffer, 0, count);
+                    }
+                } catch (Exception error) {
+                    output.delete();
+                    throw error;
+                }
+                archive.closeEntry();
+            }
+        }
+    }
+
+    private File archiveOutput(File root, String rawName, boolean directory,
+                               CopyProgress progress) throws Exception {
+        if (rawName == null || rawName.isEmpty() || rawName.length() > MAX_DOCUMENT_ID_LENGTH) {
+            throw new IOException("некорректное имя записи архива");
+        }
+        String normalized = rawName.replace('\\', '/');
+        if (normalized.startsWith("/") || normalized.matches("^[A-Za-z]:.*")) {
+            throw new IOException("абсолютный путь в архиве запрещён");
+        }
+        String[] segments = normalized.split("/");
+        File current = root;
+        int depth = 0;
+        for (String segment : segments) {
+            if (segment.isEmpty()) {
+                continue;
+            }
+            if (++depth > MAX_TREE_DEPTH) {
+                throw new IOException("слишком глубокий путь в архиве");
+            }
+            validateDocumentName(segment);
+            if (segment.length() > MAX_DOCUMENT_NAME_LENGTH) {
+                throw new IOException("слишком длинное имя в архиве");
+            }
+            current = checkedChild(current, segment);
+        }
+        if (current.equals(root)) {
+            throw new IOException("пустой путь записи архива");
+        }
+        ensureWithin(current, root);
+        progress.reserveNode(directory);
+        return current;
+    }
+
+    private File findExtractedGameRoot(File directory, int depth) throws IOException {
+        ensureWithin(directory, directory);
+        if (depth > MAX_TREE_DEPTH || Files.isSymbolicLink(directory.toPath())) {
+            return null;
+        }
+        File eboot = new File(directory, "eboot.bin");
+        File sceSys = new File(directory, "sce_sys");
+        if (isPlausibleEboot(eboot, directory) && sceSys.isDirectory()
+                && !Files.isSymbolicLink(sceSys.toPath())) {
+            File paramJson = new File(sceSys, "param.json");
+            File paramSfo = new File(sceSys, "param.sfo");
+            if (safeRegularFileWithin(paramJson, directory)
+                    || safeRegularFileWithin(paramSfo, directory)) {
+                return directory;
+            }
+        }
+        File[] children = directory.listFiles();
+        if (children == null) {
+            return null;
+        }
+        File found = null;
+        for (File child : children) {
+            if (!child.isDirectory() || Files.isSymbolicLink(child.toPath())) {
+                continue;
+            }
+            File candidate = findExtractedGameRoot(child, depth + 1);
+            if (candidate != null) {
+                if (found != null) {
+                    throw new IOException("архив содержит несколько корней игр");
+                }
+                found = candidate;
+            }
+        }
+        return found;
     }
 
     private String importPkg(Uri uri) throws Exception {
@@ -568,30 +877,41 @@ public final class LauncherUi {
             File eboot = new File(directory, "eboot.bin");
             File sceSys = new File(directory, "sce_sys");
             File sfo = new File(sceSys, "param.sfo");
+            File paramJson = new File(sceSys, "param.json");
             File manifest = new File(directory, "executor-installed.json");
             boolean hasEboot = isPlausibleEboot(eboot, directory);
             boolean hasSfo = safeRegularFileWithin(sfo, directory);
+            boolean hasParamJson = safeRegularFileWithin(paramJson, directory);
             boolean hasManifest = safeRegularFileWithin(manifest, directory);
-            if (!hasEboot && !hasSfo && !hasManifest) {
+            if (!hasEboot && !hasSfo && !hasParamJson && !hasManifest) {
                 return null;
             }
 
-            String titleId = hasSfo ? readSfoValue(sfo, "TITLE_ID") : null;
+            String platform = hasParamJson ? PLATFORM_PS5 : PLATFORM_PS4;
+            Ps5Metadata ps5Metadata = hasParamJson
+                    ? readPs5Metadata(readFileLimited(paramJson, MAX_SFO_BYTES))
+                    : null;
+            String titleId = ps5Metadata != null
+                    ? ps5Metadata.titleId
+                    : hasSfo ? readSfoValue(sfo, "TITLE_ID") : null;
             if (!isValidTitleId(titleId) && isValidTitleId(directory.getName())) {
                 titleId = directory.getName();
             }
             if (!isValidTitleId(titleId)) {
                 return null;
             }
-            String title = hasSfo ? readSfoValue(sfo, "TITLE") : null;
+            String title = ps5Metadata != null
+                    ? ps5Metadata.title
+                    : hasSfo ? readSfoValue(sfo, "TITLE") : null;
             if (title == null || title.isEmpty()) {
                 title = titleId;
             }
             File icon = new File(sceSys, "icon0.png");
             return new GameEntry(directory, eboot,
                     safeRegularFileWithin(icon, directory) ? icon : null,
-                    titleId, title, hasEboot, rootPriority);
+                    titleId, title, platform, hasEboot, rootPriority);
         } catch (Exception ignored) {
+            Log.w(TAG, "Skipping unreadable game directory " + directory, ignored);
             return null;
         }
     }
@@ -670,11 +990,29 @@ public final class LauncherUi {
                 selected ? 0xff6fb4ff : stroke, 18));
         row.setElevation(dp(2));
 
+        FrameLayout iconHost = new FrameLayout(activity);
         ImageView icon = new ImageView(activity);
         icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
         LinearLayout.LayoutParams iconLp = new LinearLayout.LayoutParams(dp(82), dp(82));
         iconLp.setMargins(0, 0, dp(16), 0);
-        row.addView(icon, iconLp);
+        iconHost.addView(icon, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        if (PLATFORM_PS5.equals(game.platform)) {
+            TextView badge = label("PS5", 10, 0xffffffff);
+            badge.setTypeface(android.graphics.Typeface.DEFAULT,
+                    android.graphics.Typeface.BOLD);
+            badge.setGravity(Gravity.CENTER);
+            badge.setPadding(dp(5), dp(2), dp(5), dp(2));
+            badge.setBackground(roundedBackground(0xff1769aa, 0xff89c8ff, 7));
+            FrameLayout.LayoutParams badgeLp = new FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    Gravity.END | Gravity.BOTTOM);
+            badgeLp.setMargins(dp(3), dp(3), dp(3), dp(3));
+            iconHost.addView(badge, badgeLp);
+        }
+        row.addView(iconHost, iconLp);
         Bitmap bitmap = decodeIcon(game.icon, 192);
         if (bitmap != null) {
             icon.setImageBitmap(bitmap);
@@ -1026,8 +1364,12 @@ public final class LauncherUi {
         intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
         intent.putExtra("autoload_existing_runtime", true);
         intent.putExtra("autoinit_runtime", true);
-        intent.putExtra("scan_game_path", game.eboot.getAbsolutePath());
-        intent.putExtra("launch_game_path", game.eboot.getAbsolutePath());
+        String launchPath = PLATFORM_PS5.equals(game.platform)
+                ? game.directory.getAbsolutePath()
+                : game.eboot.getAbsolutePath();
+        intent.putExtra("scan_game_path", launchPath);
+        intent.putExtra("launch_game_path", launchPath);
+        intent.putExtra(EXTRA_GAME_PLATFORM, game.platform);
         intent.putExtra("fullscreen_render", true);
         intent.putExtra(EXTRA_EMBEDDED_AARCH64_JIT_BACKEND, true);
         try {
@@ -1235,13 +1577,15 @@ public final class LauncherUi {
     }
 
     private void writeInstallManifest(File directory, String titleId, String title, String source,
-                                      boolean ebootExtracted, String installedBy) throws Exception {
+                                      boolean ebootExtracted, String installedBy,
+                                      String platform) throws Exception {
         JSONObject json = new JSONObject();
         json.put("titleId", titleId);
         json.put("title", title == null ? "" : title);
         json.put("source", source);
         json.put("ebootExtracted", ebootExtracted);
         json.put("installedBy", installedBy);
+        json.put("platform", platform);
         File target = checkedChild(directory, "executor-installed.json");
         File temporary = checkedChild(directory, ".executor-installed.json.tmp");
         try (FileOutputStream output = new FileOutputStream(temporary)) {
@@ -1367,6 +1711,53 @@ public final class LauncherUi {
                 output.write(buffer, 0, count);
             }
             return output.toByteArray();
+        }
+    }
+
+    private static byte[] readFileLimited(File file, int maximum) throws IOException {
+        long length = file.length();
+        if (length <= 0 || length > maximum) {
+            throw new IOException("metadata file has invalid size");
+        }
+        byte[] data = new byte[(int) length];
+        try (FileInputStream input = new FileInputStream(file)) {
+            int offset = 0;
+            while (offset < data.length) {
+                int count = input.read(data, offset, data.length - offset);
+                if (count < 0) {
+                    throw new IOException("truncated metadata file");
+                }
+                offset += count;
+            }
+        }
+        return data;
+    }
+
+    private static Ps5Metadata readPs5Metadata(byte[] data) throws IOException {
+        try {
+            JSONObject json = new JSONObject(new String(data, StandardCharsets.UTF_8));
+            String titleId = normalizeTitleId(json.optString("titleId", ""));
+            String title = "";
+            JSONObject localized = json.optJSONObject("localizedParameters");
+            if (localized != null) {
+                String language = localized.optString("defaultLanguage", "");
+                JSONObject selected = localized.optJSONObject(language);
+                if (selected == null) {
+                    java.util.Iterator<String> keys = localized.keys();
+                    while (keys.hasNext() && selected == null) {
+                        Object value = localized.opt(keys.next());
+                        if (value instanceof JSONObject) {
+                            selected = (JSONObject) value;
+                        }
+                    }
+                }
+                if (selected != null) {
+                    title = selected.optString("titleName", "");
+                }
+            }
+            return new Ps5Metadata(titleId, title.trim());
+        } catch (Exception error) {
+            throw new IOException("повреждён sce_sys/param.json", error);
         }
     }
 
@@ -1673,18 +2064,30 @@ public final class LauncherUi {
         final File icon;
         final String titleId;
         final String title;
+        final String platform;
         final boolean launchable;
         final int rootPriority;
 
         GameEntry(File directory, File eboot, File icon, String titleId, String title,
-                  boolean launchable, int rootPriority) {
+                  String platform, boolean launchable, int rootPriority) {
             this.directory = directory;
             this.eboot = eboot;
             this.icon = icon;
             this.titleId = titleId;
             this.title = title;
+            this.platform = platform;
             this.launchable = launchable;
             this.rootPriority = rootPriority;
+        }
+    }
+
+    private static final class Ps5Metadata {
+        final String titleId;
+        final String title;
+
+        Ps5Metadata(String titleId, String title) {
+            this.titleId = titleId;
+            this.title = title;
         }
     }
 
@@ -1714,6 +2117,72 @@ public final class LauncherUi {
 
         CopyProgress(long maxBytes) {
             this.maxBytes = maxBytes;
+        }
+
+        void reserveNode(boolean directory) throws IOException {
+            nodes++;
+            if (nodes > MAX_IMPORT_NODES) {
+                throw new IOException("слишком много записей в архиве");
+            }
+            if (!directory) {
+                files++;
+                if (files > MAX_IMPORT_FILES) {
+                    throw new IOException("слишком много файлов в архиве");
+                }
+            }
+        }
+
+        void reserveFile(long declaredBytes) throws IOException {
+            if (declaredBytes > maxBytes || (declaredBytes >= 0
+                    && bytes > maxBytes - declaredBytes)) {
+                throw new IOException("распаковка остановлена: недостаточно свободного места");
+            }
+        }
+
+        void addExtracted(long count) throws IOException {
+            if (count < 0 || bytes > maxBytes - count) {
+                throw new IOException("распаковка остановлена: недостаточно свободного места");
+            }
+            bytes += count;
+        }
+    }
+
+    private static final class BudgetOutputStream extends OutputStream {
+        private final OutputStream output;
+        private final CopyProgress progress;
+        private final long declaredBytes;
+        private long written;
+
+        BudgetOutputStream(OutputStream output, CopyProgress progress, long declaredBytes) {
+            this.output = output;
+            this.progress = progress;
+            this.declaredBytes = declaredBytes;
+        }
+
+        @Override
+        public void write(int value) throws IOException {
+            byte[] one = new byte[]{(byte) value};
+            write(one, 0, 1);
+        }
+
+        @Override
+        public void write(byte[] buffer, int offset, int count) throws IOException {
+            if (declaredBytes >= 0 && written > declaredBytes - count) {
+                throw new IOException("запись архива превышает заявленный размер");
+            }
+            progress.addExtracted(count);
+            output.write(buffer, offset, count);
+            written += count;
+        }
+
+        @Override
+        public void flush() throws IOException {
+            output.flush();
+        }
+
+        @Override
+        public void close() throws IOException {
+            output.close();
         }
     }
 

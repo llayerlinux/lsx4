@@ -58,4 +58,12 @@
     <string name="game_menu_opacity">Deckkraft der Steuerung</string>
     <string name="game_menu_opacity_value">%1$d%%</string>
     <string name="game_menu_exit">Zur Spielebibliothek</string>
+    <string name="category_managed_optimizations">Steuerbare Optimierungen</string>
+    <string name="category_managed_optimizations_summary">Optionale ARM-Schnellpfade mit Kompatibilitätsrisiken</string>
+    <string name="optimization_arm_gpu_fast_path">ARM-GPU-Schnellpfad</string>
+    <string name="optimization_arm_gpu_fast_path_hint">Leitet Shader-Konstanten durch direkten GPU-Speicher und entfernt Funnel-Diagnosen aus jedem Draw und Submit. Dies kann die Leistung erhöhen, aber auf einigen Treibern Grafikfehler oder Abstürze verursachen. Starten Sie das Spiel nach einer Änderung neu.</string>
+    <string name="optimization_coarse_fragment_2x2">Grobes 2×2-Fragment-Shading</string>
+    <string name="optimization_coarse_fragment_2x2_hint">Führt einen Fragment-Shader-Aufruf pro 2×2-Pixelgruppe aus. Dies kann die GPU-Last deutlich senken, reduziert aber feine Details und kann Effekte beeinträchtigen. Starten Sie das Spiel nach einer Änderung neu.</string>
+    <string name="optimization_disable_vk_robustness">Vulkan-Robustheitsprüfungen deaktivieren</string>
+    <string name="optimization_disable_vk_robustness_hint">Entfernt den GPU-Grenzschutz für Puffer und Bilder. Shaderlastige Spiele können schneller werden, ungültige Zugriffe können jedoch Grafikfehler oder Treiberabstürze verursachen. Starten Sie das Spiel nach einer Änderung neu.</string>
 </resources>

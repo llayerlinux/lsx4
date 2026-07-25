@@ -58,4 +58,12 @@
     <string name="game_menu_opacity">控制层透明度</string>
     <string name="game_menu_opacity_value">%1$d%%</string>
     <string name="game_menu_exit">退出到游戏库</string>
+    <string name="category_managed_optimizations">可控优化</string>
+    <string name="category_managed_optimizations_summary">可选 ARM 快速路径，可能影响兼容性</string>
+    <string name="optimization_arm_gpu_fast_path">ARM GPU 快速路径</string>
+    <string name="optimization_arm_gpu_fast_path_hint">通过 GPU 直接内存传递着色器常量，并从每次 draw 和 submit 中移除 Funnel 诊断开销。此选项可能提升性能，但部分驱动可能出现图形错误或崩溃。更改后请重新启动游戏。</string>
+    <string name="optimization_coarse_fragment_2x2">2×2 粗粒度片段着色</string>
+    <string name="optimization_coarse_fragment_2x2_hint">每个 2×2 像素组只执行一次片段着色器。它可显著降低像素密集场景的 GPU 负载，但会减少细节并可能破坏部分效果。更改后请重新启动游戏。</string>
+    <string name="optimization_disable_vk_robustness">禁用 Vulkan 稳健性检查</string>
+    <string name="optimization_disable_vk_robustness_hint">移除 GPU 缓冲区和图像边界保护。它可能加速着色器密集型游戏，但无效访问可能导致图形损坏或驱动崩溃。更改后请重新启动游戏。</string>
 </resources>

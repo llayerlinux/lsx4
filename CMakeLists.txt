@@ -39,6 +39,19 @@ set(ENABLE_DISCORD_RPC OFF)
 set(ENABLE_UPDATER OFF)
 option(EXECUTOR_ANDROID_NATIVE_CORE_PROBE_NO_DESKTOP_MEDIA_USB "Disable desktop FFmpeg/libusb fronts for the Android native-core probe" ON)
 option(EXECUTOR_ANDROID_NATIVE_CORE_PROBE_ENABLE_AVPLAYER "Enable the real FFmpeg-backed AvPlayer in the Android native-core probe" ON)
+option(LSX4_ENABLE_PS5_DESKTOP_PATH
+       "Build the isolated Funnel PS5 desktop boundary (never part of the PS4 runtime)"
+       OFF)
+
+if(LSX4_ENABLE_PS5_DESKTOP_PATH)
+    set(LSX4_PS5_DESKTOP_LAYER_MANIFEST
+        "${LSX4_ARM_DESKTOP_LAYER_DIR}/cmake/lsx4_ps5_desktop_layer.cmake")
+    if(NOT EXISTS "${LSX4_PS5_DESKTOP_LAYER_MANIFEST}")
+        message(FATAL_ERROR
+            "Funnel PS5 desktop layer is unavailable: ${LSX4_PS5_DESKTOP_LAYER_MANIFEST}")
+    endif()
+    include("${LSX4_PS5_DESKTOP_LAYER_MANIFEST}")
+endif()
 
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
     set(BASE_ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
@@ -294,9 +307,7 @@ lsx4_assert_arm_desktop_ownership(${LSX4_NATIVE_CORE_SOURCES})
 
 
 
-add_library(lsx4_executor_android SHARED
-    ${LSX4_NATIVE_CORE_SOURCES}
-    src/executor/native_runtime_api.cpp
+set(LSX4_JIT_COMMON_SOURCES
     src/executor/dynamic_translation/address_resolver.cpp
     src/executor/dynamic_translation/native_address_emitter.cpp
     src/executor/dynamic_translation/atomic_memory.cpp
@@ -342,8 +353,36 @@ add_library(lsx4_executor_android SHARED
     src/executor/dynamic_translation/packed_lane_ops.cpp
     src/executor/dynamic_translation/partial_move_plan.cpp
     src/executor/dynamic_translation/partial_move_emitter.cpp
+)
+
+add_library(lsx4_executor_android SHARED
+    ${LSX4_NATIVE_CORE_SOURCES}
+    ${LSX4_JIT_COMMON_SOURCES}
+    src/executor/native_runtime_api.cpp
+    src/executor/ps4_jit_platform.cpp
     src/executor/runtime_death_catcher.cpp
 )
+
+if(LSX4_ENABLE_PS5_DESKTOP_PATH)
+    lsx4_define_ps5_desktop_profile()
+    lsx4_assert_ps5_desktop_ownership(${LSX4_PS5_DESKTOP_SOURCES})
+
+    add_library(lsx4_executor_ps5_android SHARED
+        ${LSX4_PS5_DESKTOP_SOURCES}
+        ${LSX4_JIT_COMMON_SOURCES}
+        "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/x86_decoder.cpp"
+        src/executor/ps5_desktop/backend_contract.cpp
+        src/executor/ps5_desktop/bc7decomp.cpp
+        src/executor/ps5_desktop/vulkan_presenter.cpp
+        src/executor/ps5_desktop/runtime_api.cpp)
+    target_include_directories(lsx4_executor_ps5_android PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${LSX4_ARM_DESKTOP_SOURCE_DIR}")
+    target_compile_definitions(lsx4_executor_ps5_android PRIVATE
+        LSX4_PS5_DESKTOP_PATH=1)
+    set_target_properties(lsx4_executor_ps5_android PROPERTIES
+        OUTPUT_NAME lsx4_executor_ps5_android)
+endif()
 
 option(LSX4_FAST_TRANSLATION_ITERATION
        "Compile the large translation core with reduced optimization for local iteration"
@@ -378,6 +417,12 @@ if(ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
         target_link_options(lsx4_executor_android PRIVATE
             -flto=thin
             "LINKER:--thinlto-cache-dir=${CMAKE_CURRENT_BINARY_DIR}/thinlto-cache")
+        if(TARGET lsx4_executor_ps5_android)
+            file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/thinlto-cache-ps5")
+            target_link_options(lsx4_executor_ps5_android PRIVATE
+                -flto=thin
+                "LINKER:--thinlto-cache-dir=${CMAKE_CURRENT_BINARY_DIR}/thinlto-cache-ps5")
+        endif()
     endif()
 endif()
 
@@ -400,6 +445,29 @@ configure_file(
     "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}/native_artifact_layout.h"
     @ONLY
 )
+
+if(TARGET lsx4_executor_ps5_android)
+    set(LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH "5053354a49543031"
+        CACHE STRING "PS5-only compatibility epoch for persisted AArch64 translations")
+    string(LENGTH "${LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH}"
+           LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH_LENGTH)
+    if(NOT LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH_LENGTH EQUAL 16 OR
+       LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH MATCHES "[^0-9a-fA-F]")
+        message(FATAL_ERROR
+            "LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH must contain exactly 16 hexadecimal digits")
+    endif()
+    string(TOLOWER "${LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH}"
+           EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH_64)
+    set(LSX4_PS5_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/ps5/executor/dynamic_translation")
+    file(MAKE_DIRECTORY "${LSX4_PS5_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/native_artifact_layout.h.in"
+        "${LSX4_PS5_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}/native_artifact_layout.h"
+        @ONLY
+    )
+endif()
+
 target_include_directories(lsx4_executor_android PRIVATE
     "${EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}"
     "${LSX4_ARM_DESKTOP_SOURCE_DIR}"
@@ -415,6 +483,18 @@ target_link_options(lsx4_executor_android PRIVATE
 set_property(TARGET lsx4_executor_android APPEND PROPERTY
     LINK_DEPENDS "${LSX4_EXECUTOR_ANDROID_EXPORT_MAP}")
 
+if(TARGET lsx4_executor_ps5_android)
+    target_include_directories(lsx4_executor_ps5_android PRIVATE
+        "${LSX4_PS5_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR}")
+    set(LSX4_EXECUTOR_PS5_ANDROID_EXPORT_MAP
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/ps5_desktop/lsx4_executor_ps5_android.map")
+    target_link_options(lsx4_executor_ps5_android PRIVATE
+        "LINKER:--version-script=${LSX4_EXECUTOR_PS5_ANDROID_EXPORT_MAP}"
+        "LINKER:--no-undefined")
+    set_property(TARGET lsx4_executor_ps5_android APPEND PROPERTY
+        LINK_DEPENDS "${LSX4_EXECUTOR_PS5_ANDROID_EXPORT_MAP}")
+endif()
+
 if(CMAKE_STRIP AND CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
     add_custom_command(TARGET lsx4_executor_android POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy
@@ -427,6 +507,10 @@ endif()
 
 create_target_directory_groups(lsx4_executor_android)
 add_dependencies(lsx4_executor_android lsx_iced_decoder_build)
+if(TARGET lsx4_executor_ps5_android)
+    create_target_directory_groups(lsx4_executor_ps5_android)
+    add_dependencies(lsx4_executor_ps5_android lsx_iced_decoder_build)
+endif()
 
 set(LSX4_ANDROID_MEDIA_LIBS)
 if (EXECUTOR_ANDROID_NATIVE_CORE_PROBE_ENABLE_AVPLAYER)
@@ -445,8 +529,24 @@ target_link_libraries(lsx4_executor_android PRIVATE stb::headers nlohmann_json::
 if(TARGET xbyak_aarch64::xbyak_aarch64)
     target_link_libraries(lsx4_executor_android PRIVATE xbyak_aarch64::xbyak_aarch64)
 endif()
+if(TARGET lsx4_executor_ps5_android)
+    target_link_libraries(lsx4_executor_ps5_android PRIVATE
+        fmt::fmt
+        tsl::robin_map
+        nlohmann_json::nlohmann_json
+        Vulkan::Headers
+        xxHash::xxhash
+        lsx_iced_decoder)
+    if(TARGET xbyak_aarch64::xbyak_aarch64)
+        target_link_libraries(lsx4_executor_ps5_android PRIVATE
+            xbyak_aarch64::xbyak_aarch64)
+    endif()
+endif()
 if(ANDROID)
     target_link_libraries(lsx4_executor_android PRIVATE android aaudio mediandk dl log EGL GLESv3)
+    if(TARGET lsx4_executor_ps5_android)
+        target_link_libraries(lsx4_executor_ps5_android PRIVATE android aaudio dl log vulkan)
+    endif()
     target_link_options(lsx4_executor_android PRIVATE
         -Wl,--wrap=exit
         -Wl,--wrap=_exit
@@ -501,3 +601,6 @@ add_dependencies(lsx4_executor_android ImGui_Resources)
 target_include_directories(lsx4_executor_android PRIVATE ${IMGUI_RESOURCES_INCLUDE})
 
 install(TARGETS lsx4_executor_android LIBRARY DESTINATION lib)
+if(TARGET lsx4_executor_ps5_android)
+    install(TARGETS lsx4_executor_ps5_android LIBRARY DESTINATION lib)
+endif()
