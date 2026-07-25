@@ -31,6 +31,14 @@ extern "C" bool ExecutorJitWriteGuestBytes(
     std::uint64_t address, const void* source, std::size_t size);
 extern "C" bool ExecutorJitIsReadableGuestRange(
     std::uint64_t address, std::size_t size);
+extern "C" bool ExecutorJitIsExecutableGuestAddress(std::uint64_t address);
+
+extern "C" std::uint64_t executor_jit_ensure_hle_thunk_slab();
+extern "C" std::uint64_t executor_jit_hle_thunk_slab_base();
+extern "C" std::uint64_t executor_jit_hle_thunk_slab_size();
+extern "C" std::uint64_t executor_jit_get_hle_stub_for_native(
+    const char* label, std::uint64_t native_function);
+extern "C" std::uint64_t executor_jit_stable_libc_strcmp();
 
 #ifdef __ANDROID__
 extern "C" int executor_lsx4_android_dispatch_deferred_guest_signal(

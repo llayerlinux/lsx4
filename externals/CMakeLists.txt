@@ -26,8 +26,11 @@ if (NOT TARGET fmt::fmt)
     add_subdirectory(fmt)
 endif()
 
-# FFmpeg
-if (NOT TARGET FFmpeg::ffmpeg)
+# FFmpeg. The isolated PS5 runtime does not consume the PS4 AvPlayer stack.
+# Keep the existing default-on behavior, but honor the root opt-out so a
+# PS5-only verification does not require the PS4 PIC FFmpeg package.
+if (EXECUTOR_ANDROID_NATIVE_CORE_PROBE_ENABLE_AVPLAYER AND
+    NOT TARGET FFmpeg::ffmpeg)
     set(LSX4_ANDROID_FFMPEG_ROOT
         "${CMAKE_SOURCE_DIR}/build/lsx4-ffmpeg-android-arm64-pic"
         CACHE PATH "Android arm64 PIC FFmpeg installation")
@@ -52,6 +55,8 @@ endif()
 
 # LibAtrac9
 file(GLOB LIBATRAC9_SOURCES LibAtrac9/C/src/*.c)
+list(FILTER LIBATRAC9_SOURCES EXCLUDE REGEX "LibAtrac9/C/src/bit_reader\\.c$")
+list(APPEND LIBATRAC9_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/lsx4-overrides/LibAtrac9/bit_reader.c")
 add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES})
 target_include_directories(LibAtrac9 INTERFACE LibAtrac9/C/src)
 

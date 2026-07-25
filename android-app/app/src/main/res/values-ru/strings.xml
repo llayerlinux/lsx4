@@ -58,4 +58,12 @@
     <string name="game_menu_opacity">Прозрачность управления</string>
     <string name="game_menu_opacity_value">%1$d%%</string>
     <string name="game_menu_exit">Выйти к списку игр</string>
+    <string name="category_managed_optimizations">Управляемые оптимизации</string>
+    <string name="category_managed_optimizations_summary">Опциональные быстрые ARM-пути с риском несовместимости</string>
+    <string name="optimization_arm_gpu_fast_path">Быстрый ARM GPU-путь</string>
+    <string name="optimization_arm_gpu_fast_path_hint">Передаёт константы шейдеров через прямую память GPU и убирает диагностику Funnel из каждого draw и submit. Это может повысить производительность, но на отдельных драйверах возможны графические дефекты или сбои. После изменения перезапустите игру.</string>
+    <string name="optimization_coarse_fragment_2x2">Грубое затенение фрагментов 2×2</string>
+    <string name="optimization_coarse_fragment_2x2_hint">Выполняет один fragment shader на группу пикселей 2×2. Может сильно снизить нагрузку GPU в тяжёлых сценах, но уменьшает мелкую детализацию и способно нарушить отдельные эффекты. После изменения перезапустите игру.</string>
+    <string name="optimization_disable_vk_robustness">Отключить проверки Vulkan robustness</string>
+    <string name="optimization_disable_vk_robustness_hint">Убирает защиту границ GPU-буферов и изображений. Может ускорить игры с тяжёлыми шейдерами, но ошибочный доступ способен повредить графику или вызвать сбой драйвера. После изменения перезапустите игру.</string>
 </resources>

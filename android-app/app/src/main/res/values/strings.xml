@@ -138,4 +138,12 @@
     <string name="game_menu_opacity">Overlay opacity</string>
     <string name="game_menu_opacity_value">%1$d%%</string>
     <string name="game_menu_exit">Exit to game library</string>
+    <string name="category_managed_optimizations">Managed optimizations</string>
+    <string name="category_managed_optimizations_summary">Optional ARM fast paths with compatibility trade-offs</string>
+    <string name="optimization_arm_gpu_fast_path">ARM GPU fast path</string>
+    <string name="optimization_arm_gpu_fast_path_hint">Routes shader constants through direct GPU memory and removes Funnel diagnostic work from every draw and submit. This can improve performance, but may cause graphics corruption or crashes on some drivers. Restart the game after changing it.</string>
+    <string name="optimization_coarse_fragment_2x2">2×2 coarse fragment shading</string>
+    <string name="optimization_coarse_fragment_2x2_hint">Runs one fragment shader invocation for each 2×2 pixel group. This can strongly reduce GPU load in pixel-heavy scenes, but lowers fine detail and may break some effects. Restart the game after changing it.</string>
+    <string name="optimization_disable_vk_robustness">Disable Vulkan robustness checks</string>
+    <string name="optimization_disable_vk_robustness_hint">Removes GPU buffer and image bounds protection. This may speed up shader-heavy games, but invalid accesses can corrupt graphics or crash the driver. Restart the game after changing it.</string>
 </resources>

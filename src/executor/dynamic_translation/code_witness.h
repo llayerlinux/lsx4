@@ -43,7 +43,11 @@ struct CodeWitness {
 
 class MutationLedger {
 public:
-    static constexpr std::uint64_t kGuestPageSize = 4096;
+#if defined(LSX4_PS5_DESKTOP_PATH)
+    static constexpr std::uint64_t kGuestPageSize = 0x4000;
+#else
+    static constexpr std::uint64_t kGuestPageSize = 0x1000;
+#endif
     static constexpr std::size_t kMaximumWitnessBytes = 1024 * 1024;
 
     [[nodiscard]] std::optional<CodeWitness> Capture(

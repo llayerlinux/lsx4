@@ -120,8 +120,10 @@ std::uint64_t MutationLedger::GlobalRevision() const noexcept {
     return global_revision_.load(std::memory_order_acquire);
 }
 
-static_assert(PageBase(0x1234) == 0x1000);
-static_assert(LastCoveredAddress(0x1000, 1) == 0x1000);
+static_assert(PageBase(MutationLedger::kGuestPageSize + 0x234) ==
+              MutationLedger::kGuestPageSize);
+static_assert(LastCoveredAddress(MutationLedger::kGuestPageSize, 1) ==
+              MutationLedger::kGuestPageSize);
 static_assert(LastCoveredAddress(std::numeric_limits<std::uint64_t>::max() - 2, 8) ==
               std::numeric_limits<std::uint64_t>::max());
 
