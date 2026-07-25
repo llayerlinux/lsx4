@@ -23,7 +23,7 @@ constexpr std::uint64_t SupportedInstructionRequirements =
     Funnel::Ps5Desktop::InstructionSse4aExtrqInsertq |
     Funnel::Ps5Desktop::InstructionMonitorxMwaitx;
 
-} // namespace
+}
 
 BackendCompatibility InspectBackendCompatibility() noexcept {
     const auto guest = Funnel::Ps5Desktop::QueryGuestContract();
@@ -47,4 +47,4 @@ BackendCompatibility InspectBackendCompatibility() noexcept {
     };
 }
 
-} // namespace Lsx4::Ps5Desktop
+}

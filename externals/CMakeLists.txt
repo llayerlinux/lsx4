@@ -8,27 +8,20 @@ set_directory_properties(PROPERTIES
     SYSTEM ON
 )
 
-# Set CMP0069 policy to "NEW" in order to ensure consistent behavior when building external targets with LTO enabled
 set(CMAKE_POLICY_DEFAULT_CMP0069 NEW)
 
 if (MSVC)
-    # Silence "deprecation" warnings
     add_definitions(-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE -D_SCL_SECURE_NO_WARNINGS)
 endif()
 
-# Boost
 if (NOT TARGET Boost::headers)
     add_subdirectory(ext-boost)
 endif()
 
-# fmtlib
 if (NOT TARGET fmt::fmt)
     add_subdirectory(fmt)
 endif()
 
-# FFmpeg. The isolated PS5 runtime does not consume the PS4 AvPlayer stack.
-# Keep the existing default-on behavior, but honor the root opt-out so a
-# PS5-only verification does not require the PS4 PIC FFmpeg package.
 if (EXECUTOR_ANDROID_NATIVE_CORE_PROBE_ENABLE_AVPLAYER AND
     NOT TARGET FFmpeg::ffmpeg)
     set(LSX4_ANDROID_FFMPEG_ROOT
@@ -53,14 +46,12 @@ if (EXECUTOR_ANDROID_NATIVE_CORE_PROBE_ENABLE_AVPLAYER AND
     add_library(FFmpeg::ffmpeg ALIAS ffmpeg)
 endif()
 
-# LibAtrac9
 file(GLOB LIBATRAC9_SOURCES LibAtrac9/C/src/*.c)
 list(FILTER LIBATRAC9_SOURCES EXCLUDE REGEX "LibAtrac9/C/src/bit_reader\\.c$")
 list(APPEND LIBATRAC9_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/lsx4-overrides/LibAtrac9/bit_reader.c")
 add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES})
 target_include_directories(LibAtrac9 INTERFACE LibAtrac9/C/src)
 
-# zlib
 if (NOT TARGET ZLIB::ZLIB)
     set(ZLIB_ENABLE_TESTS OFF)
     set(WITH_GTEST OFF)
@@ -75,22 +66,16 @@ if (NOT TARGET ZLIB::ZLIB)
     )
     FetchContent_MakeAvailable(ZLIB)
     add_library(ZLIB::ZLIB ALIAS zlib)
-    # libpng expects this variable to exist after its find_package(ZLIB)
     set(ZLIB_INCLUDE_DIRS "${FETCHCONTENT_BASE_DIR}/zlib-build")
 endif()
 
-# SDL3
 if (NOT TARGET SDL3::SDL3)
     set(SDL_TEST_LIBRARY OFF)
     set(SDL_PIPEWIRE OFF)
     add_subdirectory(sdl3)
 endif()
 
-# SDL3_mixer
 if (NOT TARGET SDL3_mixer::SDL3_mixer)
-    # The Android runtime only uses SDL_mixer for its bundled WAV notification.
-    # Keep the dependency self-contained and avoid pulling desktop/game-music codecs
-    # (and their extra shared libraries) into the native runtime build.
     set(SDLMIXER_FLAC_LIBFLAC OFF CACHE BOOL "" FORCE)
     set(SDLMIXER_FLAC_DRFLAC OFF CACHE BOOL "" FORCE)
     set(SDLMIXER_GME OFF CACHE BOOL "" FORCE)
@@ -108,25 +93,21 @@ if (NOT TARGET SDL3_mixer::SDL3_mixer)
     add_subdirectory(sdl3_mixer)
 endif()
 
-# vulkan-headers
 if (NOT TARGET Vulkan::Headers)
     set(VULKAN_HEADERS_ENABLE_MODULE OFF)
     add_subdirectory(vulkan-headers)
 endif()
 
-# VMA
 if (NOT TARGET GPUOpen::VulkanMemoryAllocator)
     add_subdirectory(vma)
 endif()
 
-# RenderDoc
 if (NOT TARGET RenderDoc::API)
     add_library(renderdoc INTERFACE)
     target_include_directories(renderdoc INTERFACE ./renderdoc)
     add_library(RenderDoc::API ALIAS renderdoc)
 endif()
 
-# glslang
 if (NOT TARGET glslang::glslang)
     set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "")
     set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "")
@@ -140,17 +121,14 @@ if (NOT TARGET glslang::glslang)
     target_include_directories(glslang INTERFACE "${CMAKE_CURRENT_BINARY_DIR}/glslang")
 endif()
 
-# Robin-map
 if (NOT TARGET tsl::robin_map)
     add_subdirectory(robin-map)
 endif()
 
-# Xbyak
 if (NOT TARGET xbyak::xbyak)
     add_subdirectory(xbyak)
 endif()
 
-# Xbyak_aarch64
 if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/xbyak_aarch64/CMakeLists.txt" AND
     NOT TARGET xbyak_aarch64::xbyak_aarch64)
     set(SAMPLE OFF CACHE BOOL "" FORCE)
@@ -159,12 +137,10 @@ if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/xbyak_aarch64/CMakeLists.txt" AND
     add_subdirectory(xbyak_aarch64)
 endif()
 
-# MagicEnum
 if (NOT TARGET magic_enum::magic_enum)
     add_subdirectory(magic_enum)
 endif()
 
-# Toml11
 if (NOT TARGET toml11::toml11)
     add_subdirectory(toml11)
 
@@ -177,27 +153,23 @@ if (NOT TARGET toml11::toml11)
     endif()
 endif()
 
-# xxHash
 if (NOT TARGET xxHash::xxhash)
     add_library(xxhash xxhash/xxhash.h xxhash/xxhash.c)
     target_include_directories(xxhash PUBLIC xxhash)
     add_library(xxHash::xxhash ALIAS xxhash)
 endif()
 
-# sirit
 add_subdirectory(sirit)
 if (WIN32)
     target_compile_options(sirit PRIVATE "-Wno-error=unused-command-line-argument")
 endif()
 
-# half
 if (NOT TARGET half::half)
     add_library(half INTERFACE)
     target_include_directories(half INTERFACE half/include)
     add_library(half::half ALIAS half)
 endif()
 
-# libpng
 if (NOT TARGET PNG::PNG)
     set(PNG_SHARED OFF CACHE BOOL "" FORCE)
     set(PNG_STATIC ON CACHE BOOL "" FORCE)
@@ -208,7 +180,6 @@ if (NOT TARGET PNG::PNG)
     add_library(PNG::PNG ALIAS png_static)
 endif()
 
-# Dear ImGui
 add_library(Dear_ImGui
         dear_imgui/imgui.cpp
         dear_imgui/imgui_demo.cpp
@@ -219,7 +190,6 @@ add_library(Dear_ImGui
 )
 target_include_directories(Dear_ImGui INTERFACE dear_imgui/)
 
-# Tracy
 if (CMAKE_BUILD_TYPE STREQUAL "Release")
     option(TRACY_ENABLE "" OFF)
 else()
@@ -237,16 +207,13 @@ option(TRACY_ONLY_LOCALHOST "" ON)
 option(TRACY_NO_CONTEXT_SWITCH "" ON)
 add_subdirectory(tracy)
 
-# pugixml
 if (NOT TARGET pugixml::pugixml)
     option(PUGIXML_NO_EXCEPTIONS "" ON)
     add_subdirectory(pugixml)
 endif()
 
-# GCN Headers
 add_subdirectory(gcn)
 
-# stb
 if (NOT TARGET stb::headers)
     add_library(stb INTERFACE)
     target_include_directories(stb INTERFACE stb)
@@ -255,19 +222,16 @@ endif()
 
 add_subdirectory(aacdec)
 
-#nlohmann json 
 if (NOT TARGET nlohmann_json::nlohmann_json)
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 add_subdirectory(json)
 endif()
 
-# miniz
 if (NOT TARGET miniz::miniz)
 add_subdirectory(miniz)
 add_library(miniz::miniz ALIAS miniz)
 endif()
 
-# cli11
 if (NOT TARGET CLI11::CLI11)
     set(CLI11_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -275,18 +239,15 @@ if (NOT TARGET CLI11::CLI11)
 endif()
 
 
-#openal
 if (NOT TARGET OpenAL::OpenAL)
 set(ALSOFT_ENABLE_MODULES OFF CACHE BOOL "" FORCE)
 set(LIBTYPE "STATIC" CACHE STRING "" FORCE)
-# Disable everything we don't need
 set(ALSOFT_UTILS OFF CACHE BOOL "" FORCE)
 set(ALSOFT_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ALSOFT_TESTS OFF CACHE BOOL "" FORCE)
 set(ALSOFT_INSTALL OFF CACHE BOOL "" FORCE)
 set(ALSOFT_CONFIG OFF CACHE BOOL "" FORCE)
 
-# Backends (platform-specific)
 if (WIN32)
     set(ALSOFT_BACKEND_WASAPI ON CACHE BOOL "" FORCE)
     set(ALSOFT_BACKEND_DSOUND OFF CACHE BOOL "" FORCE)
@@ -298,16 +259,13 @@ else()
     set(ALSOFT_BACKEND_PULSEAUDIO ON CACHE BOOL "" FORCE)
     set(ALSOFT_BACKEND_PIPEWIRE OFF CACHE BOOL "" FORCE)
 endif()
-# Headless-safe
 set(ALSOFT_BACKEND_NULL ON CACHE BOOL "" FORCE)
 
-# Static build
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(openal-soft EXCLUDE_FROM_ALL)
 endif()
 
-# cpp-httplib
 add_library(Cpp_Httplib INTERFACE)
 target_include_directories(Cpp_Httplib INTERFACE cpp-httplib/)
 

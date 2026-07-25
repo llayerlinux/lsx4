@@ -2333,8 +2333,6 @@ inline void insert_weight_zero(uint64_t& index_bits, uint32_t bits_per_index, ui
 	index_bits = ((index_bits & HIGH_BIT_MASK) << 1) | (index_bits & LOW_BIT_MASK);
 }
 
-// BC7 mode 0-7 decompression.
-// Instead of one monster routine to unpack all the BC7 modes, we're lumping the 3 subset, 2 subset, 1 subset, and dual plane modes together into simple shared routines.
 
 static inline uint32_t bc7_dequant(uint32_t val, uint32_t pbit, uint32_t val_bits)
 {
@@ -2393,10 +2391,8 @@ static inline void bc7_interp2_sse2(const color_rgba* endpoint_pair, color_rgba*
 
 	__m128i endpoints_16_swapped = _mm_shuffle_epi32(endpoints_16, _MM_SHUFFLE(1, 0, 3, 2));
 
-	// Interpolated colors will be color 1 and 2
 	__m128i interpolated_colors = bc7_interp_sse2(endpoints_16, endpoints_16_swapped, _mm_set1_epi16(21), _mm_set1_epi16(43));
 
-	// all_colors will be 1, 2, 0, 3
 	__m128i all_colors = _mm_packus_epi16(interpolated_colors, endpoints_16);
 
 	all_colors = _mm_shuffle_epi32(all_colors, _MM_SHUFFLE(3, 1, 0, 2));
@@ -2427,7 +2423,6 @@ static inline void bc7_interp3_sse2(const color_rgba* endpoint_pair, color_rgba*
 
 bool unpack_bc7_mode0_2(uint32_t mode, const uint64_t* data_chunks, color_rgba* pPixels)
 {
-	//const uint32_t SUBSETS = 3;
 	const uint32_t ENDPOINTS = 6;
 	const uint32_t COMPS = 3;
 	const uint32_t WEIGHT_BITS = (mode == 0) ? 3 : 2;
@@ -2525,7 +2520,6 @@ bool unpack_bc7_mode0_2(uint32_t mode, const uint64_t* data_chunks, color_rgba* 
 
 bool unpack_bc7_mode1_3_7(uint32_t mode, const uint64_t* data_chunks, color_rgba* pPixels)
 {
-	//const uint32_t SUBSETS = 2;
 	const uint32_t ENDPOINTS = 4;
 	const uint32_t COMPS = (mode == 7) ? 4 : 3;
 	const uint32_t WEIGHT_BITS = (mode == 1) ? 3 : 2;
@@ -2631,7 +2625,6 @@ bool unpack_bc7_mode1_3_7(uint32_t mode, const uint64_t* data_chunks, color_rgba
 bool unpack_bc7_mode4_5(uint32_t mode, const uint64_t* data_chunks, color_rgba* pPixels)
 {
 	const uint32_t ENDPOINTS = 2;
-	//const uint32_t COMPS = 4;
 	const uint32_t WEIGHT_BITS = 2;
 	const uint32_t WEIGHT_MASK = (1 << WEIGHT_BITS) - 1;
 	const uint32_t A_WEIGHT_BITS = (mode == 4) ? 3 : 2;
@@ -2640,8 +2633,6 @@ bool unpack_bc7_mode4_5(uint32_t mode, const uint64_t* data_chunks, color_rgba* 
 	const uint32_t ENDPOINT_MASK = (1 << ENDPOINT_BITS) - 1;
 	const uint32_t A_ENDPOINT_BITS = (mode == 4) ? 6 : 8;
 	const uint32_t A_ENDPOINT_MASK = (1 << A_ENDPOINT_BITS) - 1;
-	//const uint32_t WEIGHT_VALS = 1 << WEIGHT_BITS;
-	//const uint32_t A_WEIGHT_VALS = 1 << A_WEIGHT_BITS;
 
 	const uint64_t low_chunk = data_chunks[0];
 	const uint64_t high_chunk = data_chunks[1];
@@ -2898,7 +2889,7 @@ bool unpack_bc7(const void *pBlock, color_rgba *pPixels)
 	return false;
 }
 
-} // namespace bc7decomp
+}
 
 /*
 ------------------------------------------------------------------------------
@@ -2941,4 +2932,3 @@ ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ------------------------------------------------------------------------------
 */
-

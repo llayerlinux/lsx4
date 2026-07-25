@@ -1,5 +1,4 @@
 // BC7 decoder by Richard Geldreich, Jr.; MIT license or public domain.
-// Adapted from the local ARMSX2 reference TextureDecompress implementation.
 #pragma once
 
 #include <algorithm>
@@ -161,4 +160,4 @@ static_assert(sizeof(color_rgba) == 4);
 
 bool unpack_bc7(const void *pBlock, color_rgba *pPixels);
 
-} // namespace bc7decomp
+}

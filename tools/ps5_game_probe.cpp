@@ -99,9 +99,6 @@ int BindDiagnosticImport(void*, const char* const symbol,
 
 std::uint64_t InvokeDiagnosticHle(
     void*, const Lsx4Ps5HleCall* const call) {
-    // This is deliberately a probe policy, not a production HLE contract.
-    // It lets execution advance to the first import that actually requires
-    // non-zero semantics while the pre-launch report retains every name.
     if (call == nullptr) {
         return 0;
     }
@@ -141,7 +138,7 @@ std::uint64_t InvokeDiagnosticHle(
     return 0;
 }
 
-} // namespace
+}
 
 int main(const int argc, char** const argv) {
     InstallCrashDiagnostics();

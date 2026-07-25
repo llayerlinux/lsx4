@@ -81,7 +81,7 @@ int CALLBACK UnrarCallback(UINT message, LPARAM, LPARAM, LPARAM) {
     }
 }
 
-}  // namespace
+}
 
 extern "C" JNIEXPORT jint JNICALL
 Java_app_lsx4_android_RuntimeBridge_extractRarArchive(
