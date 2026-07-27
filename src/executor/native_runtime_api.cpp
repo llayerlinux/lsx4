@@ -34,6 +34,7 @@
 #include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/process_memory.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
+#include "executor/dynamic_translation/retiring_execution_core.h"
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -22915,6 +22916,10 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
     constexpr int ArmGpuFastPath = 1;
     constexpr int CoarseFragmentShading = 2;
     constexpr int DisableVkRobustness = 3;
+    constexpr int TieredJit = 4;
+    constexpr int JitTraceCompilation = 5;
+    static std::atomic<bool> tiered_jit{false};
+    static std::atomic<bool> trace_compilation{false};
     const bool active = enabled != 0;
     const char* option_name = nullptr;
     switch (option) {
@@ -22929,6 +22934,21 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
     case DisableVkRobustness:
         Config::setManagedDisableVkRobustness(active);
         option_name = "disable_vk_robustness";
+        break;
+    case TieredJit:
+        tiered_jit.store(active, std::memory_order_release);
+        Executor::Jit::ConfigureTieredJit(
+            active, trace_compilation.load(std::memory_order_acquire));
+        option_name = "tiered_jit";
+        break;
+    case JitTraceCompilation:
+        trace_compilation.store(active, std::memory_order_release);
+        if (active) {
+            tiered_jit.store(true, std::memory_order_release);
+        }
+        Executor::Jit::ConfigureTieredJit(
+            tiered_jit.load(std::memory_order_acquire), active);
+        option_name = "jit_trace_compilation";
         break;
     default:
         return -1;

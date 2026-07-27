@@ -40,6 +40,10 @@ inline constexpr std::uint32_t kJitNativeFlagInsertPsDirectV17 = 1u << 18;
 inline constexpr std::uint32_t kJitNativeFlagDirectRetV18 = 1u << 19;
 inline constexpr std::uint32_t kJitNativeFlagHotStateDirectV19 = 1u << 20;
 inline constexpr std::uint32_t kJitNativeFlagHotAtomicPermuteV20 = 1u << 21;
+inline constexpr std::uint32_t kJitNativeFlagCmpxchgCacheSyncV21 = 1u << 22;
+inline constexpr std::uint32_t kJitNativeFlagXchgCacheSyncV22 = 1u << 23;
+inline constexpr std::uint32_t kJitNativeFlagPs5PauseYieldV23 = 1u << 25;
+inline constexpr std::uint32_t kJitNativeFlagPs5AtomicRestoreV24 = 1u << 27;
 
 enum class JitNativeRelocationKind : std::uint8_t {
     ModuleRelative = 0,

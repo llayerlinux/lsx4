@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "executor/ps5_desktop/runtime_api.h"
+#include "executor/ps5_desktop/gen5_compute_recompiler.h"
 
 #include "executor/dynamic_translation/runtime_bridge_api.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
 #include "executor/dynamic_translation/hle_thunk_identity.h"
+#include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/retiring_execution_core.h"
+#include "executor/dynamic_translation/stack_windows.h"
 #include "executor/ps5_desktop/backend_contract.h"
 #include "executor/ps5_desktop/bc7decomp.h"
 #include "executor/ps5_desktop/vulkan_presenter.h"
@@ -27,6 +30,7 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -36,6 +40,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -49,6 +54,7 @@
 #include <aaudio/AAudio.h>
 #include <android/log.h>
 #include <android/native_window.h>
+#include <png.h>
 #endif
 
 extern "C" std::uint64_t executor_jit_current_fault_guest_rip();
@@ -58,6 +64,7 @@ extern "C" std::uint32_t executor_jit_current_fault_instruction_meta();
 extern "C" std::uint64_t executor_jit_current_fault_gpr(std::uint32_t index);
 extern "C" std::uint32_t executor_jit_current_fault_recent_rips(
     std::uint64_t* output, std::uint32_t capacity);
+extern "C" void executor_jit_dump_thread_states(const char* reason);
 
 namespace {
 
@@ -67,15 +74,21 @@ constexpr std::uint64_t Ps5HleSlabSlots = 128;
 constexpr std::uint64_t Ps5ImageBase = 0x900000000ull;
 constexpr std::uint64_t Ps5ImageSessionStride = 0x20000000ull;
 constexpr std::uint64_t Ps5ImageSessionSlots = 32;
-constexpr std::size_t Ps5HleSlabSize = 0x40000;
+constexpr std::size_t Ps5HleSlabSize = 0x100000;
 constexpr std::size_t Ps5HleStubSize = 0x100;
 constexpr std::uint64_t Ps5TlsRegionHint = 0x8d0000000ull;
 constexpr std::uint64_t Ps5TlsRegionStride = 0x100000ull;
 constexpr std::uint64_t Ps5HleDataHint = 0x8e0000000ull;
 constexpr std::uint64_t Ps5HleDataStride = 0x100000ull;
-constexpr std::size_t Ps5HleDataSize = LSX4_PS5_GUEST_PAGE_SIZE;
+constexpr std::size_t Ps5HleDataSize = 0x100000;
+constexpr std::size_t Ps5MutexObjectPoolOffset = 0x4000;
+constexpr std::size_t Ps5MutexObjectSize = 0x100;
 constexpr std::uint64_t Ps5DirectMapHint = 0x2000000000ull;
 constexpr std::uint64_t Ps5DirectMapStride = 0x20000000ull;
+// Gen5's flexible virtual allocator starts below the direct-memory aperture.
+// Keeping it in the 0x20... direct-map range eventually exhausts every coarse
+// search slot in games which map large direct heaps during startup.
+constexpr std::uint64_t Ps5FlexibleMapHint = 0x600000000ull;
 constexpr std::uint64_t Ps5LibcHeapHint = 0x3000000000ull;
 constexpr std::uint64_t Ps5LibcHeapStride = 0x20000000ull;
 constexpr std::uint64_t Ps5DirectMemorySize =
@@ -302,6 +315,12 @@ struct GuestStdioHandlePage {
     std::size_t used{};
 };
 
+struct GuestKernelFile {
+    std::int32_t handle{};
+    std::filesystem::path path;
+    std::FILE* stream{};
+};
+
 struct GuestMutex {
     std::recursive_timed_mutex mutex;
 };
@@ -339,10 +358,11 @@ struct GuestConditionVariable {
 struct GuestEventFlag {
     std::mutex mutex;
     std::condition_variable condition;
-    std::uint64_t bits{};
+    std::atomic<std::uint64_t> bits{};
     std::uint32_t attributes{};
-    std::uint32_t waiting_threads{};
-    bool deleted{};
+    std::atomic<std::uint32_t> waiting_threads{};
+    std::atomic<std::uint64_t> waiting_patterns{};
+    std::atomic<bool> deleted{};
 };
 
 struct GuestVideoOutPort {
@@ -360,7 +380,18 @@ struct GuestVideoOutPort {
     std::int32_t flip_rate{};
     std::int32_t current_buffer{-1};
     std::uint64_t flip_count{};
+    std::uint64_t last_flip_argument{};
+    std::uint64_t last_flip_process_time{};
+    std::uint64_t last_flip_process_counter{};
+    std::uint64_t last_flip_submit_counter{};
     std::uint64_t vblank_count{};
+    std::chrono::steady_clock::time_point opened_at{
+        std::chrono::steady_clock::now()};
+    std::chrono::steady_clock::time_point last_vblank{
+        std::chrono::steady_clock::now()};
+    std::array<std::int32_t, 16> buffer_group_indices{
+        -1, -1, -1, -1, -1, -1, -1, -1,
+        -1, -1, -1, -1, -1, -1, -1, -1};
     std::vector<FlipEventRegistration> flip_events;
     std::vector<FlipEventRegistration> vblank_events;
 };
@@ -394,13 +425,46 @@ struct AgcCpuFrame {
     std::uint64_t eligible_draw_mask{};
     std::uint64_t rendered_draw_mask{};
     std::array<std::uint64_t, 64> draw_coverage{};
+    std::shared_ptr<Lsx4::Ps5Desktop::VulkanGuestFrame> gpu_frame;
     std::vector<std::uint8_t> rgba;
 };
+
+bool HasAgcFrameContent(const AgcCpuFrame& frame) {
+    return !frame.rgba.empty() ||
+        (frame.gpu_frame != nullptr &&
+         !frame.gpu_frame->draws.empty());
+}
 
 constexpr std::uint32_t AgcCpuFrameWidth = 640;
 constexpr std::uint32_t AgcCpuFrameHeight = 360;
 constexpr std::uint32_t AgcCpuFrameCaptureIntervalMs = 16u;
-constexpr std::uint32_t AgcCpuTextureCacheLimit = 24u;
+
+bool UseVulkanGuestRaster() {
+#ifdef __ANDROID__
+    static const bool enabled = []() {
+        const char* const value =
+            std::getenv("PS5_VULKAN_GUEST_RASTER");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+bool UseFullGen5Graphics() {
+#ifdef __ANDROID__
+    const char* const value =
+        std::getenv("PS5_FULL_GEN5_GRAPHICS");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+#else
+    return false;
+#endif
+}
+// A gameplay frame commonly references more than 24 atlas textures.  Keeping
+// less than one full working set makes the FIFO cache decode the same BC
+// atlases again on every submit.
+constexpr std::uint32_t AgcCpuTextureCacheLimit = 64u;
 
 struct AgcDiagnosticDraw {
     std::uint64_t texture_address{};
@@ -414,12 +478,15 @@ struct AgcDiagnosticDraw {
     std::uint32_t render_target_height{};
     std::uint32_t render_target_format{};
     std::uint32_t render_target_number_type{};
+    std::uint32_t render_target_channel_order{};
     std::uint32_t render_target_tile_mode{};
     std::uint32_t render_target_slot{};
     std::uint32_t index_buffer_count{};
     std::uint32_t index_size{};
     std::uint32_t index_offset{};
     std::uint32_t draw_count{};
+    std::uint32_t instance_count{1};
+    std::uint32_t primitive_type{};
     std::uint32_t cx_target_mask{};
     std::uint32_t cx_blend0_control{};
     std::uint32_t cx_color_base{};
@@ -431,14 +498,31 @@ struct AgcDiagnosticDraw {
     std::uint32_t sh_ps_program_hi{};
     std::uint32_t sh_es_program_lo{};
     std::uint32_t sh_es_program_hi{};
+    std::array<std::uint32_t, 16> sh_vs_user_data{};
     std::array<std::uint32_t, 16> sh_gs_user_data{};
     std::array<std::uint32_t, 16> sh_es_user_data{};
+    std::array<std::uint32_t, 16> sh_export_user_data{};
+    std::array<std::uint32_t, 16> sh_ps_user_data{};
 };
 
 struct LoaderBindingContext {
     std::uint64_t owner_handle{};
     std::vector<Funnel::Ps5Desktop::LoadedSymbol> exports;
     bool rebind_only{};
+};
+
+struct AprCommandBufferState {
+    std::uint64_t buffer{};
+    std::uint64_t size{};
+    std::uint64_t write_offset{};
+    std::uint64_t command_count{};
+};
+
+struct AprCompletionEvent {
+    std::uint64_t event_queue{};
+    std::uint64_t ident{};
+    std::uint64_t completion_token{};
+    std::uint64_t user_data{};
 };
 
 struct RuntimeState {
@@ -478,16 +562,36 @@ struct RuntimeState {
     std::condition_variable guest_event_queue_condition;
     bool guest_vblank_thread_started{};
     std::atomic<bool> diagnostic_second_event_queue_created{false};
+    std::atomic<bool> guest_login_event_delivered{false};
     std::vector<GuestStdioFile> stdio_files;
     std::vector<GuestStdioHandlePage> stdio_handle_pages;
+    std::vector<GuestKernelFile> kernel_files;
     std::unordered_map<std::uint32_t, std::filesystem::path>
         apr_files;
+    std::unordered_map<std::string, std::uint32_t>
+        apr_file_ids_by_path;
     std::unordered_map<std::uint32_t, std::uint64_t>
         apr_submissions;
+    std::unordered_map<
+        std::uint64_t,
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>>
+        apr_completion_writes;
+    std::unordered_map<std::uint64_t, AprCommandBufferState>
+        apr_command_buffers;
+    std::unordered_map<std::uint64_t, std::vector<AprCompletionEvent>>
+        apr_completion_events;
     std::unordered_map<std::string, std::filesystem::path>
         resolved_guest_paths;
+    std::unordered_map<std::string, std::uint64_t>
+        resolved_guest_file_sizes;
+    std::unordered_map<std::string, std::uint64_t>
+        indexed_guest_file_sizes;
     std::filesystem::path app0_directory;
     std::filesystem::path save_data_directory;
+#ifdef __ANDROID__
+    bool game_splash_active{};
+    bool game_splash_presented{};
+#endif
     std::uint64_t agc_register_defaults{};
     std::uint64_t agc_internal_register_defaults{};
     std::atomic<std::int32_t> msg_dialog_status{0};
@@ -503,7 +607,11 @@ struct RuntimeState {
     std::uint64_t next_event_flag_handle{1};
     std::int32_t next_video_out_handle{1};
     std::int32_t next_audio_out_handle{1};
+    std::int32_t next_net_pool_handle{1};
+    std::int32_t next_ssl_handle{1};
+    std::int32_t next_http2_handle{1};
     std::uint64_t next_event_queue_handle{1};
+    std::int32_t next_kernel_file_handle{3};
     std::uint32_t next_apr_file_id{1};
     std::uint32_t next_apr_submission_id{1};
     std::uint64_t apr_read_count{};
@@ -526,6 +634,8 @@ struct RuntimeState {
     std::uint64_t agc_index_buffer_address{};
     std::uint32_t agc_index_buffer_count{};
     std::uint32_t agc_index_size{};
+    std::uint32_t agc_instance_count{1};
+    std::uint64_t agc_dispatch_indirect_args_base{};
     std::uint64_t agc_invalid_flip_count{};
     std::chrono::steady_clock::time_point agc_next_flip{};
     std::chrono::steady_clock::time_point agc_cpu_next_render{};
@@ -547,11 +657,13 @@ struct RuntimeState {
 #endif
     std::uint64_t next_direct_offset{};
     std::uint64_t next_direct_map_hint{Ps5DirectMapHint};
+    std::uint64_t next_flexible_map_hint{Ps5FlexibleMapHint};
     std::uint64_t next_libc_heap_hint{Ps5LibcHeapHint};
     std::uint8_t* hle_slab{};
     std::size_t hle_slab_used{};
     std::uint64_t hle_slab_slot{};
     std::uint8_t* hle_data{};
+    std::size_t next_mutex_object_offset{Ps5MutexObjectPoolOffset};
     std::string status{"PS5 runtime is not initialized"};
 };
 
@@ -613,8 +725,37 @@ std::array<std::atomic<std::uint8_t>, 6> g_ps5_pad_axes{
 const auto g_ps5_process_start =
     std::chrono::steady_clock::now();
 std::atomic<std::uint64_t> g_ps5_pad_timestamp{};
+std::atomic<std::uint64_t> g_hle_binding_generation{1};
+std::atomic<std::uint64_t> g_event_flag_generation{1};
 std::array<struct sigaction, 3> g_ps5_previous_fault_actions{};
 bool g_ps5_diagnostic_fault_handlers_installed{};
+
+struct Ngs2SystemState {
+    std::uint32_t grain_samples{256};
+};
+
+struct Ngs2RackState {
+    std::uint64_t system_handle{};
+    std::uint32_t rack_id{};
+};
+
+struct Ngs2VoiceState {
+    std::uint64_t rack_handle{};
+    std::uint32_t voice_index{};
+    std::vector<std::int16_t> pcm;
+    std::uint64_t source_address{};
+    std::uint32_t source_rate{48000};
+    double position{};
+    bool playing{};
+    std::int32_t loop_start{-1};
+    std::int32_t loop_end{};
+    float gain{1.0f};
+};
+
+std::mutex g_ngs2_mutex;
+std::unordered_map<std::uint64_t, Ngs2SystemState> g_ngs2_systems;
+std::unordered_map<std::uint64_t, Ngs2RackState> g_ngs2_racks;
+std::unordered_map<std::uint64_t, Ngs2VoiceState> g_ngs2_voices;
 
 constexpr std::array Ps5DiagnosticFaultSignals{
     SIGSEGV, SIGBUS, SIGILL};
@@ -874,7 +1015,12 @@ struct GuestAccessCacheEntry {
     std::uint32_t protection{};
 };
 
-thread_local GuestAccessCacheEntry g_guest_access_cache{};
+// Guest code routinely alternates between its stack, TLS and heap mappings.
+// A single-entry cache turns that normal pattern into a global runtime mutex
+// acquisition for almost every HLE copy.
+thread_local std::array<GuestAccessCacheEntry, 32>
+    g_guest_access_cache{};
+thread_local std::size_t g_guest_access_cache_cursor{};
 
 bool Ps5TraceHleEnabled() {
     static const bool enabled = [] {
@@ -895,13 +1041,22 @@ bool GuestAccessCacheEnabled() {
 bool HasCachedAccess(const std::uint64_t address,
                      const std::uint64_t byte_count,
                      const std::uint32_t access) {
-    const auto& cached = g_guest_access_cache;
-    return GuestAccessCacheEnabled() && cached.generation != 0 &&
-           cached.generation == g_runtime.mappings.Generation() &&
-           (cached.protection & access) == access &&
-           RangeIsRepresentable(address, byte_count) &&
-           address >= cached.address && byte_count <= cached.byte_count &&
-           address - cached.address <= cached.byte_count - byte_count;
+    if (!GuestAccessCacheEnabled() ||
+        !RangeIsRepresentable(address, byte_count)) {
+        return false;
+    }
+    const auto generation = g_runtime.mappings.Generation();
+    return std::ranges::any_of(
+        g_guest_access_cache,
+        [&](const GuestAccessCacheEntry& cached) {
+            return cached.generation != 0 &&
+                   cached.generation == generation &&
+                   (cached.protection & access) == access &&
+                   address >= cached.address &&
+                   byte_count <= cached.byte_count &&
+                   address - cached.address <=
+                       cached.byte_count - byte_count;
+        });
 }
 
 bool CopyGuestBytes(const std::uint64_t address, void* const destination,
@@ -921,7 +1076,9 @@ bool CopyGuestBytes(const std::uint64_t address, void* const destination,
     if (mapping == nullptr) {
         return false;
     }
-    g_guest_access_cache = {
+    g_guest_access_cache[
+        g_guest_access_cache_cursor++ %
+        g_guest_access_cache.size()] = {
         .generation = generation,
         .address = mapping->address,
         .byte_count = mapping->byte_count,
@@ -971,12 +1128,14 @@ std::uint8_t* AllocateLowGuestRegionLocked(
     const std::uint64_t first_hint, const std::uint64_t stride,
     const std::size_t byte_count,
     const std::uint64_t required_alignment =
-        LSX4_PS5_GUEST_PAGE_SIZE) {
+        LSX4_PS5_GUEST_PAGE_SIZE,
+    const std::uint64_t attempt_limit = 256) {
     if (required_alignment == 0 ||
         (required_alignment & (required_alignment - 1u)) != 0) {
         return nullptr;
     }
-    for (std::uint64_t attempt = 0; attempt != 256; ++attempt) {
+    for (std::uint64_t attempt = 0;
+         attempt != attempt_limit; ++attempt) {
         const auto unaligned = first_hint + attempt * stride;
         if (unaligned < first_hint ||
             unaligned >
@@ -994,6 +1153,9 @@ std::uint8_t* AllocateLowGuestRegionLocked(
         int mapping_flags = MAP_PRIVATE | MAP_ANONYMOUS;
 #ifdef MAP_NORESERVE
         mapping_flags |= MAP_NORESERVE;
+#endif
+#ifdef MAP_FIXED_NOREPLACE
+        mapping_flags |= MAP_FIXED_NOREPLACE;
 #endif
         void* const mapping = mmap(
             reinterpret_cast<void*>(desired), byte_count,
@@ -1418,6 +1580,18 @@ std::uint64_t CreateHleStubLocked(
                  PROT_READ | PROT_EXEC) != 0) {
         return 0;
     }
+#ifdef __ANDROID__
+    if (g_runtime.hle_slab_used >= 0x7200 &&
+        g_runtime.hle_slab_used <= 0x7600) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5-BIND",
+            "offset=0x%zx thunk=0x%llx symbol=%s native=0x%llx",
+            g_runtime.hle_slab_used,
+            static_cast<unsigned long long>(thunk),
+            requested.empty() ? "(empty)" : requested.data(),
+            static_cast<unsigned long long>(native_function));
+    }
+#endif
     g_runtime.hle_slab_used += Ps5HleStubSize;
     g_runtime.hle_bindings.emplace(
         thunk, HleBinding{
@@ -1495,8 +1669,7 @@ int LoaderBindImport(void* const opaque_context,
             if (exported != context->exports.end()) {
                 *value = exported->address;
                 *symbol_size = exported->size;
-                if (std::getenv(
-                        "EXECUTOR_DIAG_JIT_RIP_PROBE") != nullptr) {
+                if (Ps5DiagnosticFaultProbeEnabled()) {
                     std::fprintf(
                         stderr,
                         "PS5_IMPORT_RESOLVED name=%s address=0x%llx "
@@ -1734,10 +1907,16 @@ bool FillGameProbeLocked(const std::uint64_t owner_handle,
         g_runtime.callbacks.invoke_hle != nullptr ||
         g_runtime.callbacks.bind_import != nullptr ||
         g_runtime.callbacks.resolve_hle != nullptr;
+    const auto imports_can_defer =
+#ifdef __ANDROID__
+        true;
+#else
+        has_hle_dispatch;
+#endif
     if (owner->module_scan_complete && owner->failed_modules == 0 &&
-        unresolved_data.empty() &&
-        (deferred_functions.empty() || has_hle_dispatch) &&
-        (missing_dependencies.empty() || has_hle_dispatch)) {
+        (unresolved_data.empty() || imports_can_defer) &&
+        (deferred_functions.empty() || imports_can_defer) &&
+        (missing_dependencies.empty() || imports_can_defer)) {
         report.flags |= LSX4_PS5_GAME_READY_TO_LAUNCH;
     }
 
@@ -2059,20 +2238,41 @@ bool TryReadGuestCString(
         return false;
     }
     const std::lock_guard lock{g_runtime.mutex};
-    for (std::size_t index = 0; index < maximum_size; ++index) {
-        const auto current = address + index;
-        if (current < address ||
-            !HasAccessLocked(
-                current, 1, LSX4_PS5_GUEST_READ)) {
+    auto current = address;
+    auto remaining = maximum_size;
+    while (remaining != 0) {
+        const auto* const mapping = g_runtime.mappings.Find(
+            current, 1, LSX4_PS5_GUEST_READ);
+        if (mapping == nullptr ||
+            current < mapping->address) {
             value.clear();
             return false;
         }
-        const auto character =
-            *reinterpret_cast<const char*>(current);
-        if (character == '\0') {
+        const auto available = mapping->byte_count -
+            (current - mapping->address);
+        const auto chunk = std::min<std::uint64_t>(
+            available, remaining);
+        const auto* const bytes =
+            reinterpret_cast<const char*>(current);
+        const auto* const terminator = static_cast<const char*>(
+            std::memchr(bytes, '\0',
+                       static_cast<std::size_t>(chunk)));
+        if (terminator != nullptr) {
+            value.append(
+                bytes, static_cast<std::size_t>(
+                           terminator - bytes));
             return true;
         }
-        value.push_back(character);
+        value.append(bytes, static_cast<std::size_t>(chunk));
+        if (chunk == 0 ||
+            current >
+                std::numeric_limits<std::uint64_t>::max() -
+                    chunk) {
+            value.clear();
+            return false;
+        }
+        current += chunk;
+        remaining -= static_cast<std::size_t>(chunk);
     }
     value.clear();
     return false;
@@ -2103,6 +2303,11 @@ bool TryResolveGuestPath(
         } else if (guest_path.starts_with("/savedata0/")) {
             root = g_runtime.save_data_directory;
             relative = guest_path.substr(11);
+        } else if (guest_path == "/hostapp") {
+            root = g_runtime.save_data_directory;
+        } else if (guest_path.starts_with("/hostapp/")) {
+            root = g_runtime.save_data_directory;
+            relative = guest_path.substr(9);
         } else {
             return false;
         }
@@ -2182,6 +2387,158 @@ bool TryResolveGuestPath(
         g_runtime.resolved_guest_paths.insert_or_assign(
             std::string{guest_path}, host_path);
     }
+    return true;
+}
+
+bool TryResolveGuestRegularFile(
+    const std::string_view guest_path,
+    std::filesystem::path& host_path,
+    std::uint64_t& file_size) {
+    std::filesystem::path root;
+    std::string_view relative;
+    const std::string path_key{guest_path};
+    bool has_indexed_size{};
+    std::uint64_t indexed_size{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        if (const auto cached =
+                g_runtime.resolved_guest_paths.find(path_key);
+            cached != g_runtime.resolved_guest_paths.end()) {
+            host_path = cached->second;
+            if (const auto cached_size =
+                    g_runtime.resolved_guest_file_sizes.find(
+                        path_key);
+                cached_size !=
+                    g_runtime.resolved_guest_file_sizes.end()) {
+                file_size = cached_size->second;
+                return true;
+            }
+        } else if (guest_path.starts_with("/app0/")) {
+            root = g_runtime.app0_directory;
+            relative = guest_path.substr(6);
+        } else if (guest_path.starts_with("/savedata0/")) {
+            root = g_runtime.save_data_directory;
+            relative = guest_path.substr(11);
+        } else if (guest_path.starts_with("/hostapp/")) {
+            root = g_runtime.save_data_directory;
+            relative = guest_path.substr(9);
+        } else {
+            return false;
+        }
+        if (const auto indexed =
+                g_runtime.indexed_guest_file_sizes.find(path_key);
+            indexed !=
+                g_runtime.indexed_guest_file_sizes.end()) {
+            has_indexed_size = true;
+            indexed_size = indexed->second;
+        }
+    }
+    if (host_path.empty()) {
+        while (!relative.empty() &&
+               (relative.front() == '/' ||
+                relative.front() == '\\')) {
+            relative.remove_prefix(1);
+        }
+        if (root.empty() || relative.empty()) {
+            return false;
+        }
+        std::filesystem::path suffix{relative};
+        for (const auto& component : suffix) {
+            if (component == ".." || component == "/" ||
+                component == "\\") {
+                return false;
+            }
+        }
+        host_path = (root / suffix).lexically_normal();
+    }
+    if (has_indexed_size) {
+        file_size = indexed_size;
+        return true;
+    }
+    std::error_code error;
+    const auto size = std::filesystem::file_size(
+        host_path, error);
+    if (!error) {
+        file_size = static_cast<std::uint64_t>(size);
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.resolved_guest_paths.insert_or_assign(
+            path_key, host_path);
+        g_runtime.resolved_guest_file_sizes.insert_or_assign(
+            path_key, file_size);
+        return true;
+    }
+
+    host_path.clear();
+    if (!TryResolveGuestPath(guest_path, host_path)) {
+        return false;
+    }
+    error.clear();
+    const auto fallback_size =
+        std::filesystem::file_size(host_path, error);
+    if (error) {
+        return false;
+    }
+    file_size = static_cast<std::uint64_t>(fallback_size);
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.resolved_guest_file_sizes.insert_or_assign(
+            path_key, file_size);
+    }
+    return true;
+}
+
+bool LoadGuestFileSizeIndex(
+    const std::filesystem::path& manifest_path,
+    std::unordered_map<std::string, std::uint64_t>& index) {
+    constexpr std::array<char, 8> ExpectedMagic{
+        'L', 'S', 'X', '4', 'F', 'S', '1', '\0'};
+    constexpr std::uint64_t MaximumEntries = 2'000'000;
+    constexpr std::uint32_t MaximumPathLength = 4096;
+    auto* const stream =
+        std::fopen(manifest_path.string().c_str(), "rb");
+    if (stream == nullptr) {
+        return false;
+    }
+    std::array<char, 8> magic{};
+    std::uint64_t count{};
+    const bool valid_header =
+        std::fread(magic.data(), 1, magic.size(), stream) ==
+            magic.size() &&
+        magic == ExpectedMagic &&
+        std::fread(&count, sizeof(count), 1, stream) == 1 &&
+        count <= MaximumEntries;
+    if (!valid_header) {
+        std::fclose(stream);
+        return false;
+    }
+    index.clear();
+    index.reserve(static_cast<std::size_t>(count));
+    std::string path;
+    for (std::uint64_t entry = 0; entry < count; ++entry) {
+        std::uint32_t path_length{};
+        std::uint64_t file_size{};
+        if (std::fread(
+                &path_length, sizeof(path_length), 1, stream) !=
+                1 ||
+            std::fread(
+                &file_size, sizeof(file_size), 1, stream) != 1 ||
+            path_length == 0 ||
+            path_length > MaximumPathLength) {
+            index.clear();
+            std::fclose(stream);
+            return false;
+        }
+        path.resize(path_length);
+        if (std::fread(
+                path.data(), 1, path.size(), stream) !=
+            path.size()) {
+            index.clear();
+            std::fclose(stream);
+            return false;
+        }
+        index.emplace(path, file_size);
+    }
+    std::fclose(stream);
     return true;
 }
 
@@ -2285,6 +2642,232 @@ bool TryGuestKernelStat(
     return true;
 }
 
+bool TryGuestKernelOpen(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr std::uint32_t NotFound = 0x80020002;
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    const auto path_address = request.integer_arguments[0];
+    const auto flags =
+        static_cast<std::uint32_t>(request.integer_arguments[1]);
+    if (path_address == 0) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    std::string guest_path;
+    std::filesystem::path host_path;
+    if (!TryReadGuestCString(
+            path_address, 4096, guest_path) ||
+        !TryResolveGuestPath(guest_path, host_path)) {
+        result = OrbisError(NotFound);
+        return true;
+    }
+    constexpr std::uint32_t WriteOnly = 0x0001;
+    constexpr std::uint32_t ReadWrite = 0x0002;
+    constexpr std::uint32_t Append = 0x0008;
+    constexpr std::uint32_t Create = 0x0200;
+    constexpr std::uint32_t Truncate = 0x0400;
+    const bool writes =
+        (flags & (WriteOnly | ReadWrite)) != 0;
+    if (writes && guest_path.starts_with("/app0")) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    if ((flags & Create) != 0) {
+        std::error_code error;
+        std::filesystem::create_directories(
+            host_path.parent_path(), error);
+        if (error) {
+            result = OrbisError(NotFound);
+            return true;
+        }
+    }
+    const char* mode = "rb";
+    if (writes) {
+        mode = (flags & Append) != 0
+            ? "ab+"
+            : (flags & Truncate) != 0
+                ? "wb+"
+                : "rb+";
+    }
+    auto* stream = std::fopen(
+        host_path.string().c_str(), mode);
+    if (stream == nullptr && writes &&
+        (flags & Create) != 0) {
+        stream = std::fopen(
+            host_path.string().c_str(), "wb+");
+    }
+    if (stream == nullptr) {
+        result = OrbisError(NotFound);
+        return true;
+    }
+    std::int32_t handle{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        handle = g_runtime.next_kernel_file_handle++;
+        g_runtime.kernel_files.push_back({
+            .handle = handle,
+            .path = host_path,
+            .stream = stream,
+        });
+    }
+#ifdef __ANDROID__
+    if (Ps5DiagnosticFaultProbeEnabled()) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5-FS",
+            "open guest=%s host=%s flags=0x%x fd=%d",
+            guest_path.c_str(), host_path.string().c_str(),
+            flags, handle);
+    }
+#endif
+    result = static_cast<std::uint64_t>(
+        static_cast<std::int64_t>(handle));
+    return true;
+}
+
+bool TryGuestKernelClose(
+    const std::int32_t handle, std::uint64_t& result) {
+    std::FILE* stream{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        const auto found = std::ranges::find(
+            g_runtime.kernel_files, handle,
+            &GuestKernelFile::handle);
+        if (found == g_runtime.kernel_files.end()) {
+            result = OrbisError(UINT32_C(0x80020009));
+            return true;
+        }
+        stream = found->stream;
+        g_runtime.kernel_files.erase(found);
+    }
+    result =
+        stream == nullptr || std::fclose(stream) == 0
+            ? 0
+            : OrbisError(UINT32_C(0x80020009));
+    return true;
+}
+
+bool TryGuestKernelFstat(
+    const std::int32_t handle,
+    const std::uint64_t stat_address,
+    std::uint64_t& result) {
+    if (stat_address == 0) {
+        result = OrbisError(UINT32_C(0x80020003));
+        return true;
+    }
+    std::filesystem::path host_path;
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        const auto found = std::ranges::find(
+            g_runtime.kernel_files, handle,
+            &GuestKernelFile::handle);
+        if (found == g_runtime.kernel_files.end()) {
+            result = OrbisError(UINT32_C(0x80020009));
+            return true;
+        }
+        host_path = found->path;
+    }
+    result = TryWriteGuestKernelStat(
+                 stat_address, host_path)
+        ? 0
+        : OrbisError(UINT32_C(0x80020002));
+    return true;
+}
+
+bool TryGuestKernelRead(
+    const std::int32_t handle,
+    const std::uint64_t destination,
+    const std::uint64_t byte_count,
+    std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t BadFileDescriptor = 0x80020009;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    if (byte_count == 0) {
+        result = 0;
+        return true;
+    }
+    if (destination == 0 ||
+        byte_count > std::numeric_limits<std::size_t>::max()) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    std::vector<std::uint8_t> bytes(
+        static_cast<std::size_t>(byte_count));
+    std::size_t bytes_read{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        const auto found = std::ranges::find(
+            g_runtime.kernel_files, handle,
+            &GuestKernelFile::handle);
+        if (found == g_runtime.kernel_files.end() ||
+            found->stream == nullptr) {
+            result = OrbisError(BadFileDescriptor);
+            return true;
+        }
+        bytes_read = std::fread(
+            bytes.data(), 1, bytes.size(), found->stream);
+        if (bytes_read == 0 && std::ferror(found->stream) != 0) {
+            result = OrbisError(BadFileDescriptor);
+            return true;
+        }
+    }
+    if (!TryWriteGuestBytes(
+            destination, bytes.data(), bytes_read)) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    result = bytes_read;
+    return true;
+}
+
+bool TryGuestKernelWrite(
+    const std::int32_t handle,
+    const std::uint64_t source,
+    const std::uint64_t byte_count,
+    std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t BadFileDescriptor = 0x80020009;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    if (byte_count == 0) {
+        result = 0;
+        return true;
+    }
+    if (source == 0 ||
+        byte_count > std::numeric_limits<std::size_t>::max()) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    std::vector<std::uint8_t> bytes(
+        static_cast<std::size_t>(byte_count));
+    if (!TryReadGuestBytes(
+            source, bytes.data(), bytes.size())) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    std::size_t bytes_written{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        const auto found = std::ranges::find(
+            g_runtime.kernel_files, handle,
+            &GuestKernelFile::handle);
+        if (found == g_runtime.kernel_files.end() ||
+            found->stream == nullptr) {
+            result = OrbisError(BadFileDescriptor);
+            return true;
+        }
+        bytes_written = std::fwrite(
+            bytes.data(), 1, bytes.size(), found->stream);
+        std::fflush(found->stream);
+        if (bytes_written == 0 &&
+            std::ferror(found->stream) != 0) {
+            result = OrbisError(BadFileDescriptor);
+            return true;
+        }
+    }
+    result = bytes_written;
+    return true;
+}
+
 bool TryResolveAprGuestPath(
     const std::uint64_t path_list_address,
     const std::uint64_t index,
@@ -2327,11 +2910,11 @@ bool TryResolveAprGuestPath(
 std::uint32_t RegisterAprFile(
     const std::filesystem::path& host_path) {
     const std::lock_guard lock{g_runtime.mutex};
-    const auto existing = std::ranges::find(
-        g_runtime.apr_files, host_path,
-        &decltype(g_runtime.apr_files)::value_type::second);
-    if (existing != g_runtime.apr_files.end()) {
-        return existing->first;
+    const auto path_key = host_path.string();
+    if (const auto existing =
+            g_runtime.apr_file_ids_by_path.find(path_key);
+        existing != g_runtime.apr_file_ids_by_path.end()) {
+        return existing->second;
     }
     std::uint32_t identifier{};
     do {
@@ -2339,6 +2922,7 @@ std::uint32_t RegisterAprFile(
     } while (identifier == 0 ||
              g_runtime.apr_files.contains(identifier));
     g_runtime.apr_files.emplace(identifier, host_path);
+    g_runtime.apr_file_ids_by_path.emplace(path_key, identifier);
     return identifier;
 }
 
@@ -2391,10 +2975,9 @@ bool TryResolveAprFilepathsToIds(
             return true;
         }
         std::filesystem::path host_path;
-        std::error_code error;
-        if (!TryResolveGuestPath(guest_path, host_path) ||
-            !std::filesystem::is_regular_file(
-                host_path, error) || error) {
+        std::uint64_t ignored_size{};
+        if (!TryResolveGuestRegularFile(
+                guest_path, host_path, ignored_size)) {
 #ifdef __ANDROID__
             if (Ps5DiagnosticFaultProbeEnabled()) {
                 __android_log_print(
@@ -2403,7 +2986,7 @@ bool TryResolveAprFilepathsToIds(
                     "error=%d",
                     guest_path.c_str(),
                     host_path.string().c_str(),
-                    error.value());
+                    errno);
             }
 #endif
             result = OrbisError(NotFound);
@@ -2418,12 +3001,104 @@ bool TryResolveAprFilepathsToIds(
             return true;
         }
 #ifdef __ANDROID__
-        if (Ps5DiagnosticFaultProbeEnabled()) {
+        if (Ps5DiagnosticFaultProbeEnabled() &&
+            (identifier <= 64u ||
+             (identifier & 0x3ffu) == 0u)) {
             __android_log_print(
                 ANDROID_LOG_INFO, "LSX4-PS5-APR",
                 "resolve guest=%s host=%s id=0x%x",
                 guest_path.c_str(),
                 host_path.string().c_str(), identifier);
+        }
+#endif
+    }
+    result = 0;
+    return true;
+}
+
+bool TryResolveAprFilepathsToIdsAndSizes(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    const auto path_list_address = request.integer_arguments[0];
+    const auto count = request.integer_arguments[1];
+    const auto identifiers_address = request.integer_arguments[2];
+    const auto sizes_address = request.integer_arguments[3];
+    const auto error_index_address = request.integer_arguments[4];
+    if (path_list_address == 0 || count == 0 ||
+        sizes_address == 0 || count > 1024) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    for (std::uint64_t index = 0; index < count; ++index) {
+        constexpr std::uint32_t InvalidIdentifier =
+            std::numeric_limits<std::uint32_t>::max();
+        if (identifiers_address != 0 &&
+            !TryWriteGuestBytes(
+                identifiers_address +
+                    index * sizeof(std::uint32_t),
+                &InvalidIdentifier,
+                sizeof(InvalidIdentifier))) {
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+        std::string guest_path;
+        std::filesystem::path host_path;
+        std::uint64_t file_size{};
+        if (!TryResolveAprGuestPath(
+                path_list_address, index, guest_path) ||
+            !TryResolveGuestRegularFile(
+                guest_path, host_path, file_size)) {
+            const std::uint64_t zero{};
+            if (!TryWriteGuestBytes(
+                    sizes_address +
+                        index * sizeof(std::uint64_t),
+                    &zero, sizeof(zero)) ||
+                (error_index_address != 0 &&
+                 !TryWriteGuestBytes(
+                     error_index_address,
+                     &index, sizeof(std::uint32_t)))) {
+                result = OrbisError(MemoryFault);
+                return true;
+            }
+#ifdef __ANDROID__
+            if (Ps5DiagnosticFaultProbeEnabled()) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5-APR",
+                    "resolve-size missing index=%llu guest=%s host=%s",
+                    static_cast<unsigned long long>(index),
+                    guest_path.empty() ? "<invalid>" : guest_path.c_str(),
+                    host_path.empty()
+                        ? "<invalid>"
+                        : host_path.string().c_str());
+            }
+#endif
+            result = std::numeric_limits<std::uint64_t>::max();
+            return true;
+        }
+        const auto identifier = RegisterAprFile(host_path);
+        if ((identifiers_address != 0 &&
+             !TryWriteGuestBytes(
+                 identifiers_address +
+                     index * sizeof(std::uint32_t),
+                 &identifier, sizeof(identifier))) ||
+            !TryWriteGuestBytes(
+                sizes_address +
+                    index * sizeof(std::uint64_t),
+                &file_size, sizeof(file_size))) {
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+#ifdef __ANDROID__
+        if (Ps5DiagnosticFaultProbeEnabled() &&
+            (identifier <= 64u ||
+             (identifier & 0x3ffu) == 0u)) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5-APR",
+                "resolve-size guest=%s id=0x%x size=0x%llx",
+                guest_path.c_str(), identifier,
+                static_cast<unsigned long long>(file_size));
         }
 #endif
     }
@@ -2467,6 +3142,43 @@ bool TryGetAprFileStat(
     }
 #endif
     result = 0;
+    return true;
+}
+
+constexpr std::uint64_t AprReadFileRecordSize = 0x30;
+constexpr std::uint64_t AprKernelEventQueueRecordSize = 0x30;
+constexpr std::uint64_t AprWriteAddressRecordSize = 0x20;
+
+bool TryAppendAprRecord(
+    const std::uint64_t command_buffer,
+    const void* const record,
+    const std::size_t record_size) {
+    if (record == nullptr || record_size == 0) {
+        return false;
+    }
+    const std::lock_guard lock{g_runtime.mutex};
+    const auto found =
+        g_runtime.apr_command_buffers.find(command_buffer);
+    if (found == g_runtime.apr_command_buffers.end()) {
+        return false;
+    }
+    auto& state = found->second;
+    if (state.buffer == 0 ||
+        state.write_offset > state.size ||
+        record_size > state.size - state.write_offset) {
+        return false;
+    }
+    const auto record_address = state.buffer + state.write_offset;
+    if (record_address < state.buffer ||
+        !HasAccessLocked(
+            record_address, record_size, LSX4_PS5_GUEST_WRITE)) {
+        return false;
+    }
+    std::memcpy(
+        reinterpret_cast<void*>(record_address),
+        record, record_size);
+    state.write_offset += record_size;
+    ++state.command_count;
     return true;
 }
 
@@ -2545,6 +3257,27 @@ bool TryReadAprFile(
             return true;
         }
     }
+    std::array<std::uint8_t, AprReadFileRecordSize> record{};
+    constexpr std::uint32_t ReadFileRecordType = 1;
+    const auto bytes_read_u64 =
+        static_cast<std::uint64_t>(bytes_read);
+    std::memcpy(record.data() + 0x00, &ReadFileRecordType,
+                sizeof(ReadFileRecordType));
+    std::memcpy(record.data() + 0x04, &identifier,
+                sizeof(identifier));
+    std::memcpy(record.data() + 0x08, &destination,
+                sizeof(destination));
+    std::memcpy(record.data() + 0x10, &requested_size,
+                sizeof(requested_size));
+    std::memcpy(record.data() + 0x18, &file_offset,
+                sizeof(file_offset));
+    std::memcpy(record.data() + 0x20, &bytes_read_u64,
+                sizeof(bytes_read_u64));
+    if (!TryAppendAprRecord(
+            command_buffer, record.data(), record.size())) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
 #ifdef __ANDROID__
     if (Ps5DiagnosticFaultProbeEnabled() &&
         (read_index <= 64 || (read_index & 0x3ffu) == 0)) {
@@ -2561,6 +3294,254 @@ bool TryReadAprFile(
     }
 #endif
     result = 0;
+    return true;
+}
+
+bool TryConstructAprCommandBuffer(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    const bool preserve_buffer,
+    std::uint64_t& result) {
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    const auto command_buffer = request.integer_arguments[0];
+    if (command_buffer == 0) {
+        result = 0;
+        return true;
+    }
+    std::array<std::uint64_t, 5> header{};
+    if (preserve_buffer &&
+        !TryReadGuestBytes(
+            command_buffer, header.data(), sizeof(header))) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    header[0] = command_buffer;
+    if (preserve_buffer) {
+        header[3] = request.integer_arguments[1];
+        header[4] = request.integer_arguments[2];
+    } else {
+        header[1] = request.integer_arguments[1];
+        header[2] = request.integer_arguments[2];
+    }
+    if (!TryWriteGuestBytes(
+            command_buffer, header.data(), sizeof(header))) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.apr_command_buffers[command_buffer] = {
+            .buffer = header[1],
+            .size = header[2],
+        };
+        g_runtime.apr_completion_writes.erase(command_buffer);
+        g_runtime.apr_completion_events.erase(command_buffer);
+    }
+    result = command_buffer;
+    return true;
+}
+
+bool TryDestroyAprCommandBuffer(
+    const std::uint64_t command_buffer,
+    const bool auxiliary_only,
+    std::uint64_t& result) {
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    if (command_buffer == 0) {
+        result = 0;
+        return true;
+    }
+    const std::array<std::uint64_t, 2> zeros{};
+    const auto address = auxiliary_only
+        ? command_buffer + 3 * sizeof(std::uint64_t)
+        : command_buffer + sizeof(std::uint64_t);
+    if (!TryWriteGuestBytes(
+            address, zeros.data(), sizeof(zeros))) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    if (!auxiliary_only) {
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.apr_command_buffers.erase(command_buffer);
+        g_runtime.apr_completion_writes.erase(command_buffer);
+        g_runtime.apr_completion_events.erase(command_buffer);
+    }
+    result = 0;
+    return true;
+}
+
+bool TrySetAprCommandBuffer(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    const auto command_buffer = request.integer_arguments[0];
+    const auto buffer = request.integer_arguments[1];
+    const auto size = request.integer_arguments[2];
+    if (command_buffer == 0) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    const std::array<std::uint64_t, 3> visible_pointers{
+        command_buffer, buffer, size};
+    if (!TryWriteGuestBytes(
+            command_buffer, visible_pointers.data(),
+            sizeof(visible_pointers))) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.apr_command_buffers[command_buffer] = {
+            .buffer = buffer,
+            .size = size,
+        };
+        g_runtime.apr_completion_writes.erase(command_buffer);
+        g_runtime.apr_completion_events.erase(command_buffer);
+    }
+    result = 0;
+    return true;
+}
+
+bool TryClearAprCommandBuffer(
+    const std::uint64_t command_buffer,
+    std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    if (command_buffer == 0) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    std::uint64_t buffer{};
+    if (!TryReadGuestBytes(
+            command_buffer + sizeof(std::uint64_t),
+            &buffer, sizeof(buffer))) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    const std::array<std::uint64_t, 3> visible_pointers{
+        command_buffer, 0, 0};
+    if (!TryWriteGuestBytes(
+            command_buffer, visible_pointers.data(),
+            sizeof(visible_pointers))) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.apr_command_buffers.erase(command_buffer);
+        g_runtime.apr_completion_writes.erase(command_buffer);
+        g_runtime.apr_completion_events.erase(command_buffer);
+    }
+    result = buffer;
+    return true;
+}
+
+bool TryAppendAprCompletionWrite(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    const auto command_buffer = request.integer_arguments[0];
+    const auto address = request.integer_arguments[1];
+    const auto value = request.integer_arguments[2];
+    if (command_buffer == 0 || address == 0) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    std::array<std::uint8_t, AprWriteAddressRecordSize> record{};
+    constexpr std::uint32_t WriteAddressRecordType = 3;
+    std::memcpy(record.data() + 0x00, &WriteAddressRecordType,
+                sizeof(WriteAddressRecordType));
+    std::memcpy(record.data() + 0x08, &address, sizeof(address));
+    std::memcpy(record.data() + 0x10, &value, sizeof(value));
+    if (!TryAppendAprRecord(
+            command_buffer, record.data(), record.size())) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        if (!HasAccessLocked(
+                address, sizeof(std::uint64_t),
+                LSX4_PS5_GUEST_WRITE)) {
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+        g_runtime.apr_completion_writes[command_buffer]
+            .emplace_back(address, value);
+    }
+    result = 0;
+    return true;
+}
+
+bool TryAppendAprCompletionEvent(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    const auto command_buffer = request.integer_arguments[0];
+    if (command_buffer == 0) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    const AprCompletionEvent completion{
+        .event_queue = request.integer_arguments[1],
+        .ident = request.integer_arguments[2],
+        .completion_token = request.integer_arguments[3],
+        .user_data = request.integer_arguments[4],
+    };
+    std::array<std::uint8_t, AprKernelEventQueueRecordSize> record{};
+    constexpr std::uint32_t KernelEventQueueRecordType = 2;
+    constexpr std::int16_t KernelEventFilterAmpr = -16;
+    std::memcpy(record.data() + 0x00, &KernelEventQueueRecordType,
+                sizeof(KernelEventQueueRecordType));
+    std::memcpy(record.data() + 0x04, &KernelEventFilterAmpr,
+                sizeof(KernelEventFilterAmpr));
+    std::memcpy(record.data() + 0x08, &completion.event_queue,
+                sizeof(completion.event_queue));
+    std::memcpy(record.data() + 0x10, &completion.ident,
+                sizeof(completion.ident));
+    std::memcpy(record.data() + 0x18, &completion.user_data,
+                sizeof(completion.user_data));
+    std::memcpy(record.data() + 0x20, &completion.completion_token,
+                sizeof(completion.completion_token));
+    if (!TryAppendAprRecord(
+            command_buffer, record.data(), record.size())) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.apr_completion_events[command_buffer]
+            .push_back(completion);
+    }
+    result = 0;
+    return true;
+}
+
+bool TryGetAprCommandBufferProperty(
+    const std::uint64_t command_buffer,
+    const std::uint32_t property,
+    std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    if (command_buffer == 0) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    const std::lock_guard lock{g_runtime.mutex};
+    const auto found =
+        g_runtime.apr_command_buffers.find(command_buffer);
+    if (found == g_runtime.apr_command_buffers.end()) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    if (property == 0) {
+        result = found->second.size;
+    } else if (property == 1) {
+        result = found->second.write_offset;
+    } else {
+        result = found->second.command_count;
+    }
     return true;
 }
 
@@ -2588,10 +3569,130 @@ bool TrySubmitAprCommandBuffer(
         g_runtime.apr_submissions.emplace(
             identifier, command_buffer);
     }
+    std::vector<std::uint8_t> command_records;
+    std::vector<AprCompletionEvent> completion_events;
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        const auto state =
+            g_runtime.apr_command_buffers.find(command_buffer);
+        if (state == g_runtime.apr_command_buffers.end() ||
+            state->second.write_offset > state->second.size ||
+            state->second.write_offset >
+                std::numeric_limits<std::size_t>::max()) {
+            g_runtime.apr_submissions.erase(identifier);
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+        command_records.resize(
+            static_cast<std::size_t>(
+                state->second.write_offset));
+        if (!command_records.empty()) {
+            if (state->second.buffer == 0 ||
+                !HasAccessLocked(
+                    state->second.buffer,
+                    command_records.size(),
+                    LSX4_PS5_GUEST_READ)) {
+                g_runtime.apr_submissions.erase(identifier);
+                result = OrbisError(MemoryFault);
+                return true;
+            }
+            std::memcpy(
+                command_records.data(),
+                reinterpret_cast<const void*>(
+                    state->second.buffer),
+                command_records.size());
+        }
+        if (const auto found =
+                g_runtime.apr_completion_events.find(command_buffer);
+            found != g_runtime.apr_completion_events.end()) {
+            completion_events = found->second;
+        }
+    }
     const auto forget_submission = [&] {
         const std::lock_guard lock{g_runtime.mutex};
         g_runtime.apr_submissions.erase(identifier);
     };
+    for (std::size_t offset = 0;
+         offset < command_records.size();) {
+        if (command_records.size() - offset <
+            sizeof(std::uint32_t)) {
+            forget_submission();
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+        std::uint32_t record_type{};
+        std::memcpy(
+            &record_type,
+            command_records.data() + offset,
+            sizeof(record_type));
+        std::size_t record_size{};
+        if (record_type == 1) {
+            record_size = AprReadFileRecordSize;
+        } else if (record_type == 2) {
+            record_size = AprKernelEventQueueRecordSize;
+        } else if (record_type == 3) {
+            record_size = AprWriteAddressRecordSize;
+        } else {
+            forget_submission();
+            result = OrbisError(InvalidArgument);
+            return true;
+        }
+        if (record_size > command_records.size() - offset) {
+            forget_submission();
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+        if (record_type == 3) {
+            std::uint64_t address{};
+            std::uint64_t value{};
+            std::memcpy(
+                &address,
+                command_records.data() + offset + 0x08,
+                sizeof(address));
+            std::memcpy(
+                &value,
+                command_records.data() + offset + 0x10,
+                sizeof(value));
+            if (address == 0 ||
+                !TryWriteGuestBytes(
+                    address, &value, sizeof(value))) {
+                forget_submission();
+                result = OrbisError(MemoryFault);
+                return true;
+            }
+        }
+        offset += record_size;
+    }
+    bool queued_completion_event = false;
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        for (const auto& completion : completion_events) {
+            const auto queue = g_runtime.guest_event_queues.find(
+                completion.event_queue);
+            if (queue == g_runtime.guest_event_queues.end()) {
+                continue;
+            }
+            std::array<std::uint8_t, 0x20> event{};
+            constexpr std::int16_t KernelEventFilterAmpr = -16;
+            constexpr std::uint16_t KernelEventFlags = 0x20;
+            std::memcpy(event.data() + 0x00, &completion.ident,
+                        sizeof(completion.ident));
+            std::memcpy(event.data() + 0x08, &KernelEventFilterAmpr,
+                        sizeof(KernelEventFilterAmpr));
+            std::memcpy(event.data() + 0x0a, &KernelEventFlags,
+                        sizeof(KernelEventFlags));
+            std::memcpy(event.data() + 0x10,
+                        &completion.completion_token,
+                        sizeof(completion.completion_token));
+            std::memcpy(event.data() + 0x18, &completion.user_data,
+                        sizeof(completion.user_data));
+            queue->second.push_back(event);
+            queued_completion_event = true;
+        }
+    }
+    if (queued_completion_event) {
+        g_runtime.guest_event_queue_condition.notify_all();
+    }
     if (identifier_address != 0 &&
         !TryWriteGuestBytes(
             identifier_address, &identifier,
@@ -2611,17 +3712,29 @@ bool TrySubmitAprCommandBuffer(
         }
     }
 #ifdef __ANDROID__
-    if (Ps5DiagnosticFaultProbeEnabled()) {
+    if (Ps5DiagnosticFaultProbeEnabled() &&
+        (identifier <= 64u ||
+         (identifier & 0x3ffu) == 0u)) {
+        std::array<std::uint64_t, 2> result_qwords{};
+        const bool result_qwords_ok =
+            result_address != 0 &&
+            TryReadGuestBytes(
+                result_address, result_qwords.data(),
+                sizeof(result_qwords));
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4-PS5-APR",
             "submit id=0x%x command=0x%llx priority=0x%llx "
-            "result=0x%llx output=0x%llx",
+            "result=0x%llx output=0x%llx q0=0x%llx "
+            "q1=0x%llx ok=%d",
             identifier,
             static_cast<unsigned long long>(command_buffer),
             static_cast<unsigned long long>(
                 request.integer_arguments[1]),
             static_cast<unsigned long long>(result_address),
-            static_cast<unsigned long long>(identifier_address));
+            static_cast<unsigned long long>(identifier_address),
+            static_cast<unsigned long long>(result_qwords[0]),
+            static_cast<unsigned long long>(result_qwords[1]),
+            result_qwords_ok ? 1 : 0);
     }
 #endif
     result = 0;
@@ -2646,11 +3759,18 @@ bool TryWaitAprCommandBuffer(
     }
 #ifdef __ANDROID__
     if (Ps5DiagnosticFaultProbeEnabled()) {
-        __android_log_print(
-            ANDROID_LOG_INFO, "LSX4-PS5-APR",
-            "wait id=0x%x command=0x%llx",
-            identifier,
-            static_cast<unsigned long long>(command_buffer));
+        static std::atomic<std::uint64_t> wait_logs{};
+        const auto wait_index =
+            wait_logs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (wait_index <= 32u ||
+            (wait_index & (wait_index - 1u)) == 0u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5-APR",
+                "wait count=%llu id=0x%x command=0x%llx",
+                static_cast<unsigned long long>(wait_index),
+                identifier,
+                static_cast<unsigned long long>(command_buffer));
+        }
     }
 #endif
     result = 0;
@@ -2680,6 +3800,22 @@ bool TryResetAprCommandBuffer(
             sizeof(visible_pointers))) {
         result = OrbisError(MemoryFault);
         return true;
+    }
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        const auto found =
+            g_runtime.apr_command_buffers.find(command_buffer);
+        if (found != g_runtime.apr_command_buffers.end()) {
+            found->second.write_offset = 0;
+            found->second.command_count = 0;
+        } else {
+            g_runtime.apr_command_buffers[command_buffer] = {
+                .buffer = data_and_size[0],
+                .size = data_and_size[1],
+            };
+        }
+        g_runtime.apr_completion_writes.erase(command_buffer);
+        g_runtime.apr_completion_events.erase(command_buffer);
     }
     result = 0;
     return true;
@@ -3177,31 +4313,60 @@ constexpr std::uint64_t AgcCommandBufferCursorUpOffset = 0x10;
 constexpr std::uint64_t AgcCommandBufferCursorDownOffset = 0x18;
 constexpr std::uint64_t AgcCommandBufferReservedDwOffset = 0x30;
 constexpr std::uint32_t AgcItNop = 0x10;
+constexpr std::uint32_t AgcItSetBase = 0x11;
+constexpr std::uint32_t AgcItDispatchDirect = 0x15;
+constexpr std::uint32_t AgcItDispatchIndirect = 0x16;
+constexpr std::uint32_t AgcComputePgmLo = 0x20c;
+constexpr std::uint32_t AgcComputePgmHi = 0x20d;
+constexpr std::uint32_t AgcComputeStartX = 0x204;
+constexpr std::uint32_t AgcComputeStartY = 0x205;
+constexpr std::uint32_t AgcComputeStartZ = 0x206;
+constexpr std::uint32_t AgcComputeNumThreadX = 0x207;
+constexpr std::uint32_t AgcComputeNumThreadY = 0x208;
+constexpr std::uint32_t AgcComputeNumThreadZ = 0x209;
+constexpr std::uint32_t AgcComputePgmRsrc1 = 0x212;
+constexpr std::uint32_t AgcComputePgmRsrc2 = 0x213;
+constexpr std::uint32_t AgcComputeUserData = 0x240;
 constexpr std::uint32_t AgcItWaitRegMem = 0x3c;
 constexpr std::uint32_t AgcItIndexBufferSize = 0x13;
 constexpr std::uint32_t AgcItIndexBase = 0x26;
 constexpr std::uint32_t AgcItIndexType = 0x2a;
+constexpr std::uint32_t AgcItNumInstances = 0x2f;
 constexpr std::uint32_t AgcItDrawIndexOffset2 = 0x35;
+constexpr std::uint32_t AgcItWriteData = 0x37;
 constexpr std::uint32_t AgcItEventWrite = 0x46;
 constexpr std::uint32_t AgcItReleaseMem = 0x49;
+constexpr std::uint32_t AgcItDmaData = 0x50;
 constexpr std::uint32_t AgcItSetContextReg = 0x69;
 constexpr std::uint32_t AgcItSetShReg = 0x76;
 constexpr std::uint32_t AgcItSetUconfigReg = 0x79;
+constexpr std::uint32_t AgcItGetLodStats = 0x8e;
 constexpr std::uint32_t AgcRZero = 0x00;
+constexpr std::uint32_t AgcRDrawIndexAuto = 0x04;
 constexpr std::uint32_t AgcRDrawReset = 0x05;
 constexpr std::uint32_t AgcRWaitFlipDone = 0x06;
+constexpr std::uint32_t AgcRAcbReset = 0x09;
 constexpr std::uint32_t AgcRWaitMem32 = 0x0a;
+constexpr std::uint32_t AgcRPopMarker = 0x0c;
 constexpr std::uint32_t AgcRShRegsIndirect = 0x11;
 constexpr std::uint32_t AgcRCxRegsIndirect = 0x12;
 constexpr std::uint32_t AgcRUcRegsIndirect = 0x13;
 constexpr std::uint32_t AgcRAcquireMem = 0x14;
+constexpr std::uint32_t AgcRWriteData = 0x15;
 constexpr std::uint32_t AgcRWaitMem64 = 0x16;
 constexpr std::uint32_t AgcRFlip = 0x17;
 constexpr std::uint32_t AgcRReleaseMem = 0x18;
 constexpr std::uint32_t AgcRDmaData = 0x19;
+constexpr std::uint32_t AgcRIndexCount = 0x1c;
 constexpr std::uint32_t AgcCbSetShRegisterRangeMarker = 0x6875000d;
 constexpr std::uint32_t AgcCbTargetMask = 0x8e;
 constexpr std::uint32_t AgcCbBlend0Control = 0x1e0;
+constexpr std::uint32_t AgcSpiPsInputCntl0 = 0x191;
+constexpr std::uint32_t AgcSpiPsInputEna = 0x1b3;
+constexpr std::uint32_t AgcSpiPsInputAddr = 0x1b4;
+constexpr std::uint32_t AgcSpiPsInControl = 0x1b6;
+constexpr std::uint32_t AgcSpiShaderColFormat = 0x1c5;
+constexpr std::uint32_t AgcDbShaderControl = 0x203;
 constexpr std::uint32_t AgcCbColor0Base = 0x318;
 constexpr std::uint32_t AgcCbColorRegisterStride = 15;
 constexpr std::uint32_t AgcCbColor0Info = 0x31c;
@@ -3514,30 +4679,41 @@ bool TryAgcDmaData(
         result = 0;
         return true;
     }
+    const auto engine = static_cast<std::uint32_t>(
+        request.integer_arguments[1] & 0x1u);
+    const auto destination = static_cast<std::uint32_t>(
+        request.integer_arguments[2] & 0xffu);
+    const auto destination_cache_policy =
+        static_cast<std::uint32_t>(
+            request.integer_arguments[3] & 0x3u);
     const auto destination_address = request.integer_arguments[4];
+    const auto source = static_cast<std::uint32_t>(
+        request.integer_arguments[5] & 0xffu);
+    const auto source_cache_policy =
+        static_cast<std::uint32_t>(stack[0] & 0x3u);
     const auto source_address = stack[1];
     const std::uint32_t words[]{
-        AgcPm4(8, AgcItNop, AgcRDmaData),
-        static_cast<std::uint32_t>(
-            request.integer_arguments[1] & 0xffu) |
-            (static_cast<std::uint32_t>(
-                 request.integer_arguments[2] & 0xffu) << 8u) |
-            (static_cast<std::uint32_t>(
-                 request.integer_arguments[3] & 0xffu) << 16u) |
-            (static_cast<std::uint32_t>(
-                 request.integer_arguments[5] & 0xffu) << 24u),
-        static_cast<std::uint32_t>(stack[0] & 0xffu) |
-            (static_cast<std::uint32_t>(stack[3] & 0xffu) << 8u) |
-            (static_cast<std::uint32_t>(stack[4] & 0xffu) << 16u) |
-            (static_cast<std::uint32_t>(stack[5] & 0xffu) << 24u),
-        byte_count,
+        AgcPm4(7, AgcItDmaData, 0),
+        engine |
+            (source_cache_policy << 13u) |
+            ((destination & 0x3u) << 20u) |
+            (destination_cache_policy << 25u) |
+            ((source & 0x3u) << 29u) |
+            ((static_cast<std::uint32_t>(stack[5]) & 0x1u) << 31u),
+        static_cast<std::uint32_t>(source_address),
+        static_cast<std::uint32_t>(source_address >> 32u),
         static_cast<std::uint32_t>(destination_address),
         static_cast<std::uint32_t>(destination_address >> 32u),
-        static_cast<std::uint32_t>(source_address),
-        static_cast<std::uint32_t>(source_address >> 32u)};
+        (byte_count & 0x03ffffffu) |
+            ((source & 0x4u) << 24u) |
+            ((destination & 0x4u) << 25u) |
+            ((source & 0x8u) << 25u) |
+            ((destination & 0x8u) << 26u) |
+            ((static_cast<std::uint32_t>(stack[3]) & 0x1u) << 30u) |
+            ((static_cast<std::uint32_t>(stack[4]) & 0x1u) << 31u)};
     std::uint64_t command{};
     if (!TryAllocateAgcCommandDwords(
-            request.integer_arguments[0], 8, command) ||
+            request.integer_arguments[0], 7, command) ||
         !TryWriteGuestBytes(command, words, sizeof(words))) {
         result = 0;
         return true;
@@ -3556,6 +4732,17 @@ bool TryAgcPatchDmaDataAddress(
     if (TryReadGuestValue(command_or_field, header)) {
         const auto opcode = (header >> 8u) & 0xffu;
         const auto packet_register = (header >> 2u) & 0x3fu;
+        if ((header & UINT32_C(0xc0000000)) ==
+                UINT32_C(0xc0000000) &&
+            opcode == AgcItDmaData) {
+            result = TryWriteGuestValue(
+                         command_or_field +
+                             (source ? 8u : 16u),
+                         value)
+                ? 0
+                : OrbisError(UINT32_C(0x80020101));
+            return true;
+        }
         if ((header & UINT32_C(0xc0000000)) ==
                 UINT32_C(0xc0000000) &&
             opcode == AgcItNop &&
@@ -3937,13 +5124,21 @@ bool TryAgcGetDataPacketPayload(
     }
 #ifdef __ANDROID__
     if (Ps5DiagnosticFaultProbeEnabled()) {
-        __android_log_print(
-            ANDROID_LOG_INFO, "LSX4-PS5-AGC",
-            "payload command=0x%llx type=%u header=0x%08x output=0x%llx payload=0x%llx",
-            static_cast<unsigned long long>(command),
-            type, header,
-            static_cast<unsigned long long>(output),
-            static_cast<unsigned long long>(payload));
+        static std::atomic<std::uint64_t> payload_logs{};
+        const auto log_index =
+            payload_logs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (log_index <= 8u ||
+            (log_index & (log_index - 1u)) == 0u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5-AGC",
+                "payload count=%llu command=0x%llx type=%u header=0x%08x "
+                "output=0x%llx payload=0x%llx",
+                static_cast<unsigned long long>(log_index),
+                static_cast<unsigned long long>(command),
+                type, header,
+                static_cast<unsigned long long>(output),
+                static_cast<unsigned long long>(payload));
+        }
     }
 #endif
     result = TryWriteGuestValue(output, payload)
@@ -4016,6 +5211,42 @@ bool TryAgcSetIndexSize(
     return true;
 }
 
+bool TryAgcSetIndexCount(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    std::uint64_t command{};
+    const std::uint32_t words[]{
+        AgcPm4(2, AgcItNop, AgcRIndexCount),
+        static_cast<std::uint32_t>(request.integer_arguments[1])};
+    if (request.integer_arguments[0] == 0 ||
+        !TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 2, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcSetNumInstances(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    std::uint64_t command{};
+    const std::uint32_t words[]{
+        AgcPm4(2, AgcItNumInstances, 0),
+        static_cast<std::uint32_t>(request.integer_arguments[1])};
+    if (request.integer_arguments[0] == 0 ||
+        !TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 2, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
 bool TryAgcSetIndexBuffer(
     const Lsx4::Translation::HleBridgeRequest& request,
     std::uint64_t& result) {
@@ -4060,6 +5291,426 @@ bool TryAgcDrawIndexOffset(
     return true;
 }
 
+bool TryAgcCbDispatch(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto modifier =
+        static_cast<std::uint32_t>(request.integer_arguments[4]);
+    const std::uint32_t words[]{
+        AgcPm4(5, AgcItDispatchDirect, 0),
+        static_cast<std::uint32_t>(request.integer_arguments[1]),
+        static_cast<std::uint32_t>(request.integer_arguments[2]),
+        static_cast<std::uint32_t>(request.integer_arguments[3]),
+        (modifier & UINT32_C(0xa038)) | UINT32_C(0x41)};
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 5, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcCbSetShRegistersDirect(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto command_buffer = request.integer_arguments[0];
+    const auto records_address = request.integer_arguments[1];
+    const auto record_count =
+        static_cast<std::uint32_t>(request.integer_arguments[2]);
+    if (command_buffer == 0 || records_address == 0 ||
+        record_count == 0 || record_count > 4096) {
+        result = 0;
+        return true;
+    }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> records(
+        record_count);
+    for (std::uint32_t index = 0; index < record_count; ++index) {
+        const auto record =
+            records_address + static_cast<std::uint64_t>(index) * 8u;
+        if (!TryReadGuestValue(record, records[index].first) ||
+            !TryReadGuestValue(record + 4u, records[index].second)) {
+            result = 0;
+            return true;
+        }
+    }
+    std::ranges::sort(
+        records, {}, &std::pair<std::uint32_t, std::uint32_t>::first);
+    std::uint64_t first_command{};
+    std::size_t begin{};
+    while (begin < records.size()) {
+        auto end = begin + 1u;
+        while (end < records.size() &&
+               records[end].first == records[end - 1u].first + 1u) {
+            ++end;
+        }
+        const auto value_count =
+            static_cast<std::uint32_t>(end - begin);
+        const auto dword_count = value_count + 2u;
+        std::uint64_t command{};
+        if (!TryAllocateAgcCommandDwords(
+                command_buffer, dword_count, command) ||
+            !TryWriteGuestValue(
+                command,
+                AgcPm4(dword_count, AgcItSetShReg, 0)) ||
+            !TryWriteGuestValue(
+                command + 4u, records[begin].first & 0xffffu)) {
+            result = 0;
+            return true;
+        }
+        if (first_command == 0) {
+            first_command = command;
+        }
+        for (std::size_t index = begin; index < end; ++index) {
+            if (!TryWriteGuestValue(
+                    command + 8u +
+                        static_cast<std::uint64_t>(index - begin) * 4u,
+                    records[index].second)) {
+                result = 0;
+                return true;
+            }
+        }
+        begin = end;
+    }
+    result = first_command;
+    return true;
+}
+
+bool TryAgcAcbResetQueue(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const std::uint32_t words[]{
+        AgcPm4(2, AgcItNop, AgcRAcbReset), 0};
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 2, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcAcbEventWrite(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto event_type =
+        static_cast<std::uint32_t>(request.integer_arguments[1] & 0xffu);
+    const auto event_address = request.integer_arguments[2];
+    const bool has_address = (event_type & ~1u) == 0x38u;
+    const auto dword_count = has_address ? 4u : 2u;
+    std::array<std::uint32_t, 4> words{
+        AgcPm4(dword_count, AgcItEventWrite, 0),
+        has_address ? event_type | 0x100u : event_type & 0x3fu,
+        static_cast<std::uint32_t>(event_address) & ~7u,
+        static_cast<std::uint32_t>(event_address >> 32u)};
+    std::uint64_t command{};
+    if (event_type >= 0x40u ||
+        !TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], dword_count, command) ||
+        !TryWriteGuestBytes(
+            command, words.data(),
+            static_cast<std::size_t>(dword_count) * 4u)) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcAcbAcquireMem(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto gcr_control =
+        static_cast<std::uint32_t>(request.integer_arguments[1]);
+    const auto base_address = request.integer_arguments[2];
+    const auto size_bytes = request.integer_arguments[3];
+    const auto poll_cycles =
+        static_cast<std::uint32_t>(request.integer_arguments[4]);
+    const bool no_size =
+        size_bytes == std::numeric_limits<std::uint64_t>::max();
+    const std::uint32_t words[]{
+        AgcPm4(8, AgcItNop, AgcRAcquireMem),
+        UINT32_C(0x80000000),
+        no_size ? 0u : static_cast<std::uint32_t>(size_bytes >> 8u),
+        0,
+        static_cast<std::uint32_t>(base_address >> 8u),
+        0,
+        poll_cycles / 40u,
+        gcr_control};
+    std::uint64_t command{};
+    if ((!no_size && (size_bytes & 0xffu) != 0) ||
+        (!no_size && (size_bytes >> 40u) != 0) ||
+        (base_address & 0xffu) != 0 ||
+        (base_address >> 40u) != 0 ||
+        !TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 8, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcAcbWaitRegMem(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto size =
+        static_cast<std::uint32_t>(request.integer_arguments[1] & 0xffu);
+    const auto compare =
+        static_cast<std::uint32_t>(request.integer_arguments[2] & 0xffu);
+    const auto cache =
+        static_cast<std::uint32_t>(request.integer_arguments[3] & 0xffu);
+    const auto address = request.integer_arguments[4];
+    const auto reference = request.integer_arguments[5];
+    std::uint64_t mask{};
+    std::uint32_t poll_cycles{};
+    if (size > 1 || compare > 7 || cache > 3 ||
+        !TryReadGuestValue(request.guest_stack + 8u, mask) ||
+        !TryReadGuestValue(request.guest_stack + 16u, poll_cycles)) {
+        result = 0;
+        return true;
+    }
+    const auto control =
+        UINT32_C(0x10) | compare | (cache << 25u);
+    const auto poll = std::min(poll_cycles >> 4u, 0xffffu);
+    std::array<std::uint32_t, 9> words{
+        AgcPm4(
+            size == 0 ? 7u : 9u, AgcItNop,
+            size == 0 ? AgcRWaitMem32 : AgcRWaitMem64),
+        static_cast<std::uint32_t>(address) &
+            (size == 0 ? ~3u : ~7u),
+        static_cast<std::uint32_t>(address >> 32u) & 0x3ffffu,
+        static_cast<std::uint32_t>(mask)};
+    if (size == 0) {
+        words[4] = static_cast<std::uint32_t>(reference);
+        words[5] = control;
+        words[6] = poll;
+    } else {
+        words[4] = static_cast<std::uint32_t>(mask >> 32u);
+        words[5] = static_cast<std::uint32_t>(reference);
+        words[6] = static_cast<std::uint32_t>(reference >> 32u);
+        words[7] = control;
+        words[8] = poll;
+    }
+    const auto dword_count = size == 0 ? 7u : 9u;
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], dword_count, command) ||
+        !TryWriteGuestBytes(
+            command, words.data(),
+            static_cast<std::size_t>(dword_count) * 4u)) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcAcbDispatchIndirect(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto arguments_address = request.integer_arguments[1];
+    const auto modifier =
+        static_cast<std::uint32_t>(request.integer_arguments[2]);
+    const std::uint32_t words[]{
+        AgcPm4(4, AgcItDispatchIndirect, 0),
+        static_cast<std::uint32_t>(arguments_address),
+        static_cast<std::uint32_t>(arguments_address >> 32u),
+        (modifier & UINT32_C(0xa038)) | UINT32_C(0x41)};
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 4, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcWriteData(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto destination_address = request.integer_arguments[3];
+    const auto data_address = request.integer_arguments[4];
+    const auto data_count =
+        static_cast<std::uint32_t>(request.integer_arguments[5]);
+    std::uint64_t increment_raw{};
+    std::uint64_t confirm_raw{};
+    if (destination_address == 0 || data_address == 0 ||
+        data_count > 0x3ffdu ||
+        !TryReadGuestValue(
+            request.guest_stack + 8u, increment_raw) ||
+        !TryReadGuestValue(
+            request.guest_stack + 16u, confirm_raw)) {
+        result = 0;
+        return true;
+    }
+    const auto dword_count = data_count + 4u;
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], dword_count, command)) {
+        result = 0;
+        return true;
+    }
+    const std::uint32_t prefix[]{
+        AgcPm4(dword_count, AgcItNop, AgcRWriteData),
+        static_cast<std::uint32_t>(
+            request.integer_arguments[1] & 0xffu) |
+            (static_cast<std::uint32_t>(
+                 request.integer_arguments[2] & 0xffu) << 8u) |
+            (static_cast<std::uint32_t>(
+                 increment_raw & 0xffu) << 16u) |
+            (static_cast<std::uint32_t>(
+                 confirm_raw & 0xffu) << 24u),
+        static_cast<std::uint32_t>(destination_address),
+        static_cast<std::uint32_t>(destination_address >> 32u)};
+    if (!TryWriteGuestBytes(command, prefix, sizeof(prefix))) {
+        result = 0;
+        return true;
+    }
+    for (std::uint32_t index = 0; index < data_count; ++index) {
+        std::uint32_t value{};
+        if (!TryReadGuestValue(
+                data_address + static_cast<std::uint64_t>(index) * 4u,
+                value) ||
+            !TryWriteGuestValue(
+                command + 16u +
+                    static_cast<std::uint64_t>(index) * 4u,
+                value)) {
+            result = 0;
+            return true;
+        }
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcDcbDrawIndexAuto(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    if (request.integer_arguments[2] != UINT32_C(0x40000000)) {
+        result = 0;
+        return true;
+    }
+    const std::uint32_t words[]{
+        AgcPm4(7, AgcItNop, AgcRDrawIndexAuto),
+        static_cast<std::uint32_t>(request.integer_arguments[1]),
+        0, 0, 0, 0, 0};
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 7, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcDcbSetBaseIndirectArgs(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto base_index =
+        static_cast<std::uint32_t>(request.integer_arguments[1]);
+    const auto address = request.integer_arguments[2];
+    const std::uint32_t words[]{
+        AgcPm4(4, AgcItSetBase, 0) | (base_index << 1u),
+        1,
+        static_cast<std::uint32_t>(address) & ~7u,
+        static_cast<std::uint32_t>(address >> 32u)};
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 4, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcDcbDispatchIndirect(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const auto modifier =
+        static_cast<std::uint32_t>(request.integer_arguments[2]);
+    const std::uint32_t words[]{
+        AgcPm4(3, AgcItDispatchIndirect, 0),
+        static_cast<std::uint32_t>(request.integer_arguments[1]),
+        (modifier & UINT32_C(0xa038)) | UINT32_C(0x41)};
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 3, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcDcbPopMarker(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    const std::uint32_t words[]{
+        AgcPm4(2, AgcItNop, AgcRPopMarker), 0};
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 2, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
+bool TryAgcDcbGetLodStats(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    std::uint64_t enable_raw{};
+    std::uint64_t counter_select_raw{};
+    if (!TryReadGuestValue(
+            request.guest_stack + 8u, enable_raw) ||
+        !TryReadGuestValue(
+            request.guest_stack + 16u, counter_select_raw)) {
+        result = 0;
+        return true;
+    }
+    const auto destination_address = request.integer_arguments[2];
+    const auto packet_control =
+        (static_cast<std::uint32_t>(
+             request.integer_arguments[1] & 3u) << 28u) |
+        (static_cast<std::uint32_t>(enable_raw & 1u) << 19u) |
+        (static_cast<std::uint32_t>(
+             request.integer_arguments[5] & 1u) << 18u) |
+        (static_cast<std::uint32_t>(
+             request.integer_arguments[4] & 0xffu) << 10u) |
+        (static_cast<std::uint32_t>(
+             counter_select_raw & 0xffu) << 2u);
+    const std::uint32_t words[]{
+        AgcPm4(5, AgcItGetLodStats, 0),
+        static_cast<std::uint32_t>(request.integer_arguments[3]),
+        static_cast<std::uint32_t>(destination_address) & ~0x3fu,
+        static_cast<std::uint32_t>(destination_address >> 32u),
+        packet_control};
+    std::uint64_t command{};
+    if (!TryAllocateAgcCommandDwords(
+            request.integer_arguments[0], 5, command) ||
+        !TryWriteGuestBytes(command, words, sizeof(words))) {
+        result = 0;
+        return true;
+    }
+    result = command;
+    return true;
+}
+
 struct AgcCpuVertex {
     float x{};
     float y{};
@@ -4075,34 +5726,450 @@ struct AgcCpuDecodedTexture {
     std::uint32_t height{};
     std::uint32_t format{};
     std::uint32_t tile_mode{};
-    std::vector<std::uint8_t> rgba;
+    std::uint64_t source_probe{};
+    std::uint64_t source_probe_serial{};
+    std::uint64_t signature{};
+    std::shared_ptr<std::vector<std::uint8_t>> rgba;
 };
+
+std::uint64_t AgcTextureSignature(
+    const std::vector<std::uint8_t>& rgba) {
+    std::uint64_t signature = UINT64_C(1469598103934665603);
+    const auto stride = std::max<std::size_t>(
+        rgba.size() / 8192u, 1u);
+    for (std::size_t offset = 0; offset < rgba.size();
+         offset += stride) {
+        signature ^= rgba[offset];
+        signature *= UINT64_C(1099511628211);
+    }
+    signature ^= rgba.size();
+    signature *= UINT64_C(1099511628211);
+    return signature;
+}
+
+bool TryResolveAgcTextureDescriptor(
+    AgcDiagnosticDraw& draw,
+    const std::span<const AgcDiagnosticDraw> preceding_draws) {
+    struct Candidate {
+        std::uint64_t address{};
+        std::uint32_t width{};
+        std::uint32_t height{};
+        std::uint32_t tile_mode{};
+        std::uint32_t format{};
+        std::uint64_t score{};
+    };
+    Candidate best{};
+    Candidate fallback{};
+    std::vector<std::uint64_t> tables;
+    tables.reserve(64u);
+    const auto append_table =
+        [&](const std::uint64_t address) {
+            if (address < UINT64_C(0x10000) ||
+                (address & 3u) != 0u ||
+                tables.size() >= 64u ||
+                std::ranges::contains(tables, address)) {
+                return;
+            }
+            tables.push_back(address);
+        };
+    const auto append_user_data =
+        [&](const auto& user_data) {
+            for (std::size_t word = 0;
+                 word + 1u < user_data.size(); ++word) {
+                append_table(
+                    static_cast<std::uint64_t>(user_data[word]) |
+                    (static_cast<std::uint64_t>(
+                         user_data[word + 1u] & UINT32_C(0xffff))
+                     << 32u));
+            }
+        };
+    append_user_data(draw.sh_ps_user_data);
+    append_user_data(draw.sh_export_user_data);
+    append_user_data(draw.sh_gs_user_data);
+    append_user_data(draw.sh_es_user_data);
+    append_user_data(draw.sh_vs_user_data);
+    if (draw.texture_address != 0u) {
+        append_table(draw.texture_address >> 8u);
+    }
+
+    constexpr std::size_t TableBytes = 0x400u;
+    std::array<std::uint32_t, TableBytes / sizeof(std::uint32_t)>
+        words{};
+    std::array<std::uint8_t, 4> source_probe{};
+    for (std::size_t table_index = 0;
+         table_index < tables.size() && table_index < 64u;
+         ++table_index) {
+        if (!TryReadGuestBytes(
+                tables[table_index], words.data(), sizeof(words))) {
+            continue;
+        }
+        for (std::size_t word = 0;
+             word + 3u < words.size(); ++word) {
+            const auto address =
+                ((static_cast<std::uint64_t>(
+                      words[word + 1u] & UINT32_C(0xff))
+                  << 32u) |
+                 words[word]) << 8u;
+            const auto width =
+                (((words[word + 1u] >> 30u) & 3u) |
+                 ((words[word + 2u] & UINT32_C(0x3fff)) << 2u)) +
+                1u;
+            const auto height =
+                ((words[word + 2u] >> 14u) & UINT32_C(0xffff)) +
+                1u;
+            const auto format =
+                (words[word + 1u] >> 20u) & UINT32_C(0x1ff);
+            const auto tile_mode =
+                (words[word + 3u] >> 20u) & UINT32_C(0x1f);
+            const bool supported_format =
+                format == UINT32_C(0x1) ||
+                format == UINT32_C(0x38) ||
+                format == UINT32_C(0xad) ||
+                format == UINT32_C(0xb5);
+            const bool supported_hdr_surface =
+                format == UINT32_C(0x47) &&
+                tile_mode == UINT32_C(27);
+            const auto preceding_target =
+                std::ranges::find_if(
+                    preceding_draws,
+                    [&](const AgcDiagnosticDraw& preceding) {
+                        return address ==
+                            preceding.render_target_address;
+                    });
+            const bool matches_preceding_target =
+                preceding_target != preceding_draws.end();
+            const bool plausible_dimensions =
+                (width == draw.render_target_width &&
+                 height == draw.render_target_height) ||
+                (width * 2u == draw.render_target_width &&
+                 height * 2u == draw.render_target_height) ||
+                (width == draw.render_target_width * 2u &&
+                 height == draw.render_target_height * 2u);
+            if (address != 0u &&
+                address != draw.render_target_address &&
+                width >= 16u && height >= 16u &&
+                width <= 8192u && height <= 8192u &&
+                plausible_dimensions &&
+                TryReadGuestBytes(
+                    address, source_probe.data(),
+                    source_probe.size())) {
+                auto fallback_score =
+                    static_cast<std::uint64_t>(width) * height;
+                fallback_score += UINT64_C(1) << 50u;
+                if (format != 0u) {
+                    fallback_score += UINT64_C(1) << 48u;
+                }
+                if (fallback_score > fallback.score) {
+                    fallback = {
+                        .address = address,
+                        .width = width,
+                        .height = height,
+                        .tile_mode = tile_mode,
+                        .format = format,
+                        .score = fallback_score};
+                }
+            }
+            if (address == 0u ||
+                address == draw.render_target_address ||
+                width < 16u || height < 16u ||
+                width > 8192u || height > 8192u ||
+                (!matches_preceding_target &&
+                 ((!supported_format && !supported_hdr_surface) ||
+                  (supported_format &&
+                   tile_mode != 0u && tile_mode != 5u) ||
+                  (supported_hdr_surface &&
+                   tile_mode != UINT32_C(27)) ||
+                  !TryReadGuestBytes(
+                      address, source_probe.data(),
+                      source_probe.size())))) {
+                continue;
+            }
+
+            std::uint64_t score =
+                static_cast<std::uint64_t>(width) * height;
+            if (width == draw.render_target_width &&
+                height == draw.render_target_height) {
+                score += UINT64_C(1) << 50u;
+            } else if (
+                width * 2u == draw.render_target_width &&
+                height * 2u == draw.render_target_height) {
+                score += UINT64_C(1) << 49u;
+            } else if (
+                width == draw.render_target_width * 2u &&
+                height == draw.render_target_height * 2u) {
+                score += UINT64_C(1) << 48u;
+            }
+            if (matches_preceding_target) {
+                score += UINT64_C(1) << 60u;
+                if (width == preceding_target->render_target_width &&
+                    height == preceding_target->render_target_height) {
+                    score += UINT64_C(1) << 55u;
+                }
+            }
+            if (score > best.score) {
+                best = {
+                    .address = address,
+                    .width = width,
+                    .height = height,
+                    .tile_mode = tile_mode,
+                    .format = format,
+                    .score = score};
+            }
+        }
+        for (std::size_t word = 0;
+             word + 1u < words.size(); ++word) {
+            append_table(
+                static_cast<std::uint64_t>(words[word]) |
+                (static_cast<std::uint64_t>(
+                     words[word + 1u] & UINT32_C(0xffff))
+                 << 32u));
+        }
+    }
+    if (best.score == 0u) {
+#ifdef __ANDROID__
+        if (fallback.score != 0u) {
+            static std::atomic<std::uint32_t> fallback_logs{};
+            if (fallback_logs.fetch_add(
+                    1u, std::memory_order_relaxed) < 8u) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "texture resolver fallback target=0x%llx/%ux%u "
+                    "texture=0x%llx/%ux%u/f%02x/t%u",
+                    static_cast<unsigned long long>(
+                        draw.render_target_address),
+                    draw.render_target_width,
+                    draw.render_target_height,
+                    static_cast<unsigned long long>(
+                        fallback.address),
+                    fallback.width, fallback.height,
+                    fallback.format, fallback.tile_mode);
+            }
+        }
+#endif
+        return false;
+    }
+    draw.texture_address = best.address;
+    draw.texture_width = best.width;
+    draw.texture_height = best.height;
+    draw.texture_tile_mode = best.tile_mode;
+    draw.texture_format = best.format;
+    return true;
+}
+
+bool TryAgcTextureSourceProbe(
+    const AgcDiagnosticDraw& draw,
+    std::uint64_t& signature) {
+    std::uint32_t element_width = draw.texture_width;
+    std::uint32_t element_height = draw.texture_height;
+    std::uint32_t element_bytes{};
+    if (draw.texture_format == UINT32_C(0x38)) {
+        element_bytes = 4u;
+    } else if (draw.texture_format == UINT32_C(0x1)) {
+        element_bytes = 1u;
+    } else if (draw.texture_format == UINT32_C(0xad) ||
+               draw.texture_format == UINT32_C(0xb5)) {
+        element_width = (element_width + 3u) / 4u;
+        element_height = (element_height + 3u) / 4u;
+        element_bytes = 16u;
+    } else {
+        return false;
+    }
+
+    std::uint64_t source_bytes{};
+    if (draw.texture_tile_mode == 0u) {
+        const auto row_bytes =
+            static_cast<std::uint64_t>(element_width) *
+            element_bytes;
+        source_bytes =
+            ((row_bytes + UINT64_C(255)) & ~UINT64_C(255)) *
+            element_height;
+    } else if (draw.texture_tile_mode == 5u) {
+        const auto block_extent =
+            element_bytes == 1u ? 64u
+            : element_bytes == 4u ? 32u
+                                  : 16u;
+        source_bytes =
+            ((static_cast<std::uint64_t>(element_width) +
+              block_extent - 1u) /
+             block_extent) *
+            ((static_cast<std::uint64_t>(element_height) +
+              block_extent - 1u) /
+             block_extent) *
+            UINT64_C(4096);
+    } else {
+        return false;
+    }
+    if (source_bytes == 0u) {
+        return false;
+    }
+
+    // GameMaker reuses the same GPU allocation for unrelated texture pages
+    // across rooms. Sparse probes can miss those atlas updates completely,
+    // leaving menu/title data visible in gameplay. Hash the whole source,
+    // but only periodically at the cache call site below.
+    constexpr std::size_t ProbeBytes = 64u * 1024u;
+    static thread_local std::vector<std::uint8_t> sample;
+    sample.resize(static_cast<std::size_t>(
+        std::min<std::uint64_t>(ProbeBytes, source_bytes)));
+    signature = UINT64_C(1469598103934665603);
+    for (std::uint64_t offset = 0u; offset < source_bytes;) {
+        const auto byte_count = static_cast<std::size_t>(
+            std::min<std::uint64_t>(
+                sample.size(), source_bytes - offset));
+        if (!TryReadGuestBytes(
+                draw.texture_address + offset,
+                sample.data(), byte_count)) {
+            return false;
+        }
+        for (std::size_t index = 0; index < byte_count; ++index) {
+            signature ^= sample[index];
+            signature *= UINT64_C(1099511628211);
+        }
+        signature ^= offset;
+        signature *= UINT64_C(1099511628211);
+        offset += byte_count;
+    }
+    return true;
+}
+
+class AgcCpuRowWorkerPool {
+public:
+    AgcCpuRowWorkerPool() {
+        constexpr std::size_t WorkerCount = 5u;
+        workers_.reserve(WorkerCount);
+        for (std::size_t index = 0; index < WorkerCount; ++index) {
+            workers_.emplace_back([this]() { WorkerMain(); });
+        }
+    }
+
+    ~AgcCpuRowWorkerPool() {
+        {
+            const std::lock_guard lock{mutex_};
+            stopping_ = true;
+            ++generation_;
+        }
+        start_.notify_all();
+        for (auto& worker : workers_) {
+            worker.join();
+        }
+    }
+
+    void Run(const int first_row,
+             const int last_row,
+             std::function<void(int)> work) {
+        {
+            const std::lock_guard lock{mutex_};
+            work_ = std::move(work);
+            next_row_.store(first_row, std::memory_order_relaxed);
+            end_row_ = last_row + 1;
+            active_workers_ = workers_.size();
+            ++generation_;
+        }
+        start_.notify_all();
+        RunAvailableRows();
+        std::unique_lock lock{mutex_};
+        finished_.wait(lock, [&]() { return active_workers_ == 0u; });
+        work_ = {};
+    }
+
+private:
+    void RunAvailableRows() {
+        for (;;) {
+            const auto row =
+                next_row_.fetch_add(1, std::memory_order_relaxed);
+            if (row >= end_row_) {
+                return;
+            }
+            work_(row);
+        }
+    }
+
+    void WorkerMain() {
+        std::uint64_t observed_generation{};
+        for (;;) {
+            {
+                std::unique_lock lock{mutex_};
+                start_.wait(lock, [&]() {
+                    return stopping_ ||
+                        generation_ != observed_generation;
+                });
+                if (stopping_) {
+                    return;
+                }
+                observed_generation = generation_;
+            }
+            RunAvailableRows();
+            {
+                const std::lock_guard lock{mutex_};
+                if (--active_workers_ == 0u) {
+                    finished_.notify_one();
+                }
+            }
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable start_;
+    std::condition_variable finished_;
+    std::vector<std::thread> workers_;
+    std::function<void(int)> work_;
+    std::atomic<int> next_row_{};
+    int end_row_{};
+    std::size_t active_workers_{};
+    std::uint64_t generation_{};
+    bool stopping_{};
+};
+
+void RunAgcCpuRows(const int first_row,
+                   const int last_row,
+                   const std::uint64_t candidate_pixels,
+                   std::function<void(int)> work) {
+    if (last_row - first_row < 7 ||
+        candidate_pixels < 1024u) {
+        for (auto row = first_row; row <= last_row; ++row) {
+            work(row);
+        }
+        return;
+    }
+    static AgcCpuRowWorkerPool pool;
+    pool.Run(first_row, last_row, std::move(work));
+}
 
 bool TryReadAgcCpuVertexBuffer(
     const AgcDiagnosticDraw& draw,
     const std::vector<std::uint32_t>& indices,
     std::vector<std::uint8_t>& vertices,
     std::uint64_t& vertex_address,
-    std::uint32_t& vertex_stride) {
+    std::uint32_t& vertex_stride,
+    std::uint64_t& descriptor_table_address,
+    bool& game_maker_vertex_group) {
     const auto vertex_count =
         indices.empty()
         ? 0u
         : *std::ranges::max_element(indices) + 1u;
     vertex_address = 0;
     vertex_stride = 0;
+    descriptor_table_address = 0;
+    game_maker_vertex_group = false;
     if (vertex_count == 0 || vertex_count > 65536u ||
         draw.sh_es_program_hi != 0 ||
         (draw.sh_es_program_lo & UINT32_C(0xff000000)) !=
             UINT32_C(0x20000000)) {
         return false;
     }
-    const std::array<std::uint64_t, 2> legacy_srt_addresses{
+    const std::array<std::uint64_t, 4> legacy_srt_addresses{
+        (static_cast<std::uint64_t>(
+             draw.sh_export_user_data[1] & 0xffu) << 32u) |
+            draw.sh_export_user_data[0],
         (static_cast<std::uint64_t>(
              draw.sh_gs_user_data[1] & 0xffu) << 32u) |
             draw.sh_gs_user_data[0],
         (static_cast<std::uint64_t>(
              draw.sh_es_user_data[1] & 0xffu) << 32u) |
-            draw.sh_es_user_data[0]};
+            draw.sh_es_user_data[0],
+        (static_cast<std::uint64_t>(
+             draw.sh_vs_user_data[1] & 0xffu) << 32u) |
+            draw.sh_vs_user_data[0]};
     std::array<std::uint32_t, 4> last_descriptor{};
     std::uint64_t used_srt_address{};
     std::uint64_t used_descriptor_offset{};
@@ -4117,6 +6184,12 @@ bool TryReadAgcCpuVertexBuffer(
     std::array<float, 4> rejected_vertex_values{};
     const auto shader_suffix =
         draw.sh_es_program_lo & UINT32_C(0xfff);
+    const auto pixel_shader_suffix =
+        draw.sh_ps_program_lo & UINT32_C(0xfff);
+    const auto game_maker_shader =
+        pixel_shader_suffix == UINT32_C(0xf13) ||
+        pixel_shader_suffix == UINT32_C(0x311) ||
+        pixel_shader_suffix == UINT32_C(0x459);
     const auto unity_c40_shader =
         shader_suffix == UINT32_C(0xc40);
     const auto unity_aee_shader =
@@ -4148,6 +6221,65 @@ bool TryReadAgcCpuVertexBuffer(
             const auto candidate_elements = descriptor[2];
             const auto candidate_unified_format =
                 (descriptor[3] >> 12u) & 0x7fu;
+            bool interleaved_float2_pair{};
+            bool stride24_sprite_group{};
+            if (!unity_ui_shader &&
+                candidate_stride == 16u &&
+                candidate_unified_format == 64u &&
+                descriptor_offset + 32u <= UINT64_C(0x400)) {
+                std::array<std::uint32_t, 4> sibling{};
+                if (TryReadGuestBytes(
+                        srt_address + descriptor_offset + 16u,
+                        sibling.data(), sizeof(sibling))) {
+                    const auto sibling_address =
+                        sibling[0] |
+                        (static_cast<std::uint64_t>(
+                             sibling[1] & 0xffffu) << 32u);
+                    const auto sibling_stride =
+                        (sibling[1] >> 16u) & 0x3fffu;
+                    const auto sibling_format =
+                        (sibling[3] >> 12u) & 0x7fu;
+                    interleaved_float2_pair =
+                        sibling_address == candidate_address + 8u &&
+                        sibling_stride == candidate_stride &&
+                        sibling[2] == candidate_elements &&
+                        sibling_format == candidate_unified_format;
+                }
+            }
+            if (candidate_stride == 24u &&
+                candidate_unified_format == 74u &&
+                descriptor_offset + 48u <= UINT64_C(0x400)) {
+                std::array<std::uint32_t, 8> siblings{};
+                if (TryReadGuestBytes(
+                        srt_address + descriptor_offset + 16u,
+                        siblings.data(), sizeof(siblings))) {
+                    const auto color_address =
+                        siblings[0] |
+                        (static_cast<std::uint64_t>(
+                             siblings[1] & 0xffffu) << 32u);
+                    const auto uv_address =
+                        siblings[4] |
+                        (static_cast<std::uint64_t>(
+                             siblings[5] & 0xffffu) << 32u);
+                    const auto color_stride =
+                        (siblings[1] >> 16u) & 0x3fffu;
+                    const auto uv_stride =
+                        (siblings[5] >> 16u) & 0x3fffu;
+                    const auto color_format =
+                        (siblings[3] >> 12u) & 0x7fu;
+                    const auto uv_format =
+                        (siblings[7] >> 12u) & 0x7fu;
+                    stride24_sprite_group =
+                        color_address == candidate_address + 12u &&
+                        uv_address == candidate_address + 16u &&
+                        color_stride == candidate_stride &&
+                        uv_stride == candidate_stride &&
+                        siblings[2] == candidate_elements &&
+                        siblings[6] == candidate_elements &&
+                        color_format == 22u &&
+                        uv_format == 64u;
+                }
+            }
             bool has_unity_vertex_group =
                 !unity_ui_shader ||
                 (unity_aee_shader &&
@@ -4194,6 +6326,7 @@ bool TryReadAgcCpuVertexBuffer(
                 return false;
             }
             if (candidate_stride != 24u &&
+                !interleaved_float2_pair &&
                 !(unity_c40_shader &&
                   candidate_stride == 16u) &&
                 !(unity_aee_shader &&
@@ -4206,7 +6339,15 @@ bool TryReadAgcCpuVertexBuffer(
                 descriptor_reject_stage = 4u;
                 return false;
             }
+            if (game_maker_shader &&
+                !stride24_sprite_group) {
+                descriptor_reject_stage = 6u;
+                return false;
+            }
             if (candidate_unified_format != 74u &&
+                !(interleaved_float2_pair &&
+                  candidate_unified_format == 64u) &&
+                !stride24_sprite_group &&
                 !(unity_aee_shader &&
                   candidate_unified_format == 77u)) {
                 descriptor_reject_stage = 5u;
@@ -4231,6 +6372,45 @@ bool TryReadAgcCpuVertexBuffer(
                 descriptor_reject_stage = 8u;
                 return false;
             }
+#ifdef __ANDROID__
+            if (game_maker_shader &&
+                draw.texture_width == 64u &&
+                draw.texture_height == 128u) {
+                static std::atomic<std::uint32_t>
+                    game_maker_descriptor_probe_logs{};
+                if (game_maker_descriptor_probe_logs.fetch_add(
+                        1u, std::memory_order_relaxed) < 40u) {
+                    float values[6]{};
+                    for (std::size_t word = 0; word < 6u &&
+                         word * sizeof(float) + sizeof(float) <=
+                             probe.size(); ++word) {
+                        std::memcpy(
+                            values + word,
+                            probe.data() + word * sizeof(float),
+                            sizeof(float));
+                    }
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5",
+                        "gm descriptor probe srt=0x%llx off=0x%llx "
+                        "desc=%08x,%08x,%08x,%08x "
+                        "address=0x%llx stride=%u elements=%u "
+                        "format=%u group=%u values="
+                        "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
+                        static_cast<unsigned long long>(srt_address),
+                        static_cast<unsigned long long>(
+                            descriptor_offset),
+                        descriptor[0], descriptor[1],
+                        descriptor[2], descriptor[3],
+                        static_cast<unsigned long long>(
+                            candidate_address),
+                        candidate_stride, candidate_elements,
+                        candidate_unified_format,
+                        stride24_sprite_group ? 1u : 0u,
+                        values[0], values[1], values[2],
+                        values[3], values[4], values[5]);
+                }
+            }
+#endif
             const auto read_float =
                 [&](const std::uint32_t index,
                     const std::uint32_t byte_offset) {
@@ -4245,13 +6425,13 @@ bool TryReadAgcCpuVertexBuffer(
                     return value;
                 };
             const auto position_limit_x =
-                unity_world_sprite_shader
+                (unity_world_sprite_shader || game_maker_shader)
                 ? 10000000.0f
                 : static_cast<float>(
                       std::max(draw.render_target_width, 1920u)) *
                       2.0f;
             const auto position_limit_y =
-                unity_world_sprite_shader
+                (unity_world_sprite_shader || game_maker_shader)
                 ? 10000000.0f
                 : static_cast<float>(
                       std::max(draw.render_target_height, 1080u)) *
@@ -4277,7 +6457,9 @@ bool TryReadAgcCpuVertexBuffer(
                     v = read_float(index, 68u);
                 } else {
                     const auto uv_offset =
-                        candidate_stride == 36u ? 28u : 16u;
+                        interleaved_float2_pair
+                            ? 8u
+                            : (candidate_stride == 36u ? 28u : 16u);
                     u = read_float(index, uv_offset);
                     v = read_float(index, uv_offset + 4u);
                 }
@@ -4287,8 +6469,10 @@ bool TryReadAgcCpuVertexBuffer(
                     x > position_limit_x ||
                     y < -position_limit_y ||
                     y > position_limit_y ||
-                    std::abs(u) > 16.0f ||
-                    std::abs(v) > 16.0f) {
+                    std::abs(u) >
+                        (game_maker_shader ? 65536.0f : 16.0f) ||
+                    std::abs(v) >
+                        (game_maker_shader ? 65536.0f : 16.0f)) {
                     descriptor_reject_stage = 9u;
                     rejected_vertex_index = index;
                     rejected_vertex_values = {x, y, u, v};
@@ -4340,10 +6524,34 @@ bool TryReadAgcCpuVertexBuffer(
             }
             best_score = score;
             vertex_address = candidate_address;
-            vertex_stride = candidate_stride;
-            vertices = std::move(probe);
+            if (interleaved_float2_pair) {
+                constexpr std::uint32_t canonical_stride = 24u;
+                vertices.assign(
+                    static_cast<std::size_t>(vertex_count) *
+                        canonical_stride,
+                    0u);
+                for (std::uint32_t index = 0;
+                     index < vertex_count; ++index) {
+                    const auto* const source =
+                        probe.data() +
+                        static_cast<std::size_t>(index) *
+                            candidate_stride;
+                    auto* const destination =
+                        vertices.data() +
+                        static_cast<std::size_t>(index) *
+                            canonical_stride;
+                    std::memcpy(destination, source, 8u);
+                    std::memset(destination + 12u, 0xff, 4u);
+                    std::memcpy(destination + 16u, source + 8u, 8u);
+                }
+                vertex_stride = canonical_stride;
+            } else {
+                vertex_stride = candidate_stride;
+                vertices = std::move(probe);
+            }
             used_srt_address = srt_address;
             used_descriptor_offset = descriptor_offset;
+            game_maker_vertex_group = stride24_sprite_group;
             return true;
         };
     if (unity_aee_shader) {
@@ -4553,23 +6761,98 @@ bool TryReadAgcCpuVertexBuffer(
 #endif
         }
     } else {
-        for (const auto srt_address : legacy_srt_addresses) {
-            if (srt_address == 0) {
-                continue;
+        const auto scan_descriptor_table =
+            [&](const std::uint64_t table_address) {
+                if (table_address == 0) {
+                    return false;
+                }
+                for (const auto descriptor_offset :
+                     {UINT64_C(0x180), UINT64_C(0x80)}) {
+                    if (try_descriptor(
+                            table_address, descriptor_offset)) {
+                        return true;
+                    }
+                }
+                for (std::uint64_t descriptor_offset = 0;
+                     descriptor_offset < UINT64_C(0x200);
+                     descriptor_offset += 4u) {
+                    if (descriptor_offset == UINT64_C(0x180) ||
+                        descriptor_offset == UINT64_C(0x80)) {
+                        continue;
+                    }
+                    if (try_descriptor(
+                            table_address, descriptor_offset)) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+        bool resolved{};
+        if (game_maker_shader) {
+            std::vector<std::uint64_t> table_addresses;
+            const auto append_user_data_addresses =
+                [&](const auto& user_data) {
+                    for (std::size_t word = 0;
+                         word + 1u < user_data.size(); ++word) {
+                        const auto address =
+                            (static_cast<std::uint64_t>(
+                                 user_data[word + 1u] & 0xffu)
+                             << 32u) |
+                            user_data[word];
+                        if (address != 0 &&
+                            !std::ranges::contains(
+                                table_addresses, address)) {
+                            table_addresses.push_back(address);
+                        }
+                    }
+                };
+            append_user_data_addresses(
+                draw.sh_export_user_data);
+            append_user_data_addresses(draw.sh_gs_user_data);
+            append_user_data_addresses(draw.sh_es_user_data);
+            append_user_data_addresses(draw.sh_vs_user_data);
+            for (const auto table_address : table_addresses) {
+                if (scan_descriptor_table(table_address)) {
+                    resolved = true;
+                    break;
+                }
             }
-        for (const auto descriptor_offset :
-             {UINT64_C(0x180), UINT64_C(0x80)}) {
-            (void)try_descriptor(srt_address, descriptor_offset);
-        }
-        for (std::uint64_t descriptor_offset = 0;
-             descriptor_offset < UINT64_C(0x200);
-             descriptor_offset += 4u) {
-            if (descriptor_offset == UINT64_C(0x180) ||
-                descriptor_offset == UINT64_C(0x80)) {
-                continue;
+            if (!resolved) {
+                const auto direct_addresses = table_addresses;
+                for (const auto source_address :
+                     direct_addresses) {
+                    std::array<std::uint32_t, 64> pointers{};
+                    if (!TryReadGuestBytes(
+                            source_address, pointers.data(),
+                            sizeof(pointers))) {
+                        continue;
+                    }
+                    for (std::size_t word = 0;
+                         word + 1u < pointers.size(); ++word) {
+                        const auto nested_address =
+                            (static_cast<std::uint64_t>(
+                                 pointers[word + 1u] & 0xffu)
+                             << 32u) |
+                            pointers[word];
+                        if (scan_descriptor_table(
+                                nested_address)) {
+                            resolved = true;
+                            break;
+                        }
+                    }
+                    if (resolved) {
+                        break;
+                    }
+                }
             }
-            (void)try_descriptor(srt_address, descriptor_offset);
-        }
+        } else {
+            for (const auto srt_address :
+                 legacy_srt_addresses) {
+                if (scan_descriptor_table(srt_address)) {
+                    resolved = true;
+                    break;
+                }
+            }
         }
     }
     if (vertex_address == 0 || vertex_stride == 0 ||
@@ -4577,6 +6860,40 @@ bool TryReadAgcCpuVertexBuffer(
             std::numeric_limits<std::size_t>::max() /
                 vertex_stride) {
 #ifdef __ANDROID__
+        if (game_maker_shader) {
+            static std::atomic<std::uint32_t>
+                game_maker_vertex_logs{};
+            if (game_maker_vertex_logs.fetch_add(
+                    1u, std::memory_order_relaxed) < 4u) {
+                std::array<std::uint32_t, 16> probe{};
+                (void)TryReadGuestBytes(
+                    legacy_srt_addresses[0],
+                    probe.data(), sizeof(probe));
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "cpu gm vertex miss srt=0x%llx "
+                    "gs=%08x,%08x,%08x,%08x "
+                    "es=%08x,%08x,%08x,%08x "
+                    "probe=%08x,%08x,%08x,%08x,"
+                    "%08x,%08x,%08x,%08x,"
+                    "%08x,%08x,%08x,%08x,"
+                    "%08x,%08x,%08x,%08x",
+                    static_cast<unsigned long long>(
+                        legacy_srt_addresses[0]),
+                    draw.sh_gs_user_data[0],
+                    draw.sh_gs_user_data[1],
+                    draw.sh_gs_user_data[2],
+                    draw.sh_gs_user_data[3],
+                    draw.sh_es_user_data[0],
+                    draw.sh_es_user_data[1],
+                    draw.sh_es_user_data[2],
+                    draw.sh_es_user_data[3],
+                    probe[0], probe[1], probe[2], probe[3],
+                    probe[4], probe[5], probe[6], probe[7],
+                    probe[8], probe[9], probe[10], probe[11],
+                    probe[12], probe[13], probe[14], probe[15]);
+            }
+        }
         static std::atomic<std::uint32_t> descriptor_failure_logs{};
         const auto log_index = descriptor_failure_logs.fetch_add(
             1u, std::memory_order_relaxed);
@@ -4633,6 +6950,7 @@ bool TryReadAgcCpuVertexBuffer(
         }
     }
 #endif
+    descriptor_table_address = used_srt_address;
     return true;
 }
 
@@ -4656,8 +6974,126 @@ bool TryReadAgcCpuTextureElements(
         static_cast<std::size_t>(element_count) *
         element_bytes);
     if (draw.texture_tile_mode == 0u) {
-        return TryReadGuestBytes(
-            draw.texture_address, linear.data(), linear.size());
+        const auto row_bytes =
+            static_cast<std::uint64_t>(element_width) *
+            element_bytes;
+        const auto pitch_bytes =
+            (row_bytes + UINT64_C(255)) & ~UINT64_C(255);
+        if (pitch_bytes == row_bytes) {
+            return TryReadGuestBytes(
+                draw.texture_address, linear.data(), linear.size());
+        }
+        if (pitch_bytes >
+            std::numeric_limits<std::size_t>::max() /
+                element_height) {
+            return false;
+        }
+        std::vector<std::uint8_t> pitched(
+            static_cast<std::size_t>(pitch_bytes) *
+            element_height);
+        if (!TryReadGuestBytes(
+                draw.texture_address, pitched.data(),
+                pitched.size())) {
+            return false;
+        }
+        for (std::uint32_t row = 0; row < element_height; ++row) {
+            std::memcpy(
+                linear.data() +
+                    static_cast<std::size_t>(row * row_bytes),
+                pitched.data() +
+                    static_cast<std::size_t>(row * pitch_bytes),
+                static_cast<std::size_t>(row_bytes));
+        }
+        return true;
+    }
+    if (draw.texture_tile_mode == UINT32_C(27) &&
+        element_bytes == 8u) {
+        constexpr std::uint32_t BlockWidth = 128u;
+        constexpr std::uint32_t BlockHeight = 64u;
+        constexpr std::uint64_t BlockBytes = UINT64_C(65536);
+        constexpr std::array<std::uint32_t, 16> XMask{
+            0u, 0u, 0u, 1u << 0u,
+            0u, 1u << 1u, 1u << 2u, 0u,
+            1u << 7u, 1u << 4u, 1u << 6u, 1u << 5u,
+            0u, 1u << 3u, 1u << 7u, 1u << 6u};
+        constexpr std::array<std::uint32_t, 16> YMask{
+            0u, 0u, 0u, 0u,
+            1u << 0u, 0u, 0u, 1u << 1u,
+            (1u << 4u) | (1u << 7u), 1u << 4u,
+            1u << 5u, 1u << 6u,
+            1u << 2u, 0u, 1u << 3u, 1u << 6u};
+        const auto blocks_wide =
+            (static_cast<std::uint64_t>(element_width) +
+             BlockWidth - 1u) /
+            BlockWidth;
+        const auto blocks_high =
+            (static_cast<std::uint64_t>(element_height) +
+             BlockHeight - 1u) /
+            BlockHeight;
+        if (blocks_wide == 0u || blocks_high == 0u ||
+            blocks_wide >
+                std::numeric_limits<std::size_t>::max() /
+                    blocks_high ||
+            blocks_wide * blocks_high >
+                std::numeric_limits<std::size_t>::max() /
+                    BlockBytes) {
+            return false;
+        }
+        static thread_local std::vector<std::uint8_t> tiled;
+        tiled.resize(static_cast<std::size_t>(
+            blocks_wide * blocks_high * BlockBytes));
+        if (!TryReadGuestBytes(
+                draw.texture_address, tiled.data(), tiled.size())) {
+            return false;
+        }
+        const auto axis_term =
+            [](const std::uint32_t coordinate,
+               const auto& masks) {
+                std::uint32_t offset{};
+                for (std::uint32_t bit = 0u; bit < 16u; ++bit) {
+                    offset |=
+                        (static_cast<std::uint32_t>(
+                             __builtin_popcount(
+                                 coordinate & masks[bit])) &
+                         1u)
+                        << bit;
+                }
+                return offset;
+            };
+        std::vector<std::uint32_t> x_terms(element_width);
+        std::vector<std::uint32_t> y_terms(element_height);
+        for (std::uint32_t x = 0u; x < element_width; ++x) {
+            x_terms[x] = axis_term(x, XMask);
+        }
+        for (std::uint32_t y = 0u; y < element_height; ++y) {
+            y_terms[y] = axis_term(y, YMask);
+        }
+        for (std::uint32_t y = 0u; y < element_height; ++y) {
+            const auto block_y = y / BlockHeight;
+            for (std::uint32_t x = 0u; x < element_width; ++x) {
+                const auto block_x = x / BlockWidth;
+                const auto block_index =
+                    static_cast<std::uint64_t>(block_y) *
+                        blocks_wide +
+                    block_x;
+                const auto source =
+                    block_index * BlockBytes +
+                    (x_terms[x] ^ y_terms[y]);
+                const auto destination =
+                    (static_cast<std::size_t>(y) *
+                         element_width +
+                     x) *
+                    element_bytes;
+                if (source + element_bytes <= tiled.size()) {
+                    std::memcpy(
+                        linear.data() + destination,
+                        tiled.data() +
+                            static_cast<std::size_t>(source),
+                        element_bytes);
+                }
+            }
+        }
+        return true;
     }
     if (draw.texture_tile_mode != 5u ||
         (element_bytes != 1u &&
@@ -4861,6 +7297,83 @@ bool TryReadAgcCpuTextureRgba(
         return false;
     }
     rgba.assign(static_cast<std::size_t>(pixel_count) * 4u, 0u);
+    if (draw.texture_format == UINT32_C(0x47)) {
+        std::vector<std::uint8_t> half_rgba;
+        if (!TryReadAgcCpuTextureElements(
+                draw, draw.texture_width, draw.texture_height,
+                8u, half_rgba)) {
+            return false;
+        }
+        const auto half_to_float =
+            [](const std::uint16_t half) {
+                const auto sign =
+                    static_cast<std::uint32_t>(half & 0x8000u)
+                    << 16u;
+                auto exponent =
+                    static_cast<std::uint32_t>(
+                        (half >> 10u) & 0x1fu);
+                auto mantissa =
+                    static_cast<std::uint32_t>(half & 0x3ffu);
+                std::uint32_t bits{};
+                if (exponent == 0u) {
+                    if (mantissa == 0u) {
+                        bits = sign;
+                    } else {
+                        std::int32_t unbiased = -14;
+                        while ((mantissa & 0x400u) == 0u) {
+                            mantissa <<= 1u;
+                            --unbiased;
+                        }
+                        mantissa &= 0x3ffu;
+                        bits = sign |
+                            (static_cast<std::uint32_t>(
+                                 unbiased + 127)
+                             << 23u) |
+                            (mantissa << 13u);
+                    }
+                } else if (exponent == 0x1fu) {
+                    bits = sign | UINT32_C(0x7f800000) |
+                        (mantissa << 13u);
+                } else {
+                    bits = sign |
+                        ((exponent + 112u) << 23u) |
+                        (mantissa << 13u);
+                }
+                float value{};
+                std::memcpy(&value, &bits, sizeof(value));
+                return value;
+            };
+        for (std::size_t pixel = 0u;
+             pixel < static_cast<std::size_t>(pixel_count);
+             ++pixel) {
+            for (std::size_t channel = 0u; channel < 4u;
+                 ++channel) {
+                std::uint16_t half{};
+                std::memcpy(
+                    &half,
+                    half_rgba.data() + pixel * 8u + channel * 2u,
+                    sizeof(half));
+                auto value = half_to_float(half);
+                if (!std::isfinite(value)) {
+                    value = 0.0f;
+                }
+                value = std::clamp(value, 0.0f, 1.0f);
+                if (channel != 3u) {
+                    value = value <= 0.0031308f
+                        ? value * 12.92f
+                        : 1.055f *
+                              std::pow(value, 1.0f / 2.4f) -
+                              0.055f;
+                }
+                rgba[pixel * 4u + channel] =
+                    static_cast<std::uint8_t>(
+                        std::clamp(
+                            value * 255.0f + 0.5f,
+                            0.0f, 255.0f));
+            }
+        }
+        return true;
+    }
     if (draw.texture_format == UINT32_C(0x38)) {
         return TryReadAgcCpuTextureElements(
             draw, draw.texture_width, draw.texture_height,
@@ -4949,30 +7462,128 @@ bool TryReadAgcCpuTextureRgba(
     return false;
 }
 
+bool TryReadGameMakerTransform(
+    const AgcDiagnosticDraw& draw,
+    std::uint64_t descriptor_table_address,
+    std::array<float, 32>& transform,
+    std::uint64_t& transform_address);
+
 bool TryCompositeAgcCpuDraw(
     const AgcDiagnosticDraw& draw,
     AgcCpuFrame& frame,
     const std::size_t draw_ordinal,
     const bool ignore_black_rgb_tint,
-    std::vector<AgcCpuDecodedTexture>& texture_cache) {
+    std::vector<AgcCpuDecodedTexture>& texture_cache,
+    std::vector<Lsx4::Ps5Desktop::VulkanGuestPass>* const gpu_passes,
+    const bool target_source = false,
+    const std::uint64_t texture_probe_serial = 0u) {
     constexpr std::uint32_t FrameWidth = AgcCpuFrameWidth;
     constexpr std::uint32_t FrameHeight = AgcCpuFrameHeight;
+    static std::atomic<std::uint64_t> next_batch_id{1u};
+    const auto game_maker_fill =
+        draw.draw_count == 6u &&
+        (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
+            UINT32_C(0xf13);
+    const auto game_maker_sprite =
+        (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
+            UINT32_C(0x311);
+    const auto game_maker_solid =
+        game_maker_fill &&
+        draw.texture_address != 0 &&
+        draw.texture_width == 5u &&
+        draw.texture_height == 1u &&
+        draw.texture_tile_mode == 0u;
+    const auto is_clear_packet =
+        draw.draw_count == 3u &&
+        draw.texture_address != 0 &&
+        draw.texture_width == 5u &&
+        draw.texture_height == 1u &&
+        draw.texture_tile_mode == 0u;
+    if (is_clear_packet) {
+        std::array<float, 4> clear{};
+        const auto clear_address = draw.texture_address >> 8u;
+        if (!TryReadGuestBytes(
+                clear_address, clear.data(), sizeof(clear)) ||
+            !std::ranges::all_of(
+                clear, [](const float value) {
+                    return std::isfinite(value) &&
+                        value >= 0.0f && value <= 1.0f;
+                })) {
+            return false;
+        }
+        std::array<std::uint8_t, 4> rgba{};
+        for (std::size_t channel = 0; channel < rgba.size();
+             ++channel) {
+            rgba[channel] = static_cast<std::uint8_t>(
+                std::clamp(
+                    clear[channel] * 255.0f + 0.5f,
+                    0.0f, 255.0f));
+        }
+        if (frame.gpu_frame == nullptr) {
+            frame.gpu_frame = std::make_shared<
+                Lsx4::Ps5Desktop::VulkanGuestFrame>();
+        }
+        frame.gpu_frame->batch_id =
+            next_batch_id.fetch_add(1u, std::memory_order_relaxed);
+        frame.gpu_frame->base_batch_id = 0u;
+        frame.gpu_frame->target_key =
+            draw.render_target_address;
+        frame.gpu_frame->first_new_draw = 0u;
+        frame.gpu_frame->preserve_target = false;
+        frame.gpu_frame->clear_target = true;
+        frame.gpu_frame->width = FrameWidth;
+        frame.gpu_frame->height = FrameHeight;
+        std::memcpy(
+            &frame.gpu_frame->clear_rgba,
+            rgba.data(), sizeof(frame.gpu_frame->clear_rgba));
+        frame.gpu_frame->draws.clear();
+        if (gpu_passes != nullptr) {
+            gpu_passes->push_back({
+                .target_key = draw.render_target_address,
+                .clear_rgba = frame.gpu_frame->clear_rgba,
+                .clear_target = true});
+        }
+        frame.width = FrameWidth;
+        frame.height = FrameHeight;
+        frame.rgba.clear();
+        frame.rendered_draws = 1u;
+        frame.covered_pixels =
+            static_cast<std::uint64_t>(FrameWidth) * FrameHeight;
+        if (draw_ordinal < 64u) {
+            const auto bit = UINT64_C(1) << draw_ordinal;
+            frame.eligible_draw_mask |= bit;
+            frame.rendered_draw_mask |= bit;
+            frame.draw_coverage[draw_ordinal] =
+                frame.covered_pixels;
+        }
+        return true;
+    }
     if (draw.texture_address == 0 ||
-        draw.texture_width < 16u || draw.texture_height < 16u ||
-        draw.texture_width > 4096u ||
-        draw.texture_height > 4096u ||
-        (draw.texture_tile_mode != 0u &&
-         draw.texture_tile_mode != 5u) ||
-         (draw.texture_format != UINT32_C(0x1) &&
-          draw.texture_format != UINT32_C(0x38) &&
-          draw.texture_format != UINT32_C(0xad) &&
-          draw.texture_format != UINT32_C(0xb5)) ||
+        (!game_maker_solid && !target_source &&
+         (draw.texture_width < 16u ||
+          draw.texture_height < 16u ||
+          draw.texture_width > 4096u ||
+          draw.texture_height > 4096u ||
+          !(((draw.texture_tile_mode == 0u ||
+              draw.texture_tile_mode == 5u) &&
+             (draw.texture_format == UINT32_C(0x1) ||
+              draw.texture_format == UINT32_C(0x38) ||
+              draw.texture_format == UINT32_C(0xad) ||
+              draw.texture_format == UINT32_C(0xb5))) ||
+            (draw.texture_tile_mode == UINT32_C(27) &&
+             draw.texture_format == UINT32_C(0x47))))) ||
         draw.sh_ps_program_hi != 0u ||
         (draw.sh_ps_program_lo & UINT32_C(0xff000000)) !=
             UINT32_C(0x20000000) ||
-        draw.index_buffer_address == 0 ||
+        (draw.index_buffer_address == 0 &&
+         draw.draw_count != 3u &&
+         draw.draw_count != 6u &&
+         !((draw.primitive_type == UINT32_C(0x6) ||
+            draw.primitive_type == UINT32_C(0x11)) &&
+           draw.draw_count == 4u)) ||
         draw.draw_count < 3u || draw.draw_count > 65536u ||
-        (draw.index_size != 0u && draw.index_size != 1u)) {
+        (draw.index_buffer_address != 0u &&
+         draw.index_size != 0u && draw.index_size != 1u)) {
         return false;
     }
     if (draw_ordinal < 64u) {
@@ -5013,9 +7624,19 @@ bool TryCompositeAgcCpuDraw(
         static_cast<std::uint64_t>(draw.index_offset) *
             index_bytes;
     static thread_local std::vector<std::uint8_t> raw_indices;
+    const bool synthetic_strip =
+        draw.index_buffer_address == 0u &&
+        (draw.primitive_type == UINT32_C(0x6) ||
+         draw.primitive_type == UINT32_C(0x11)) &&
+        draw.draw_count == 4u;
+    const bool synthetic_indices =
+        draw.index_buffer_address == 0u &&
+        (draw.draw_count == 3u || draw.draw_count == 6u ||
+         synthetic_strip);
     raw_indices.resize(
         static_cast<std::size_t>(draw.draw_count) * index_bytes);
-    if (!TryReadGuestBytes(
+    if (!synthetic_indices &&
+        !TryReadGuestBytes(
             index_address, raw_indices.data(),
             raw_indices.size())) {
 #ifdef __ANDROID__
@@ -5028,7 +7649,14 @@ bool TryCompositeAgcCpuDraw(
     std::uint32_t maximum_index{};
     for (std::uint32_t index = 0; index < draw.draw_count;
          ++index) {
-        if (draw.index_size == 1u) {
+        if (synthetic_indices) {
+            constexpr std::array<std::uint32_t, 6> QuadIndices{
+                0u, 1u, 2u, 2u, 3u, 0u};
+            indices[index] =
+                draw.draw_count == 3u || synthetic_strip
+                ? index
+                : QuadIndices[index];
+        } else if (draw.index_size == 1u) {
             std::memcpy(
                 &indices[index],
                 raw_indices.data() +
@@ -5045,24 +7673,50 @@ bool TryCompositeAgcCpuDraw(
         }
         maximum_index = std::max(maximum_index, indices[index]);
     }
-
     static thread_local std::vector<std::uint8_t> raw_vertices;
     std::uint64_t vertex_address{};
     std::uint32_t vertex_stride{};
+    std::uint64_t vertex_descriptor_table{};
+    bool game_maker_vertex_group{};
     static thread_local std::vector<std::uint8_t>
         cached_raw_vertices;
     static thread_local std::uint64_t cached_vertex_address{};
     static thread_local std::uint32_t cached_vertex_stride{};
     static thread_local std::uint32_t cached_vertex_count{};
     static thread_local std::uint32_t cached_vertex_shader{};
-    if (TryReadAgcCpuVertexBuffer(
+    static thread_local bool cached_game_maker_vertex_group{};
+    if (synthetic_indices &&
+        (draw.draw_count == 3u || synthetic_strip)) {
+        constexpr std::uint32_t SyntheticStride = 24u;
+        constexpr std::array<std::array<float, 6>, 4>
+            FullscreenGeometry{{
+                {0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f},
+                {0.0f, 2.0f, 0.0f, 1.0f, 0.0f, 2.0f},
+                {2.0f, 0.0f, 0.0f, 1.0f, 2.0f, 0.0f},
+                {2.0f, 2.0f, 0.0f, 1.0f, 2.0f, 2.0f},
+            }};
+        raw_vertices.resize(
+            (synthetic_strip ? 4u : 3u) * SyntheticStride);
+        for (std::size_t index = 0;
+             index < (synthetic_strip ? 4u : 3u); ++index) {
+            std::memcpy(
+                raw_vertices.data() + index * SyntheticStride,
+                FullscreenGeometry[index].data(),
+                SyntheticStride);
+        }
+        vertex_stride = SyntheticStride;
+    } else if (TryReadAgcCpuVertexBuffer(
             draw, indices, raw_vertices,
-            vertex_address, vertex_stride)) {
+            vertex_address, vertex_stride,
+            vertex_descriptor_table,
+            game_maker_vertex_group)) {
         cached_raw_vertices = raw_vertices;
         cached_vertex_address = vertex_address;
         cached_vertex_stride = vertex_stride;
         cached_vertex_count = maximum_index + 1u;
         cached_vertex_shader = draw.sh_es_program_lo;
+        cached_game_maker_vertex_group =
+            game_maker_vertex_group;
     } else if (
                cached_vertex_shader == draw.sh_es_program_lo &&
                cached_vertex_count >= maximum_index + 1u &&
@@ -5089,6 +7743,8 @@ bool TryCompositeAgcCpuDraw(
                     cached_vertex_stride));
         vertex_address = cached_vertex_address;
         vertex_stride = cached_vertex_stride;
+        game_maker_vertex_group =
+            cached_game_maker_vertex_group;
     } else {
 #ifdef __ANDROID__
         log_cpu_failure("vertices", maximum_index);
@@ -5164,6 +7820,13 @@ bool TryCompositeAgcCpuDraw(
                 vertices[index].color[1] = 1.0f;
                 vertices[index].color[2] = 1.0f;
             }
+        } else if (vertex_stride == 24u) {
+            float multiplier{};
+            std::memcpy(
+                &multiplier, source + 12u, sizeof(multiplier));
+            vertices[index].color = {
+                multiplier, multiplier,
+                multiplier, multiplier};
         } else if (vertex_stride != 16u) {
             for (std::size_t channel = 0; channel < 4u;
                  ++channel) {
@@ -5180,10 +7843,146 @@ bool TryCompositeAgcCpuDraw(
             return false;
         }
     }
+    if (game_maker_solid) {
+        std::array<float, 4> solid_color{};
+        const auto solid_address = draw.texture_address >> 8u;
+        if (!TryReadGuestBytes(
+                solid_address, solid_color.data(),
+                sizeof(solid_color)) ||
+            !std::ranges::all_of(
+                solid_color,
+                [](const float value) {
+                    return std::isfinite(value) &&
+                        value >= 0.0f && value <= 1.0f;
+                })) {
+            return false;
+        }
+        for (auto& vertex : vertices) {
+            vertex.color = solid_color;
+        }
+    }
+#ifdef __ANDROID__
+    static std::atomic<bool> observed_game_maker_character{};
+    if (draw.texture_width == 256u &&
+        draw.texture_height == 512u &&
+        draw.draw_count == 150u) {
+        observed_game_maker_character.store(
+            true, std::memory_order_relaxed);
+    }
+    if (observed_game_maker_character.load(
+            std::memory_order_relaxed) &&
+        ((draw.texture_width == 980u &&
+          draw.texture_height == 347u) ||
+         (draw.texture_width == 256u &&
+          draw.texture_height == 512u))) {
+        static std::atomic<std::uint32_t> gameplay_sprite_logs{};
+        if (gameplay_sprite_logs.fetch_add(
+                1u, std::memory_order_relaxed) < 12u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5",
+                "gm gameplay sprite=%ux%u count=%u "
+                "color=%.6f p0=%.1f,%.1f uv0=%.4f,%.4f "
+                "p1=%.1f,%.1f",
+                draw.texture_width, draw.texture_height,
+                draw.draw_count, vertices[0].color[0],
+                vertices[0].x, vertices[0].y,
+                vertices[0].u, vertices[0].v,
+                vertices.size() > 1u ? vertices[1].x : 0.0f,
+                vertices.size() > 1u ? vertices[1].y : 0.0f);
+        }
+    }
+    if (game_maker_solid) {
+        static std::atomic<std::uint32_t> solid_vertex_logs{};
+        if (solid_vertex_logs.fetch_add(
+                1u, std::memory_order_relaxed) < 12u) {
+            const auto* const source = raw_vertices.data();
+            std::uint32_t packed_color{};
+            float color_as_float{};
+            std::memcpy(
+                &packed_color, source + 12u,
+                sizeof(packed_color));
+            std::memcpy(
+                &color_as_float, source + 12u,
+                sizeof(color_as_float));
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5",
+                "gm solid vertex=0x%llx stride=%u "
+                "p0=%.1f,%.1f packed=%08x float=%g "
+                "rgba=%.3f,%.3f,%.3f,%.3f",
+                static_cast<unsigned long long>(vertex_address),
+                vertex_stride, vertices[0].x, vertices[0].y,
+                packed_color, color_as_float,
+                vertices[0].color[0], vertices[0].color[1],
+                vertices[0].color[2], vertices[0].color[3]);
+        }
+    }
+#endif
     bool positions_are_render_target_coordinates{};
     const auto vertex_shader_suffix =
         draw.sh_es_program_lo & UINT32_C(0xfff);
-    if (vertex_shader_suffix == UINT32_C(0xbaa) ||
+    if (game_maker_vertex_group && !target_source) {
+        std::array<float, 32> transforms{};
+        std::uint64_t transform_address{};
+        if (TryReadGameMakerTransform(
+                draw, vertex_descriptor_table,
+                transforms, transform_address)) {
+            bool valid_transform = true;
+            for (std::size_t index = 0;
+                 index < vertices.size(); ++index) {
+                const std::array<float, 4> input{
+                    vertices[index].x,
+                    vertices[index].y,
+                    vertices[index].z,
+                    1.0f};
+                std::array<float, 4> view{};
+                std::array<float, 4> clip{};
+                for (std::size_t row = 0; row < 4u; ++row) {
+                    for (std::size_t column = 0;
+                         column < 4u; ++column) {
+                        view[row] +=
+                            transforms[
+                                16u + column * 4u + row] *
+                            input[column];
+                    }
+                }
+                for (std::size_t row = 0; row < 4u; ++row) {
+                    for (std::size_t column = 0;
+                         column < 4u; ++column) {
+                        clip[row] +=
+                            transforms[column * 4u + row] *
+                            view[column];
+                    }
+                }
+                if (!std::ranges::all_of(
+                        clip,
+                        [](const float value) {
+                            return std::isfinite(value);
+                        }) ||
+                    std::abs(clip[3]) < 0.000001f) {
+                    valid_transform = false;
+                    break;
+                }
+                const auto reciprocal_w = 1.0f / clip[3];
+                vertices[index].x =
+                    (clip[0] * reciprocal_w * 0.5f + 0.5f) *
+                    static_cast<float>(draw.render_target_width);
+                vertices[index].y =
+                    (0.5f - clip[1] * reciprocal_w * 0.5f) *
+                    static_cast<float>(draw.render_target_height);
+            }
+            if (valid_transform) {
+                positions_are_render_target_coordinates = true;
+            } else {
+                for (std::size_t index = 0;
+                     index < vertices.size(); ++index) {
+                    vertices[index].x =
+                        raw_positions[index][0];
+                    vertices[index].y =
+                        raw_positions[index][1];
+                }
+            }
+        }
+    } else if (vertex_shader_suffix == UINT32_C(0xbaa) ||
         vertex_shader_suffix == UINT32_C(0xaee) ||
         vertex_shader_suffix == UINT32_C(0xc40)) {
         const auto transform_address =
@@ -5299,11 +8098,67 @@ bool TryCompositeAgcCpuDraw(
     }
     if (draw.render_target_width != 0u &&
         draw.render_target_height != 0u) {
-        float maximum_x{};
-        float maximum_y{};
+        float minimum_x = std::numeric_limits<float>::infinity();
+        float minimum_y = std::numeric_limits<float>::infinity();
+        float maximum_x =
+            -std::numeric_limits<float>::infinity();
+        float maximum_y =
+            -std::numeric_limits<float>::infinity();
         for (const auto& vertex : vertices) {
+            minimum_x = std::min(minimum_x, vertex.x);
+            minimum_y = std::min(minimum_y, vertex.y);
             maximum_x = std::max(maximum_x, vertex.x);
             maximum_y = std::max(maximum_y, vertex.y);
+        }
+        const auto uses_centered_target_coordinates =
+            target_source &&
+            std::abs(
+                minimum_x +
+                static_cast<float>(draw.render_target_width) * 0.5f) <=
+                1.0f &&
+            std::abs(
+                maximum_x -
+                static_cast<float>(draw.render_target_width) * 0.5f) <=
+                1.0f &&
+            std::abs(
+                minimum_y +
+                static_cast<float>(draw.render_target_height) * 0.5f) <=
+                1.0f &&
+            std::abs(
+                maximum_y -
+                static_cast<float>(draw.render_target_height) * 0.5f) <=
+                1.0f;
+        if (uses_centered_target_coordinates) {
+            for (auto& vertex : vertices) {
+                vertex.x +=
+                    static_cast<float>(draw.render_target_width) * 0.5f;
+                vertex.y +=
+                    static_cast<float>(draw.render_target_height) * 0.5f;
+            }
+            minimum_x = 0.0f;
+            minimum_y = 0.0f;
+            maximum_x = static_cast<float>(draw.render_target_width);
+            maximum_y = static_cast<float>(draw.render_target_height);
+            positions_are_render_target_coordinates = true;
+        }
+        const auto uses_clip_coordinates =
+            !positions_are_render_target_coordinates &&
+            minimum_x >= -1.001f && maximum_x <= 1.001f &&
+            minimum_y >= -1.001f && maximum_y <= 1.001f &&
+            minimum_x < -0.001f && minimum_y < -0.001f &&
+            maximum_x > 0.001f && maximum_y > 0.001f;
+        if (uses_clip_coordinates) {
+            for (auto& vertex : vertices) {
+                vertex.x =
+                    (vertex.x * 0.5f + 0.5f) *
+                    static_cast<float>(
+                        draw.render_target_width);
+                vertex.y =
+                    (0.5f - vertex.y * 0.5f) *
+                    static_cast<float>(
+                        draw.render_target_height);
+            }
+            positions_are_render_target_coordinates = true;
         }
         const auto uses_logical_coordinates =
             !positions_are_render_target_coordinates &&
@@ -5333,6 +8188,92 @@ bool TryCompositeAgcCpuDraw(
                 static_cast<float>(FrameHeight) /
                 static_cast<float>(coordinate_height);
         }
+#ifdef __ANDROID__
+        if (target_source) {
+            static std::atomic<std::uint32_t> copy_geometry_logs{};
+            if (copy_geometry_logs.fetch_add(
+                    1u, std::memory_order_relaxed) < 20u) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "gm copy geometry draw=%zu vertex=0x%llx "
+                    "stride=%u p=%.1f,%.1f;%.1f,%.1f;"
+                    "%.1f,%.1f;%.1f,%.1f uv=%.3f,%.3f;"
+                    "%.3f,%.3f",
+                    draw_ordinal,
+                    static_cast<unsigned long long>(vertex_address),
+                    vertex_stride,
+                    vertices[0].x, vertices[0].y,
+                    vertices[1].x, vertices[1].y,
+                    vertices[2].x, vertices[2].y,
+                    vertices[3].x, vertices[3].y,
+                    vertices[0].u, vertices[0].v,
+                    vertices[1].u, vertices[1].v);
+            }
+        }
+#endif
+#ifdef __ANDROID__
+        if (uses_clip_coordinates) {
+            static std::atomic<std::uint32_t> clip_geometry_logs{};
+            if (clip_geometry_logs.fetch_add(
+                    1u, std::memory_order_relaxed) < 4u) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "cpu clip geometry es=%03x raw0=%.3f,%.3f "
+                    "raw1=%.3f,%.3f screen0=%.1f,%.1f "
+                    "screen1=%.1f,%.1f",
+                    vertex_shader_suffix,
+                    raw_positions[0][0], raw_positions[0][1],
+                    raw_positions[
+                        std::min<std::size_t>(
+                            1u, raw_positions.size() - 1u)][0],
+                    raw_positions[
+                        std::min<std::size_t>(
+                            1u, raw_positions.size() - 1u)][1],
+                    vertices[0].x, vertices[0].y,
+                    vertices[
+                        std::min<std::size_t>(
+                            1u, vertices.size() - 1u)].x,
+                    vertices[
+                        std::min<std::size_t>(
+                            1u, vertices.size() - 1u)].y);
+            }
+        }
+#endif
+#ifdef __ANDROID__
+        if ((draw.render_target_address & UINT64_C(0xffffffff)) ==
+            UINT64_C(0xd0a20000)) {
+            static std::atomic<std::uint32_t>
+                gameplay_geometry_logs{};
+            const auto log_index = gameplay_geometry_logs.fetch_add(
+                1u, std::memory_order_relaxed);
+            if (log_index < 32u) {
+                const auto second =
+                    std::min<std::size_t>(1u, vertices.size() - 1u);
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "gameplay geometry draw=%zu es=%03x ps=%03x "
+                    "count=%u stride=%u transformed=%u logical=%u "
+                    "raw0=%.2f,%.2f raw1=%.2f,%.2f "
+                    "screen0=%.2f,%.2f screen1=%.2f,%.2f "
+                    "tex=0x%llx/%ux%u/f%02x",
+                    draw_ordinal,
+                    draw.sh_es_program_lo & UINT32_C(0xfff),
+                    draw.sh_ps_program_lo & UINT32_C(0xfff),
+                    draw.draw_count, vertex_stride,
+                    positions_are_render_target_coordinates ? 1u : 0u,
+                    uses_logical_coordinates ? 1u : 0u,
+                    raw_positions[0][0], raw_positions[0][1],
+                    raw_positions[second][0],
+                    raw_positions[second][1],
+                    vertices[0].x, vertices[0].y,
+                    vertices[second].x, vertices[second].y,
+                    static_cast<unsigned long long>(
+                        draw.texture_address),
+                    draw.texture_width, draw.texture_height,
+                    draw.texture_format);
+            }
+        }
+#endif
     }
     {
         float minimum_x = std::numeric_limits<float>::infinity();
@@ -5395,34 +8336,177 @@ bool TryCompositeAgcCpuDraw(
     }
 #endif
 
-    auto cached_texture = std::ranges::find_if(
-        texture_cache,
-        [&](const AgcCpuDecodedTexture& texture) {
-            return texture.address == draw.texture_address &&
-                texture.width == draw.texture_width &&
-                texture.height == draw.texture_height &&
-                texture.format == draw.texture_format &&
-                texture.tile_mode == draw.texture_tile_mode;
-        });
-    if (cached_texture == texture_cache.end()) {
-        AgcCpuDecodedTexture decoded{
-            draw.texture_address,
-            draw.texture_width,
-            draw.texture_height,
-            draw.texture_format,
-            draw.texture_tile_mode,
-            {}};
-        if (!TryReadAgcCpuTextureRgba(draw, decoded.rgba)) {
-#ifdef __ANDROID__
-            log_cpu_failure("texture");
-#endif
-            return false;
-        }
-        texture_cache.emplace_back(std::move(decoded));
-        cached_texture = std::prev(texture_cache.end());
+    float draw_minimum_x = static_cast<float>(FrameWidth);
+    float draw_minimum_y = static_cast<float>(FrameHeight);
+    float draw_maximum_x{};
+    float draw_maximum_y{};
+    for (const auto index : indices) {
+        draw_minimum_x =
+            std::min(draw_minimum_x, vertices[index].x);
+        draw_minimum_y =
+            std::min(draw_minimum_y, vertices[index].y);
+        draw_maximum_x =
+            std::max(draw_maximum_x, vertices[index].x);
+        draw_maximum_y =
+            std::max(draw_maximum_y, vertices[index].y);
     }
-    const auto& texture = cached_texture->rgba;
+    std::shared_ptr<std::vector<std::uint8_t>> texture_rgba;
+    std::uint64_t texture_signature{};
+    if (target_source) {
+        static const auto white_texture =
+            std::make_shared<std::vector<std::uint8_t>>(
+                static_cast<std::size_t>(4u), UINT8_C(255));
+        texture_rgba = white_texture;
+        texture_signature = AgcTextureSignature(*texture_rgba);
+    } else if (game_maker_solid) {
+        static const auto white_texture =
+            std::make_shared<std::vector<std::uint8_t>>(
+                static_cast<std::size_t>(5u * 4u), UINT8_C(255));
+        texture_rgba = white_texture;
+        texture_signature = AgcTextureSignature(*texture_rgba);
+    } else {
+        auto cached_texture = std::ranges::find_if(
+            texture_cache,
+            [&](const AgcCpuDecodedTexture& texture) {
+                return texture.address == draw.texture_address &&
+                    texture.width == draw.texture_width &&
+                    texture.height == draw.texture_height &&
+                    texture.format == draw.texture_format &&
+                    texture.tile_mode == draw.texture_tile_mode;
+            });
+        constexpr std::uint64_t FullProbeInterval = 15u;
+        std::uint64_t current_source_probe{};
+        const auto should_probe_source =
+            game_maker_sprite &&
+            (cached_texture == texture_cache.end() ||
+             texture_probe_serial == 0u ||
+             texture_probe_serial -
+                     cached_texture->source_probe_serial >=
+                 FullProbeInterval);
+        const auto has_current_source_probe =
+            should_probe_source &&
+            TryAgcTextureSourceProbe(draw, current_source_probe);
+        if (cached_texture != texture_cache.end() &&
+            has_current_source_probe &&
+            cached_texture->source_probe != current_source_probe) {
+            texture_cache.erase(cached_texture);
+            cached_texture = texture_cache.end();
+        } else if (cached_texture != texture_cache.end() &&
+                   has_current_source_probe) {
+            cached_texture->source_probe_serial =
+                texture_probe_serial;
+        }
+        if (cached_texture == texture_cache.end()) {
+            AgcCpuDecodedTexture decoded{
+                .address = draw.texture_address,
+                .width = draw.texture_width,
+                .height = draw.texture_height,
+                .format = draw.texture_format,
+                .tile_mode = draw.texture_tile_mode,
+                .source_probe =
+                    has_current_source_probe
+                    ? current_source_probe
+                    : 0u,
+                .source_probe_serial = texture_probe_serial,
+                .rgba =
+                    std::make_shared<std::vector<std::uint8_t>>()};
+            if (!TryReadAgcCpuTextureRgba(draw, *decoded.rgba)) {
 #ifdef __ANDROID__
+                log_cpu_failure("texture");
+#endif
+                return false;
+            }
+            decoded.signature =
+                AgcTextureSignature(*decoded.rgba);
+            texture_cache.emplace_back(std::move(decoded));
+            cached_texture = std::prev(texture_cache.end());
+        }
+        texture_rgba = cached_texture->rgba;
+        texture_signature = cached_texture->signature;
+    }
+    const auto& texture = *texture_rgba;
+#ifdef __ANDROID__
+    if (draw.texture_width == 250u &&
+        draw.texture_height == 250u) {
+        static std::atomic<std::uint32_t> texture250_logs{};
+        if (texture250_logs.fetch_add(
+                1u, std::memory_order_relaxed) < 8u) {
+            std::uint32_t packed_multiplier{};
+            std::memcpy(
+                &packed_multiplier,
+                raw_vertices.data() + 12u,
+                sizeof(packed_multiplier));
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5",
+                "gm250 vertex stride=%u packed=%08x color=%g "
+                "p=%.1f,%.1f;%.1f,%.1f;%.1f,%.1f;%.1f,%.1f",
+                vertex_stride, packed_multiplier,
+                vertices[0].color[0],
+                vertices[0].x, vertices[0].y,
+                vertices[1].x, vertices[1].y,
+                vertices[2].x, vertices[2].y,
+                vertices[3].x, vertices[3].y);
+        }
+        static std::atomic<bool> dumped_menu_texture{};
+        if (!dumped_menu_texture.exchange(
+                true, std::memory_order_relaxed)) {
+            if (auto* output = std::fopen(
+                    "/data/user/0/app.lsx4.android/files/gm250.rgba",
+                    "wb");
+                output != nullptr) {
+                (void)std::fwrite(
+                    texture.data(), 1u, texture.size(), output);
+                std::fclose(output);
+            }
+        }
+    }
+    if (draw.texture_width == 320u &&
+        draw.texture_height == 512u) {
+        static std::atomic<bool> dumped_ground_texture{};
+        if (!dumped_ground_texture.exchange(
+                true, std::memory_order_relaxed)) {
+            if (auto* output = std::fopen(
+                    "/data/user/0/app.lsx4.android/files/gm320x512.rgba",
+                    "wb");
+                output != nullptr) {
+                (void)std::fwrite(
+                    texture.data(), 1u, texture.size(), output);
+                std::fclose(output);
+            }
+        }
+    }
+    if (game_maker_sprite) {
+        static std::atomic<std::uint32_t> game_maker_texture_logs{};
+        if (game_maker_texture_logs.fetch_add(
+                1u, std::memory_order_relaxed) < 10u) {
+            std::uint64_t alpha_zero{};
+            std::uint64_t alpha_full{};
+            for (std::size_t alpha = 3u;
+                 alpha < texture.size(); alpha += 4u) {
+                alpha_zero += texture[alpha] == 0u;
+                alpha_full += texture[alpha] == 255u;
+            }
+            const auto& v0 = vertices[0];
+            const auto& v1 = vertices[
+                std::min<std::size_t>(1u, vertices.size() - 1u)];
+            const auto& v2 = vertices[
+                std::min<std::size_t>(2u, vertices.size() - 1u)];
+            const auto& v3 = vertices[
+                std::min<std::size_t>(3u, vertices.size() - 1u)];
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5",
+                "gm texture=0x%llx %ux%u alpha0=%llu "
+                "alpha255=%llu uv0=%.6f,%.6f uv1=%.6f,%.6f "
+                "uv2=%.6f,%.6f uv3=%.6f,%.6f",
+                static_cast<unsigned long long>(
+                    draw.texture_address),
+                draw.texture_width, draw.texture_height,
+                static_cast<unsigned long long>(alpha_zero),
+                static_cast<unsigned long long>(alpha_full),
+                v0.u, v0.v, v1.u, v1.v,
+                v2.u, v2.v, v3.u, v3.v);
+        }
+    }
     {
         static std::atomic<std::uint32_t> texture_probe_logs{};
         const auto probe_index = texture_probe_logs.fetch_add(
@@ -5431,16 +8515,21 @@ bool TryCompositeAgcCpuDraw(
             std::array<std::uint64_t, 4> nonzero{};
             std::array<std::uint8_t, 4> maximum{};
             const auto pixel_stride = std::max<std::size_t>(
-                static_cast<std::size_t>(
-                    draw.texture_width) *
-                    draw.texture_height /
+                std::min<std::size_t>(
+                    static_cast<std::size_t>(
+                        draw.texture_width) *
+                        draw.texture_height,
+                    texture.size() / 4u) /
                     4096u,
                 1u);
+            const auto texture_pixel_count =
+                std::min<std::size_t>(
+                    static_cast<std::size_t>(
+                        draw.texture_width) *
+                        draw.texture_height,
+                    texture.size() / 4u);
             for (std::size_t pixel = 0;
-                 pixel <
-                 static_cast<std::size_t>(
-                     draw.texture_width) *
-                     draw.texture_height;
+                 pixel < texture_pixel_count;
                  pixel += pixel_stride) {
                 for (std::size_t channel = 0; channel < 4u;
                      ++channel) {
@@ -5474,6 +8563,360 @@ bool TryCompositeAgcCpuDraw(
     }
 #endif
 
+    if (UseVulkanGuestRaster()) {
+        if (frame.gpu_frame == nullptr) {
+            frame.gpu_frame =
+                std::make_shared<
+                    Lsx4::Ps5Desktop::VulkanGuestFrame>();
+            frame.gpu_frame->target_key =
+                draw.render_target_address;
+            frame.gpu_frame->width = FrameWidth;
+            frame.gpu_frame->height = FrameHeight;
+        }
+        if (frame.rendered_draws == 0u) {
+            frame.gpu_frame->batch_id =
+                next_batch_id.fetch_add(
+                    1u, std::memory_order_relaxed);
+        }
+        Lsx4::Ps5Desktop::VulkanGuestDraw gpu_draw{};
+        gpu_draw.nearest_texture =
+            game_maker_sprite ||
+            (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
+                UINT32_C(0x459);
+        gpu_draw.repeat_texture =
+            game_maker_sprite &&
+            std::ranges::any_of(
+                vertices,
+                [](const AgcCpuVertex& vertex) {
+                    return vertex.u < 0.0f || vertex.u > 1.0f ||
+                        vertex.v < 0.0f || vertex.v > 1.0f;
+                });
+        gpu_draw.texture_key =
+            draw.texture_address ^
+            (static_cast<std::uint64_t>(draw.texture_width) << 32u) ^
+            (static_cast<std::uint64_t>(draw.texture_height) << 48u) ^
+            (static_cast<std::uint64_t>(draw.texture_format) << 24u) ^
+            (gpu_draw.repeat_texture
+                 ? UINT64_C(0x8000000000000000) : 0u) ^
+            (gpu_draw.nearest_texture
+                 ? UINT64_C(0x4000000000000000) : 0u);
+        gpu_draw.texture_address = draw.texture_address;
+        gpu_draw.texture_signature = texture_signature;
+        gpu_draw.texture_width = draw.texture_width;
+        gpu_draw.texture_height = draw.texture_height;
+        gpu_draw.instance_count = draw.instance_count;
+        gpu_draw.require_target_source = target_source;
+        // SharpEmu/AGC defines CB_BLEND_CONTROL.ENABLE at bit 30.
+        // The factor fields remain populated while blending is disabled
+        // (notably 0x25040504 on GameMaker render-target copies), so using
+        // SRC_BLEND==0 as the enable test incorrectly alpha-composites the
+        // final surface over its previous contents.
+        const auto blend_enabled =
+            ((draw.cx_blend0_control >> 30u) & 1u) != 0u;
+        const auto color_source_factor =
+            draw.cx_blend0_control & UINT32_C(0x1f);
+        const auto color_destination_factor =
+            (draw.cx_blend0_control >> 8u) & UINT32_C(0x1f);
+        const auto game_maker_blend =
+            game_maker_fill || game_maker_sprite ||
+            (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
+                UINT32_C(0x459);
+        gpu_draw.extended_blend_contract = game_maker_blend;
+        if (game_maker_blend) {
+            gpu_draw.opaque =
+                game_maker_solid || !blend_enabled ||
+                (color_destination_factor == 0u &&
+                 (!((draw.cx_blend0_control >> 29u) & 1u) ||
+                  ((draw.cx_blend0_control >> 24u) &
+                    UINT32_C(0x1f)) == 0u));
+            gpu_draw.premultiplied_alpha =
+                blend_enabled &&
+                color_source_factor == 1u &&
+                color_destination_factor == 5u;
+            gpu_draw.destination_source_alpha =
+                blend_enabled && color_source_factor == 0u &&
+                color_destination_factor == 4u;
+            gpu_draw.destination_inverse_source_alpha =
+                blend_enabled && color_source_factor == 0u &&
+                color_destination_factor == 5u;
+            gpu_draw.additive =
+                blend_enabled && color_source_factor == 1u &&
+                color_destination_factor == 1u;
+        } else {
+            // Preserve the pre-GameMaker path used by the first PS5 title.
+            // Its 0x60040008 pass keeps populated blend fields with a
+            // destination factor of zero and must not become an opaque draw.
+            gpu_draw.opaque =
+                (draw.cx_blend0_control & UINT32_C(0x1f)) == 0u;
+            gpu_draw.premultiplied_alpha =
+                (draw.cx_blend0_control & UINT32_C(0x1f)) == 1u &&
+                ((draw.cx_blend0_control >> 8u) &
+                 UINT32_C(0x1f)) == 5u;
+        }
+        gpu_draw.wave_effect =
+            (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
+            UINT32_C(0x459);
+        if (gpu_draw.wave_effect) {
+            const std::array<std::uint64_t, 5> srt_addresses{
+                (static_cast<std::uint64_t>(
+                     draw.sh_ps_user_data[1] & 0xffu) << 32u) |
+                    draw.sh_ps_user_data[0],
+                (static_cast<std::uint64_t>(
+                     draw.sh_export_user_data[1] & 0xffu) << 32u) |
+                    draw.sh_export_user_data[0],
+                (static_cast<std::uint64_t>(
+                     draw.sh_gs_user_data[1] & 0xffu) << 32u) |
+                    draw.sh_gs_user_data[0],
+                (static_cast<std::uint64_t>(
+                     draw.sh_es_user_data[1] & 0xffu) << 32u) |
+                    draw.sh_es_user_data[0],
+                (static_cast<std::uint64_t>(
+                     draw.sh_vs_user_data[1] & 0xffu) << 32u) |
+                    draw.sh_vs_user_data[0]};
+            bool found_parameters{};
+            const auto try_parameters =
+                [&](const std::uint64_t buffer_address) {
+                    std::array<float, 32> constants{};
+                    if (buffer_address == 0u ||
+                        !TryReadGuestBytes(
+                            buffer_address, constants.data(),
+                            sizeof(constants)) ||
+                        !std::isfinite(constants[0]) ||
+                        !std::isfinite(constants[1]) ||
+                        constants[0] <= 0.0f ||
+                        constants[1] <= 0.0f ||
+                        std::abs(
+                            constants[0] * constants[10] -
+                            0.5f) > 0.02f ||
+                        std::abs(
+                            constants[1] * constants[11] -
+                            0.5f) > 0.02f ||
+                        constants[10] < 160.0f ||
+                        constants[10] > 2048.0f ||
+                        constants[11] < 90.0f ||
+                        constants[11] > 2048.0f) {
+                        return false;
+                    }
+                    gpu_draw.wave_parameters = {
+                        constants[0], constants[1],
+                        constants[12], constants[16],
+                        constants[17], constants[18],
+                        constants[19], constants[20],
+                        constants[21], constants[22],
+                        constants[23], constants[24]};
+                    found_parameters = true;
+                    return true;
+                };
+            std::vector<std::uint64_t> tables;
+            for (const auto srt_address : srt_addresses) {
+                if (srt_address != 0u &&
+                    !std::ranges::contains(tables, srt_address)) {
+                    tables.push_back(srt_address);
+                }
+            }
+            const auto append_user_data_addresses =
+                [&](const auto& user_data) {
+                    for (std::size_t word = 0;
+                         word + 1u < user_data.size(); ++word) {
+                        const auto address =
+                            static_cast<std::uint64_t>(
+                                user_data[word]) |
+                            (static_cast<std::uint64_t>(
+                                 user_data[word + 1u] & 0xffffu)
+                             << 32u);
+                        if (address != 0u &&
+                            !std::ranges::contains(
+                                tables, address)) {
+                            tables.push_back(address);
+                        }
+                    }
+                };
+            append_user_data_addresses(draw.sh_ps_user_data);
+            append_user_data_addresses(
+                draw.sh_export_user_data);
+            append_user_data_addresses(draw.sh_gs_user_data);
+            append_user_data_addresses(draw.sh_es_user_data);
+            append_user_data_addresses(draw.sh_vs_user_data);
+            for (std::size_t table_index = 0;
+                 table_index < tables.size() &&
+                 table_index < 128u && !found_parameters;
+                 ++table_index) {
+                const auto table_address = tables[table_index];
+                if (try_parameters(table_address)) {
+                    break;
+                }
+                std::array<std::uint32_t, 256> words{};
+                if (!TryReadGuestBytes(
+                        table_address, words.data(),
+                        sizeof(words))) {
+                    continue;
+                }
+                for (std::size_t word = 0;
+                     word + 1u < words.size() &&
+                     !found_parameters; ++word) {
+                    const auto nested_address =
+                        static_cast<std::uint64_t>(words[word]) |
+                        (static_cast<std::uint64_t>(
+                             words[word + 1u] & 0xffffu) << 32u);
+                    if (try_parameters(nested_address)) {
+                        break;
+                    }
+                    if (nested_address != 0u &&
+                        tables.size() < 128u &&
+                        !std::ranges::contains(
+                            tables, nested_address)) {
+                        tables.push_back(nested_address);
+                    }
+                }
+            }
+#ifdef __ANDROID__
+            static std::atomic<std::uint32_t> wave_parameter_logs{};
+            if (wave_parameter_logs.fetch_add(
+                    1u, std::memory_order_relaxed) < 16u) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "gm wave uniforms found=%u values="
+                    "%.6f,%.6f,%.6f,%.3f,%.3f,%.3f,"
+                    "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f",
+                    found_parameters ? 1u : 0u,
+                    gpu_draw.wave_parameters[0],
+                    gpu_draw.wave_parameters[1],
+                    gpu_draw.wave_parameters[2],
+                    gpu_draw.wave_parameters[3],
+                    gpu_draw.wave_parameters[4],
+                    gpu_draw.wave_parameters[5],
+                    gpu_draw.wave_parameters[6],
+                    gpu_draw.wave_parameters[7],
+                    gpu_draw.wave_parameters[8],
+                    gpu_draw.wave_parameters[9],
+                    gpu_draw.wave_parameters[10],
+                    gpu_draw.wave_parameters[11]);
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "gm wave psud="
+                    "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+                    draw.sh_ps_user_data[0],
+                    draw.sh_ps_user_data[1],
+                    draw.sh_ps_user_data[2],
+                    draw.sh_ps_user_data[3],
+                    draw.sh_ps_user_data[4],
+                    draw.sh_ps_user_data[5],
+                    draw.sh_ps_user_data[6],
+                    draw.sh_ps_user_data[7]);
+                std::array<std::uint32_t, 16> ps_probe{};
+                (void)TryReadGuestBytes(
+                    srt_addresses[0], ps_probe.data(),
+                    sizeof(ps_probe));
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "gm wave psroot=0x%llx "
+                    "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,"
+                    "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+                    static_cast<unsigned long long>(
+                        srt_addresses[0]),
+                    ps_probe[0], ps_probe[1], ps_probe[2],
+                    ps_probe[3], ps_probe[4], ps_probe[5],
+                    ps_probe[6], ps_probe[7], ps_probe[8],
+                    ps_probe[9], ps_probe[10], ps_probe[11],
+                    ps_probe[12], ps_probe[13], ps_probe[14],
+                    ps_probe[15]);
+            }
+#endif
+        }
+        gpu_draw.texture_rgba = texture_rgba;
+        gpu_draw.vertices.reserve(vertices.size());
+        for (const auto& vertex : vertices) {
+            const auto channel = [&](const std::size_t index) {
+                return static_cast<std::uint32_t>(
+                    std::clamp(
+                        vertex.color[index] * 255.0f,
+                        0.0f, 255.0f) +
+                    0.5f);
+            };
+            gpu_draw.vertices.push_back({
+                vertex.x,
+                vertex.y,
+                vertex.u,
+                vertex.v,
+                channel(0) |
+                    (channel(1) << 8u) |
+                    (channel(2) << 16u) |
+                    (channel(3) << 24u)});
+        }
+        if ((draw.primitive_type == UINT32_C(0x6) ||
+             draw.primitive_type == UINT32_C(0x11)) &&
+            indices.size() >= 3u) {
+            gpu_draw.indices.reserve(
+                (indices.size() - 2u) * 3u);
+            for (std::size_t index = 2u;
+                 index < indices.size(); ++index) {
+                if ((index & 1u) == 0u) {
+                    gpu_draw.indices.insert(
+                        gpu_draw.indices.end(),
+                        {indices[index - 2u],
+                         indices[index - 1u],
+                         indices[index]});
+                } else {
+                    gpu_draw.indices.insert(
+                        gpu_draw.indices.end(),
+                        {indices[index - 1u],
+                         indices[index - 2u],
+                         indices[index]});
+                }
+            }
+        } else {
+            gpu_draw.indices.assign(
+                indices.begin(), indices.end());
+        }
+        frame.width = FrameWidth;
+        frame.height = FrameHeight;
+        float minimum_x = static_cast<float>(FrameWidth);
+        float minimum_y = static_cast<float>(FrameHeight);
+        float maximum_x{};
+        float maximum_y{};
+        for (const auto index : indices) {
+            minimum_x = std::min(minimum_x, vertices[index].x);
+            minimum_y = std::min(minimum_y, vertices[index].y);
+            maximum_x = std::max(maximum_x, vertices[index].x);
+            maximum_y = std::max(maximum_y, vertices[index].y);
+        }
+        const auto first_x = std::clamp(
+            static_cast<int>(std::floor(minimum_x)),
+            0, static_cast<int>(FrameWidth));
+        const auto last_x = std::clamp(
+            static_cast<int>(std::ceil(maximum_x)),
+            0, static_cast<int>(FrameWidth));
+        const auto first_y = std::clamp(
+            static_cast<int>(std::floor(minimum_y)),
+            0, static_cast<int>(FrameHeight));
+        const auto last_y = std::clamp(
+            static_cast<int>(std::ceil(maximum_y)),
+            0, static_cast<int>(FrameHeight));
+        const auto coverage =
+            static_cast<std::uint64_t>(
+                std::max(last_x - first_x, 0)) *
+            static_cast<std::uint64_t>(
+                std::max(last_y - first_y, 0));
+        if (gpu_passes != nullptr) {
+            if (gpu_passes->empty() ||
+                gpu_passes->back().target_key !=
+                    draw.render_target_address) {
+                gpu_passes->push_back({
+                    .target_key = draw.render_target_address});
+            }
+            gpu_passes->back().draws.push_back(gpu_draw);
+        }
+        frame.gpu_frame->draws.emplace_back(std::move(gpu_draw));
+        ++frame.rendered_draws;
+        frame.covered_pixels += coverage;
+        if (draw_ordinal < 64u) {
+            frame.rendered_draw_mask |=
+                UINT64_C(1) << draw_ordinal;
+            frame.draw_coverage[draw_ordinal] = coverage;
+        }
+        return true;
+    }
+
     if (frame.rgba.empty()) {
         frame.width = FrameWidth;
         frame.height = FrameHeight;
@@ -5496,8 +8939,252 @@ bool TryCompositeAgcCpuDraw(
         };
     std::uint64_t rasterized_pixels{};
     std::uint64_t covered_pixels{};
-    for (std::uint32_t first = 0;
-         first + 2u < draw.draw_count; first += 3u) {
+    const auto rasterize_axis_aligned_quad = [&]() {
+        if (draw.draw_count != 6u) {
+            return false;
+        }
+        std::array<std::uint32_t, 4> unique_indices{};
+        std::size_t unique_count{};
+        for (const auto index : indices) {
+            if (std::find(
+                    unique_indices.begin(),
+                    unique_indices.begin() +
+                        static_cast<std::ptrdiff_t>(unique_count),
+                    index) ==
+                unique_indices.begin() +
+                    static_cast<std::ptrdiff_t>(unique_count)) {
+                if (unique_count == unique_indices.size()) {
+                    return false;
+                }
+                unique_indices[unique_count++] = index;
+            }
+        }
+        if (unique_count != unique_indices.size()) {
+            return false;
+        }
+
+        float minimum_x = std::numeric_limits<float>::infinity();
+        float minimum_y = std::numeric_limits<float>::infinity();
+        float maximum_x = -std::numeric_limits<float>::infinity();
+        float maximum_y = -std::numeric_limits<float>::infinity();
+        for (const auto index : unique_indices) {
+            minimum_x = std::min(minimum_x, vertices[index].x);
+            minimum_y = std::min(minimum_y, vertices[index].y);
+            maximum_x = std::max(maximum_x, vertices[index].x);
+            maximum_y = std::max(maximum_y, vertices[index].y);
+        }
+        const auto width = maximum_x - minimum_x;
+        const auto height = maximum_y - minimum_y;
+        if (!std::isfinite(width) || !std::isfinite(height) ||
+            width < 0.001f || height < 0.001f) {
+            return false;
+        }
+        const auto epsilon_x = std::max(0.05f, width * 0.0001f);
+        const auto epsilon_y = std::max(0.05f, height * 0.0001f);
+        std::array<const AgcCpuVertex*, 4> corners{};
+        for (const auto index : unique_indices) {
+            const auto& vertex = vertices[index];
+            const bool left =
+                std::abs(vertex.x - minimum_x) <= epsilon_x;
+            const bool right =
+                std::abs(vertex.x - maximum_x) <= epsilon_x;
+            const bool top =
+                std::abs(vertex.y - minimum_y) <= epsilon_y;
+            const bool bottom =
+                std::abs(vertex.y - maximum_y) <= epsilon_y;
+            if ((!left && !right) || (!top && !bottom)) {
+                return false;
+            }
+            const auto corner = (bottom ? 2u : 0u) +
+                (right ? 1u : 0u);
+            if (corners[corner] != nullptr) {
+                return false;
+            }
+            corners[corner] = &vertex;
+        }
+        if (std::ranges::any_of(
+                corners, [](const AgcCpuVertex* const vertex) {
+                    return vertex == nullptr;
+                })) {
+            return false;
+        }
+
+        constexpr float AttributeEpsilon = 0.0001f;
+        for (std::size_t corner = 1; corner < corners.size();
+             ++corner) {
+            for (std::size_t channel = 0; channel < 4u; ++channel) {
+                if (std::abs(
+                        corners[corner]->color[channel] -
+                        corners[0]->color[channel]) >
+                    AttributeEpsilon) {
+                    return false;
+                }
+            }
+        }
+        if (std::abs(corners[0]->u - corners[2]->u) >
+                AttributeEpsilon ||
+            std::abs(corners[1]->u - corners[3]->u) >
+                AttributeEpsilon ||
+            std::abs(corners[0]->v - corners[1]->v) >
+                AttributeEpsilon ||
+            std::abs(corners[2]->v - corners[3]->v) >
+                AttributeEpsilon) {
+            return false;
+        }
+
+        const auto first_x = std::max(
+            0, static_cast<int>(std::ceil(minimum_x - 0.5f)));
+        const auto last_x = std::min(
+            static_cast<int>(FrameWidth) - 1,
+            static_cast<int>(std::floor(maximum_x - 0.5f)));
+        const auto first_y = std::max(
+            0, static_cast<int>(std::ceil(minimum_y - 0.5f)));
+        const auto last_y = std::min(
+            static_cast<int>(FrameHeight) - 1,
+            static_cast<int>(std::floor(maximum_y - 0.5f)));
+        if (first_x > last_x || first_y > last_y) {
+            return false;
+        }
+
+        static thread_local
+            std::array<std::uint32_t, FrameWidth> texture_x_lookup;
+        static thread_local
+            std::array<std::uint32_t, FrameHeight> texture_y_lookup;
+        const auto u0 = corners[0]->u;
+        const auto u1 = corners[1]->u;
+        const auto v0 = corners[0]->v;
+        const auto v1 = corners[2]->v;
+        for (auto x = first_x; x <= last_x; ++x) {
+            const auto t =
+                (static_cast<float>(x) + 0.5f - minimum_x) / width;
+            const auto u = std::clamp(
+                u0 + (u1 - u0) * t, 0.0f, 1.0f);
+            texture_x_lookup[static_cast<std::size_t>(x)] =
+                std::min(
+                    static_cast<std::uint32_t>(
+                        u * draw.texture_width),
+                    draw.texture_width - 1u);
+        }
+        for (auto y = first_y; y <= last_y; ++y) {
+            const auto t =
+                (static_cast<float>(y) + 0.5f - minimum_y) / height;
+            const auto v = std::clamp(
+                v0 + (v1 - v0) * t, 0.0f, 1.0f);
+            texture_y_lookup[static_cast<std::size_t>(y)] =
+                std::min(
+                    static_cast<std::uint32_t>(
+                        v * draw.texture_height),
+                    draw.texture_height - 1u);
+        }
+
+        std::array<std::uint32_t, 4> vertex_multiplier{};
+        for (std::size_t channel = 0; channel < 4u; ++channel) {
+            vertex_multiplier[channel] =
+                static_cast<std::uint32_t>(
+                    std::clamp(
+                        corners[0]->color[channel] * 255.0f,
+                        0.0f, 255.0f) +
+                    0.5f);
+        }
+        const bool coverage_alpha_from_rgb =
+            draw.texture_width == 1920u &&
+            draw.texture_height == 1080u;
+        rasterized_pixels +=
+            static_cast<std::uint64_t>(last_x - first_x + 1) *
+            static_cast<std::uint64_t>(last_y - first_y + 1);
+        for (auto y = first_y; y <= last_y; ++y) {
+            const auto source_row =
+                static_cast<std::size_t>(
+                    texture_y_lookup[static_cast<std::size_t>(y)]) *
+                draw.texture_width * 4u;
+            auto destination =
+                (static_cast<std::size_t>(y) * FrameWidth +
+                 static_cast<std::size_t>(first_x)) *
+                4u;
+            for (auto x = first_x; x <= last_x;
+                 ++x, destination += 4u) {
+                const auto source = source_row +
+                    static_cast<std::size_t>(
+                        texture_x_lookup[static_cast<std::size_t>(x)]) *
+                        4u;
+                auto texture_alpha =
+                    static_cast<std::uint32_t>(texture[source + 3u]);
+                if (coverage_alpha_from_rgb) {
+                    texture_alpha = std::max({
+                        static_cast<std::uint32_t>(texture[source]),
+                        static_cast<std::uint32_t>(texture[source + 1u]),
+                        static_cast<std::uint32_t>(texture[source + 2u])});
+                }
+                const auto source_alpha =
+                    (texture_alpha * vertex_multiplier[3] + 127u) /
+                    255u;
+                if (source_alpha == 0u) {
+                    continue;
+                }
+                const auto source_red =
+                    (static_cast<std::uint32_t>(texture[source]) *
+                         vertex_multiplier[0] +
+                     127u) /
+                    255u;
+                const auto source_green =
+                    (static_cast<std::uint32_t>(texture[source + 1u]) *
+                         vertex_multiplier[1] +
+                     127u) /
+                    255u;
+                const auto source_blue =
+                    (static_cast<std::uint32_t>(texture[source + 2u]) *
+                         vertex_multiplier[2] +
+                     127u) /
+                    255u;
+                if (source_alpha == 255u) {
+                    frame.rgba[destination] =
+                        static_cast<std::uint8_t>(source_red);
+                    frame.rgba[destination + 1u] =
+                        static_cast<std::uint8_t>(source_green);
+                    frame.rgba[destination + 2u] =
+                        static_cast<std::uint8_t>(source_blue);
+                } else {
+                    const auto inverse_alpha = 255u - source_alpha;
+                    frame.rgba[destination] =
+                        static_cast<std::uint8_t>(
+                            (source_red * source_alpha +
+                             static_cast<std::uint32_t>(
+                                 frame.rgba[destination]) *
+                                 inverse_alpha +
+                             127u) /
+                            255u);
+                    frame.rgba[destination + 1u] =
+                        static_cast<std::uint8_t>(
+                            (source_green * source_alpha +
+                             static_cast<std::uint32_t>(
+                                 frame.rgba[destination + 1u]) *
+                                 inverse_alpha +
+                             127u) /
+                            255u);
+                    frame.rgba[destination + 2u] =
+                        static_cast<std::uint8_t>(
+                            (source_blue * source_alpha +
+                             static_cast<std::uint32_t>(
+                                 frame.rgba[destination + 2u]) *
+                                 inverse_alpha +
+                             127u) /
+                            255u);
+                }
+                frame.rgba[destination + 3u] = 255u;
+                ++covered_pixels;
+            }
+        }
+        return true;
+    };
+    if (!rasterize_axis_aligned_quad()) {
+        std::array<std::uint64_t, FrameHeight> draw_rasterized{};
+        std::array<std::uint64_t, FrameHeight> draw_covered{};
+        RunAgcCpuRows(
+            0, static_cast<int>(FrameHeight) - 1,
+            static_cast<std::uint64_t>(FrameWidth) * FrameHeight,
+            [&](const int parallel_y) {
+        for (std::uint32_t first = 0;
+             first + 2u < draw.draw_count; first += 3u) {
         const auto& v0 = vertices[indices[first]];
         const auto& v1 = vertices[indices[first + 1u]];
         const auto& v2 = vertices[indices[first + 2u]];
@@ -5522,6 +9209,9 @@ bool TryCompositeAgcCpuDraw(
         if (minimum_x > maximum_x || minimum_y > maximum_y) {
             continue;
         }
+        if (parallel_y < minimum_y || parallel_y > maximum_y) {
+            continue;
+        }
         const auto inverse_area = 1.0f / area;
         const auto w0_step_x = (v2.y - v1.y) * inverse_area;
         const auto w0_step_y = (v1.x - v2.x) * inverse_area;
@@ -5537,10 +9227,95 @@ bool TryCompositeAgcCpuDraw(
         auto row_w1 =
             edge(v2, v0, first_sample_x, first_sample_y) *
             inverse_area;
-        for (auto y = minimum_y; y <= maximum_y; ++y) {
-            auto w0 = row_w0;
-            auto w1 = row_w1;
-            for (auto x = minimum_x; x <= maximum_x; ++x) {
+        constexpr float ColorEpsilon = 0.0001f;
+        bool constant_vertex_color = true;
+        for (std::size_t channel = 0; channel < 4u; ++channel) {
+            constant_vertex_color &=
+                std::abs(
+                    v0.color[channel] -
+                    v1.color[channel]) <= ColorEpsilon &&
+                std::abs(
+                    v0.color[channel] -
+                    v2.color[channel]) <= ColorEpsilon;
+        }
+        std::array<std::uint32_t, 4> constant_multiplier{};
+        if (constant_vertex_color) {
+            for (std::size_t channel = 0; channel < 4u; ++channel) {
+                constant_multiplier[channel] =
+                    static_cast<std::uint32_t>(
+                        std::clamp(
+                            v0.color[channel] * 255.0f,
+                            0.0f, 255.0f) +
+                        0.5f);
+            }
+        }
+        const bool coverage_alpha_from_rgb =
+            draw.texture_width == 1920u &&
+            draw.texture_height == 1080u;
+        const auto y = parallel_y;
+            const auto sample_y = static_cast<float>(y) + 0.5f;
+            float row_minimum_x =
+                std::numeric_limits<float>::infinity();
+            float row_maximum_x =
+                -std::numeric_limits<float>::infinity();
+            std::uint32_t row_intersections{};
+            const auto intersect_edge =
+                [&](const AgcCpuVertex& begin,
+                    const AgcCpuVertex& end) {
+                    const auto edge_minimum_y =
+                        std::min(begin.y, end.y);
+                    const auto edge_maximum_y =
+                        std::max(begin.y, end.y);
+                    if (sample_y < edge_minimum_y - 0.0001f ||
+                        sample_y > edge_maximum_y + 0.0001f) {
+                        return;
+                    }
+                    const auto delta_y = end.y - begin.y;
+                    if (std::abs(delta_y) < 0.0001f) {
+                        row_minimum_x = std::min({
+                            row_minimum_x, begin.x, end.x});
+                        row_maximum_x = std::max({
+                            row_maximum_x, begin.x, end.x});
+                        row_intersections += 2u;
+                        return;
+                    }
+                    const auto t =
+                        (sample_y - begin.y) / delta_y;
+                    if (t < -0.0001f || t > 1.0001f) {
+                        return;
+                    }
+                    const auto x =
+                        begin.x + (end.x - begin.x) * t;
+                    row_minimum_x = std::min(row_minimum_x, x);
+                    row_maximum_x = std::max(row_maximum_x, x);
+                    ++row_intersections;
+                };
+            intersect_edge(v0, v1);
+            intersect_edge(v1, v2);
+            intersect_edge(v2, v0);
+            if (row_intersections < 2u) {
+                continue;
+            }
+            const auto row_first_x = std::max(
+                minimum_x,
+                static_cast<int>(
+                    std::ceil(row_minimum_x - 0.5f)) - 1);
+            const auto row_last_x = std::min(
+                maximum_x,
+                static_cast<int>(
+                    std::floor(row_maximum_x - 0.5f)) + 1);
+            if (row_first_x > row_last_x) {
+                continue;
+            }
+            auto w0 = row_w0 +
+                static_cast<float>(y - minimum_y) * w0_step_y +
+                static_cast<float>(row_first_x - minimum_x) *
+                    w0_step_x;
+            auto w1 = row_w1 +
+                static_cast<float>(y - minimum_y) * w1_step_y +
+                static_cast<float>(row_first_x - minimum_x) *
+                    w1_step_x;
+            for (auto x = row_first_x; x <= row_last_x; ++x) {
                 const auto w2 = 1.0f - w0 - w1;
                 if (w0 < -0.0001f || w1 < -0.0001f ||
                     w2 < -0.0001f) {
@@ -5548,7 +9323,8 @@ bool TryCompositeAgcCpuDraw(
                     w1 += w1_step_x;
                     continue;
                 }
-                ++rasterized_pixels;
+                ++draw_rasterized[
+                    static_cast<std::size_t>(y)];
                 const auto u =
                     std::clamp(
                         w0 * v0.u + w1 * v1.u + w2 * v2.u,
@@ -5557,15 +9333,6 @@ bool TryCompositeAgcCpuDraw(
                     std::clamp(
                         w0 * v0.v + w1 * v1.v + w2 * v2.v,
                         0.0f, 1.0f);
-                std::array<float, 4> vertex_color{};
-                for (std::size_t channel = 0; channel < 4u;
-                     ++channel) {
-                    vertex_color[channel] = std::clamp(
-                        w0 * v0.color[channel] +
-                            w1 * v1.color[channel] +
-                            w2 * v2.color[channel],
-                        0.0f, 1.0f);
-                }
                 const auto texture_x = std::min(
                     static_cast<std::uint32_t>(
                         u * draw.texture_width),
@@ -5586,8 +9353,7 @@ bool TryCompositeAgcCpuDraw(
                 auto texture_alpha =
                     static_cast<std::uint32_t>(
                         texture[source + 3u]);
-                if (draw.texture_width == 1920u &&
-                    draw.texture_height == 1080u) {
+                if (coverage_alpha_from_rgb) {
                     texture_alpha = std::max({
                         static_cast<std::uint32_t>(
                             texture[source]),
@@ -5596,13 +9362,24 @@ bool TryCompositeAgcCpuDraw(
                         static_cast<std::uint32_t>(
                             texture[source + 2u])});
                 }
+                std::array<std::uint32_t, 4> vertex_multiplier =
+                    constant_multiplier;
+                if (!constant_vertex_color) {
+                    for (std::size_t channel = 0; channel < 4u;
+                         ++channel) {
+                        vertex_multiplier[channel] =
+                            static_cast<std::uint32_t>(
+                                std::clamp(
+                                    (w0 * v0.color[channel] +
+                                     w1 * v1.color[channel] +
+                                     w2 * v2.color[channel]) *
+                                        255.0f,
+                                    0.0f, 255.0f) +
+                                0.5f);
+                    }
+                }
                 const auto source_alpha =
-                    (texture_alpha * 
-                     static_cast<std::uint32_t>(
-                         std::clamp(
-                             vertex_color[3] * 255.0f,
-                             0.0f, 255.0f) + 0.5f) +
-                     127u) /
+                    (texture_alpha * vertex_multiplier[3] + 127u) /
                     255u;
                 if (source_alpha == 0) {
                     w0 += w0_step_x;
@@ -5610,46 +9387,28 @@ bool TryCompositeAgcCpuDraw(
                     continue;
                 }
                 const auto inverse_alpha = 255u - source_alpha;
-                const auto vertex_multiplier_r =
-                    static_cast<std::uint32_t>(
-                        std::clamp(
-                            vertex_color[0] * 255.0f,
-                            0.0f, 255.0f) +
-                        0.5f);
-                const auto vertex_multiplier_g =
-                    static_cast<std::uint32_t>(
-                        std::clamp(
-                            vertex_color[1] * 255.0f,
-                            0.0f, 255.0f) +
-                        0.5f);
-                const auto vertex_multiplier_b =
-                    static_cast<std::uint32_t>(
-                        std::clamp(
-                            vertex_color[2] * 255.0f,
-                            0.0f, 255.0f) +
-                        0.5f);
                 if (source_alpha == 255u &&
-                    vertex_multiplier_r == 255u &&
-                    vertex_multiplier_g == 255u &&
-                    vertex_multiplier_b == 255u) {
+                    vertex_multiplier[0] == 255u &&
+                    vertex_multiplier[1] == 255u &&
+                    vertex_multiplier[2] == 255u) {
                     frame.rgba[destination] = texture[source];
                     frame.rgba[destination + 1u] = texture[source + 1u];
                     frame.rgba[destination + 2u] = texture[source + 2u];
                 } else {
                     const auto modulated_source_red =
                         (static_cast<std::uint32_t>(texture[source]) *
-                         vertex_multiplier_r +
+                         vertex_multiplier[0] +
                          127u) /
                         255u;
                     const auto modulated_source_green =
                         (static_cast<std::uint32_t>(
                              texture[source + 1u]) *
-                         vertex_multiplier_g +
+                         vertex_multiplier[1] +
                          127u) /
                         255u;
                     const auto modulated_source_blue =
                         (static_cast<std::uint32_t>(texture[source + 2u]) *
-                         vertex_multiplier_b +
+                         vertex_multiplier[2] +
                          127u) /
                         255u;
                     if (source_alpha == 255u) {
@@ -5695,12 +9454,15 @@ bool TryCompositeAgcCpuDraw(
                     }
                 }
                 frame.rgba[destination + 3u] = 255u;
-                ++covered_pixels;
+                ++draw_covered[static_cast<std::size_t>(y)];
                 w0 += w0_step_x;
                 w1 += w1_step_x;
             }
-            row_w0 += w0_step_y;
-            row_w1 += w1_step_y;
+        }
+        });
+        for (std::size_t y = 0; y < FrameHeight; ++y) {
+            rasterized_pixels += draw_rasterized[y];
+            covered_pixels += draw_covered[y];
         }
     }
     if (covered_pixels == 0) {
@@ -5942,9 +9704,10 @@ bool TryApplyAgcCpuClearOrCopy(
                 g_runtime.agc_cpu_next_render
                         .time_since_epoch().count() == 0 ||
                 now >= g_runtime.agc_cpu_next_render;
-            const bool clear_guest_target = !(
-                capture_software_frame &&
-                target_bytes >= (1920u * 1080u * 4u));
+            const bool clear_guest_target =
+                !UseVulkanGuestRaster() &&
+                !(capture_software_frame &&
+                  target_bytes >= (1920u * 1080u * 4u));
             if (clear_guest_target) {
                 std::fill_n(
                     reinterpret_cast<std::uint32_t*>(
@@ -6031,7 +9794,8 @@ bool TryApplyAgcCpuClearOrCopy(
                 software_source != g_runtime.agc_cpu_surfaces.end() &&
                 software_source->second != nullptr &&
                 !software_source->second->rgba.empty();
-            if (!has_software_source) {
+            if (!has_software_source &&
+                !UseVulkanGuestRaster()) {
                 if (!HasAccessLocked(
                         draw.texture_address, source_bytes,
                         LSX4_PS5_GUEST_READ) ||
@@ -6041,7 +9805,8 @@ bool TryApplyAgcCpuClearOrCopy(
                     return false;
                 }
             }
-            if (!has_software_source) {
+            if (!has_software_source &&
+                !UseVulkanGuestRaster()) {
                 std::memmove(
                     reinterpret_cast<void*>(
                         draw.render_target_address),
@@ -6295,6 +10060,12 @@ void PresentGuestTextureToAndroid(
         flip_count % presentation_divisor != 0u) {
         return;
     }
+    const auto has_gpu_frame =
+        cpu_frame != nullptr &&
+        cpu_frame->gpu_frame != nullptr &&
+        cpu_frame->gpu_frame->width != 0 &&
+        cpu_frame->gpu_frame->height != 0 &&
+        !cpu_frame->gpu_frame->draws.empty();
     const auto has_cpu_frame =
         cpu_frame != nullptr &&
         cpu_frame->width != 0 && cpu_frame->height != 0 &&
@@ -6302,7 +10073,7 @@ void PresentGuestTextureToAndroid(
             static_cast<std::size_t>(cpu_frame->width) *
                 cpu_frame->height * 4u;
     if (window == nullptr ||
-        (!has_cpu_frame &&
+        (!has_gpu_frame && !has_cpu_frame &&
          (texture.address == 0 ||
           texture.width == 0 || texture.height == 0 ||
           (texture.tile_mode != 0 && texture.tile_mode != 27) ||
@@ -6310,9 +10081,61 @@ void PresentGuestTextureToAndroid(
         return;
     }
     auto source_width =
-        has_cpu_frame ? cpu_frame->width : texture.width;
+        (has_gpu_frame || has_cpu_frame)
+        ? cpu_frame->width : texture.width;
     auto source_height =
-        has_cpu_frame ? cpu_frame->height : texture.height;
+        (has_gpu_frame || has_cpu_frame)
+        ? cpu_frame->height : texture.height;
+    if (has_gpu_frame) {
+        bool splash_active{};
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            splash_active = g_runtime.game_splash_active;
+        }
+        const auto draw_has_visible_content =
+            [](const Lsx4::Ps5Desktop::VulkanGuestDraw& draw) {
+                if (draw.texture_rgba != nullptr) {
+                    const auto& rgba = *draw.texture_rgba;
+                    for (std::size_t pixel = 0;
+                         pixel + 2u < rgba.size(); pixel += 4u) {
+                        if (rgba[pixel] != 0u ||
+                            rgba[pixel + 1u] != 0u ||
+                            rgba[pixel + 2u] != 0u) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                return std::ranges::any_of(
+                    draw.vertices,
+                    [](const auto& vertex) {
+                        return (vertex.color &
+                                UINT32_C(0x00ffffff)) != 0u;
+                    });
+            };
+        bool visible =
+            (cpu_frame->gpu_frame->clear_rgba &
+             UINT32_C(0x00ffffff)) != 0u ||
+            std::ranges::any_of(
+                cpu_frame->gpu_frame->draws,
+                draw_has_visible_content);
+        for (const auto& pass : cpu_frame->gpu_frame->passes) {
+            visible = visible ||
+                ((pass.clear_rgba & UINT32_C(0x00ffffff)) != 0u) ||
+                std::ranges::any_of(
+                    pass.draws, draw_has_visible_content);
+        }
+        if (!splash_active || visible) {
+            if (Lsx4::Ps5Desktop::PresentVulkanGuestFrame(
+                    window, *cpu_frame->gpu_frame, flip_count)) {
+                const std::lock_guard lock{g_runtime.mutex};
+                g_runtime.game_splash_active = false;
+                return;
+            }
+        } else {
+            return;
+        }
+    }
     const std::uint8_t* rgba{};
     std::size_t rgba_size{};
     static thread_local std::vector<std::uint8_t> owned_rgba;
@@ -6327,21 +10150,41 @@ void PresentGuestTextureToAndroid(
         rgba = owned_rgba.data();
         rgba_size = owned_rgba.size();
     }
+    bool splash_active{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        splash_active = g_runtime.game_splash_active;
+    }
+    if (splash_active) {
+        const bool guest_frame_is_black = std::ranges::all_of(
+            std::span<const std::uint8_t>{rgba, rgba_size},
+            [](const std::uint8_t value) { return value == 0; });
+        if (guest_frame_is_black) {
+            return;
+        }
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.game_splash_active = false;
+    }
     if (Lsx4::Ps5Desktop::PresentVulkanFrame(
             window, rgba, rgba_size,
             source_width, source_height, flip_count)) {
         return;
     }
-    std::uint64_t fingerprint = UINT64_C(1469598103934665603);
+    const bool log_fallback =
+        flip_count <= 8u || flip_count % 60u == 0u;
+    std::uint64_t fingerprint{};
     std::uint64_t sampled_nonzero{};
-    const auto sample_stride =
-        std::max<std::size_t>(rgba_size / 4096u, 1u);
-    for (std::size_t index = 0; index < rgba_size;
-         index += sample_stride) {
-        const auto value = rgba[index];
-        fingerprint ^= value;
-        fingerprint *= UINT64_C(1099511628211);
-        sampled_nonzero += value != 0;
+    if (log_fallback) {
+        fingerprint = UINT64_C(1469598103934665603);
+        const auto sample_stride =
+            std::max<std::size_t>(rgba_size / 4096u, 1u);
+        for (std::size_t index = 0; index < rgba_size;
+             index += sample_stride) {
+            const auto value = rgba[index];
+            fingerprint ^= value;
+            fingerprint *= UINT64_C(1099511628211);
+            sampled_nonzero += value != 0;
+        }
     }
     if (ANativeWindow_getWidth(window) !=
             static_cast<std::int32_t>(source_width) ||
@@ -6410,7 +10253,7 @@ void PresentGuestTextureToAndroid(
         }
     }
     (void)ANativeWindow_unlockAndPost(window);
-    if (flip_count <= 8 || flip_count % 60u == 0) {
+    if (log_fallback) {
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4-PS5",
             "present count=%llu address=0x%llx source=%ux%u "
@@ -6432,6 +10275,54 @@ void PresentGuestTextureToAndroid(
             static_cast<unsigned long long>(texture.address),
             source_width, source_height,
             buffer.width, buffer.height, buffer.stride);
+    }
+}
+
+void TryPresentGameSplashToAndroid() {
+    std::filesystem::path splash_path;
+    ANativeWindow* window{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        if (g_runtime.game_splash_presented ||
+            g_runtime.app0_directory.empty() ||
+            g_runtime.android_window == nullptr) {
+            return;
+        }
+        splash_path =
+            g_runtime.app0_directory / "sce_sys" / "pic0.png";
+        window = g_runtime.android_window;
+        ANativeWindow_acquire(window);
+    }
+
+    png_image image{};
+    image.version = PNG_IMAGE_VERSION;
+    bool presented{};
+    if (png_image_begin_read_from_file(
+            &image, splash_path.string().c_str()) != 0 &&
+        image.width != 0 && image.height != 0 &&
+        image.width <= 8192u && image.height <= 8192u) {
+        image.format = PNG_FORMAT_RGBA;
+        std::vector<std::uint8_t> rgba(PNG_IMAGE_SIZE(image));
+        if (png_image_finish_read(
+                &image, nullptr, rgba.data(), 0, nullptr) != 0) {
+            presented = Lsx4::Ps5Desktop::PresentVulkanFrame(
+                window, rgba.data(), rgba.size(),
+                image.width, image.height, 0);
+        }
+    }
+    png_image_free(&image);
+    ANativeWindow_release(window);
+
+    if (presented) {
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            g_runtime.game_splash_active = true;
+            g_runtime.game_splash_presented = true;
+        }
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5",
+            "presented game splash path=%s size=%ux%u",
+            splash_path.string().c_str(), image.width, image.height);
     }
 }
 #endif
@@ -6545,7 +10436,10 @@ void ObserveAgcFlip(const std::int32_t handle,
         const std::lock_guard lock{g_runtime.mutex};
         const auto found = g_runtime.guest_video_out_ports.find(handle);
         if (found == g_runtime.guest_video_out_ports.end() ||
-            buffer_index < -1 || buffer_index >= 16) {
+            buffer_index < -2 || buffer_index >= 16 ||
+            (buffer_index >= 0 &&
+             static_cast<std::size_t>(buffer_index) >=
+                 found->second.buffer_addresses.size())) {
             const auto invalid_count =
                 ++g_runtime.agc_invalid_flip_count;
             std::fprintf(
@@ -6571,6 +10465,17 @@ void ObserveAgcFlip(const std::int32_t handle,
         }
         found->second.current_buffer = buffer_index;
         ++found->second.flip_count;
+        found->second.last_flip_argument = flip_argument;
+        const auto flip_now = std::chrono::steady_clock::now();
+        found->second.last_flip_process_time =
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    flip_now - found->second.opened_at).count());
+        found->second.last_flip_process_counter =
+            static_cast<std::uint64_t>(
+                flip_now.time_since_epoch().count());
+        found->second.last_flip_submit_counter =
+            found->second.last_flip_process_counter;
         port = found->second;
         presenter = g_runtime.presenter_texture;
         cpu_frame.reset();
@@ -6587,10 +10492,25 @@ void ObserveAgcFlip(const std::int32_t handle,
             if (g_runtime.agc_cpu_pending_capture_target != 0) {
                 resolved_capture_target =
                     g_runtime.agc_cpu_pending_capture_target;
-                const auto captured =
-                    g_runtime.agc_cpu_surfaces.find(
+                auto captured =
+                    g_runtime.agc_cpu_working_surfaces.find(
                         g_runtime.agc_cpu_pending_capture_target);
-                if (captured != g_runtime.agc_cpu_surfaces.end() &&
+                const auto working_has_gpu =
+                    captured !=
+                        g_runtime.agc_cpu_working_surfaces.end() &&
+                    captured->second != nullptr &&
+                    captured->second->gpu_frame != nullptr &&
+                    !captured->second->gpu_frame->draws.empty();
+                if (!working_has_gpu) {
+                    captured =
+                        g_runtime.agc_cpu_surfaces.find(
+                            g_runtime.agc_cpu_pending_capture_target);
+                }
+                const auto captured_end =
+                    working_has_gpu
+                    ? g_runtime.agc_cpu_working_surfaces.end()
+                    : g_runtime.agc_cpu_surfaces.end();
+                if (captured != captured_end &&
                     captured->second != nullptr) {
                     resolved_capture_draws =
                         captured->second->rendered_draws;
@@ -6600,7 +10520,7 @@ void ObserveAgcFlip(const std::int32_t handle,
                         captured->second->eligible_draw_mask;
                     resolved_capture_rendered =
                         captured->second->rendered_draw_mask;
-                    if (!captured->second->rgba.empty() &&
+                    if (HasAgcFrameContent(*captured->second) &&
                         captured->second->rendered_draws != 0u) {
                         cpu_frame = captured->second;
                         used_capture_surface = true;
@@ -6681,10 +10601,37 @@ void ObserveAgcFlip(const std::int32_t handle,
         g_runtime.guest_event_queue_condition.notify_all();
     }
 
-    const auto address =
-        port.buffer_addresses[static_cast<std::size_t>(buffer_index)];
-    if (cpu_frame == nullptr ||
-        cpu_frame->rgba.empty()) {
+    const auto address = buffer_index >= 0
+        ? port.buffer_addresses[
+              static_cast<std::size_t>(buffer_index)]
+        : 0u;
+    // A degenerate diagnostic draw must not hide the real scanout buffer.
+    // Large titles can emit a one-pixel setup primitive before their actual
+    // display pass; treating it as a complete software frame produces an
+    // indefinitely black image even though the registered VideoOut buffer is
+    // being updated.
+    if (cpu_frame != nullptr &&
+        cpu_frame->covered_pixels <= 4u &&
+        cpu_frame->rendered_draws <= 3u) {
+#ifdef __ANDROID__
+        static std::atomic<std::uint32_t> weak_frame_logs{};
+        if (weak_frame_logs.fetch_add(
+                1u, std::memory_order_relaxed) < 8u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5",
+                "ignore degenerate frame draws=%u coverage=%llu "
+                "scanout=0x%llx",
+                cpu_frame->rendered_draws,
+                static_cast<unsigned long long>(
+                    cpu_frame->covered_pixels),
+                static_cast<unsigned long long>(address));
+        }
+#endif
+        cpu_frame.reset();
+    }
+    if (buffer_index >= 0 &&
+        (cpu_frame == nullptr ||
+         !HasAgcFrameContent(*cpu_frame))) {
         presenter.address = address;
         presenter.width = port.width;
         presenter.height = port.height;
@@ -6715,7 +10662,9 @@ void ObserveAgcFlip(const std::int32_t handle,
             handle, buffer_index,
             static_cast<unsigned long long>(address),
             port.width, port.height,
-            cpu_frame != nullptr && !cpu_frame->rgba.empty() ? 1u : 0u,
+            cpu_frame != nullptr &&
+                    HasAgcFrameContent(*cpu_frame)
+                ? 1u : 0u,
             used_capture_surface ? 1u : 0u,
             queued_capture_surface ? 1u : 0u,
             cpu_frame != nullptr ? cpu_frame->width : 0u,
@@ -6810,6 +10759,7 @@ void ObserveAgcFlip(const std::int32_t handle,
 bool TryAgcDriverSubmitDcb(
     const Lsx4::Translation::HleBridgeRequest& request,
     std::uint64_t& result) {
+    const auto submit_started = std::chrono::steady_clock::now();
     const std::lock_guard submit_lock{g_agc_submit_mutex};
     const auto packet_address = request.integer_arguments[0];
     std::uint64_t command_address{};
@@ -6867,9 +10817,12 @@ bool TryAgcDriverSubmitDcb(
         }
     }
 
-    std::unordered_map<std::uint32_t, std::uint32_t> cx_registers;
-    std::unordered_map<std::uint32_t, std::uint32_t> sh_registers;
-    std::unordered_map<std::uint32_t, std::uint32_t> uc_registers;
+    static thread_local std::unordered_map<
+        std::uint32_t, std::uint32_t> cx_registers;
+    static thread_local std::unordered_map<
+        std::uint32_t, std::uint32_t> sh_registers;
+    static thread_local std::unordered_map<
+        std::uint32_t, std::uint32_t> uc_registers;
     std::array<std::uint32_t, 256> opcode_counts{};
     std::array<std::uint32_t, 64> nop_register_counts{};
     std::uint32_t parsed_packet_count{};
@@ -6882,9 +10835,21 @@ bool TryAgcDriverSubmitDcb(
         std::uint64_t data{};
     };
     std::vector<DeferredReleaseWrite> deferred_release_writes;
+    deferred_release_writes.reserve(8u);
+    struct DeferredDataWrite {
+        bool standard_packet{};
+        std::uint32_t destination_selection{};
+        bool increment_address{};
+        std::uint64_t destination_address{};
+        std::vector<std::uint32_t> values;
+    };
+    std::vector<DeferredDataWrite> deferred_data_writes;
+    deferred_data_writes.reserve(32u);
     std::uint64_t index_buffer_address{};
     std::uint32_t index_buffer_count{};
     std::uint32_t index_size{};
+    std::uint32_t instance_count{1};
+    std::uint64_t dispatch_indirect_args_base{};
     std::uint64_t runtime_texture_cache_epoch{};
     {
         const std::lock_guard lock{g_runtime.mutex};
@@ -6896,17 +10861,110 @@ bool TryAgcDriverSubmitDcb(
         index_buffer_count =
             g_runtime.agc_index_buffer_count;
         index_size = g_runtime.agc_index_size;
+        instance_count = g_runtime.agc_instance_count;
+        dispatch_indirect_args_base =
+            g_runtime.agc_dispatch_indirect_args_base;
         runtime_texture_cache_epoch =
             g_runtime.agc_cpu_texture_cache_epoch;
     }
+#ifdef __ANDROID__
+    ANativeWindow* graphics_window{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        graphics_window = g_runtime.android_window;
+        if (graphics_window != nullptr) {
+            ANativeWindow_acquire(graphics_window);
+        }
+    }
+    if (graphics_window != nullptr) {
+        (void)Lsx4::Ps5Desktop::EnsureVulkanPresenter(
+            graphics_window);
+        ANativeWindow_release(graphics_window);
+    }
+#endif
     std::vector<AgcDiagnosticDraw> diagnostic_draws;
+    diagnostic_draws.reserve(32u);
+    const auto is_cpu_draw_candidate =
+        [&](const AgcDiagnosticDraw& draw) {
+            const auto game_maker_fill =
+                draw.draw_count == 6u &&
+                (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
+                    UINT32_C(0xf13);
+            if ((draw.draw_count == 3u || game_maker_fill) &&
+                draw.texture_address != 0 &&
+                draw.texture_width == 5u &&
+                draw.texture_height == 1u &&
+                draw.texture_tile_mode == 0u) {
+                return true;
+            }
+            if (draw.primitive_type != UINT32_C(0x4) &&
+                draw.primitive_type != UINT32_C(0x6) &&
+                draw.primitive_type != UINT32_C(0x11)) {
+                return false;
+            }
+            if ((draw.sh_es_program_lo & UINT32_C(0xfff)) ==
+                    UINT32_C(0xc40) &&
+                (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
+                    UINT32_C(0xc38)) {
+                return false;
+            }
+            const auto render_target_source =
+                std::ranges::any_of(
+                    diagnostic_draws,
+                    [&](const AgcDiagnosticDraw& producer) {
+                        return producer.render_target_address != 0u &&
+                            producer.render_target_address ==
+                                draw.texture_address;
+                    });
+            return draw.sh_es_program_hi == 0 &&
+                draw.sh_es_program_lo != 0u &&
+                draw.sh_ps_program_hi == 0 &&
+                draw.sh_ps_program_lo != 0u &&
+                (render_target_source ||
+                 ((draw.texture_tile_mode == 0 ||
+                   draw.texture_tile_mode == 5) &&
+                  (draw.texture_format == UINT32_C(0x1) ||
+                   draw.texture_format == UINT32_C(0x38) ||
+                   draw.texture_format == UINT32_C(0xad) ||
+                   draw.texture_format == UINT32_C(0xb5))) ||
+                 (draw.texture_tile_mode == UINT32_C(27) &&
+                  draw.texture_format == UINT32_C(0x47))) &&
+                draw.texture_width >= 16u &&
+                draw.texture_height >= 16u;
+        };
     static thread_local std::vector<AgcCpuDecodedTexture>
         cpu_texture_cache;
     static thread_local std::uint64_t cpu_texture_cache_epoch{};
+    static thread_local std::uint64_t cpu_texture_probe_serial{};
+    static thread_local std::uint64_t gen5_route_epoch{};
+    static thread_local std::unordered_set<std::uint64_t>
+        gen5_only_shader_pairs;
+    ++cpu_texture_probe_serial;
     if (cpu_texture_cache_epoch != runtime_texture_cache_epoch) {
         cpu_texture_cache.clear();
         cpu_texture_cache_epoch = runtime_texture_cache_epoch;
     }
+    if (gen5_route_epoch != runtime_texture_cache_epoch) {
+        gen5_only_shader_pairs.clear();
+        gen5_route_epoch = runtime_texture_cache_epoch;
+    }
+    const auto gen5_shader_pair_key =
+        [](const AgcDiagnosticDraw& draw) {
+            const auto vertex =
+                (static_cast<std::uint64_t>(
+                     draw.sh_es_program_hi & 0xffu) << 40u) |
+                (static_cast<std::uint64_t>(
+                     draw.sh_es_program_lo) << 8u);
+            const auto pixel =
+                (static_cast<std::uint64_t>(
+                     draw.sh_ps_program_hi & 0xffu) << 40u) |
+                (static_cast<std::uint64_t>(
+                     draw.sh_ps_program_lo) << 8u);
+            std::uint64_t key =
+                vertex ^ (pixel + UINT64_C(0x9e3779b97f4a7c15) +
+                          (vertex << 6u) + (vertex >> 2u));
+            return key != 0u ? key : UINT64_C(1);
+        };
     std::shared_ptr<AgcCpuFrame> cpu_frame;
     std::uint64_t cpu_frame_target{};
     std::unordered_map<
@@ -6919,6 +10977,8 @@ bool TryAgcDriverSubmitDcb(
     bool has_diagnostic_flip{};
     std::uint32_t release_write_count{};
     std::uint32_t release_write_failures{};
+    std::uint32_t data_write_count{};
+    std::uint32_t data_write_failures{};
     std::uint32_t dma_write_count{};
     std::uint32_t dma_write_failures{};
     std::uint32_t offset{};
@@ -7063,6 +11123,149 @@ skip_packet_diagnostic_log:
                    length >= 8u) {
             apply_release_mem(true);
         }
+        const bool agc_write_data =
+            opcode == AgcItNop &&
+            packet_register == AgcRWriteData &&
+            length >= 4u;
+        const bool standard_write_data =
+            opcode == AgcItWriteData &&
+            length >= 4u;
+        if (agc_write_data || standard_write_data) {
+            std::uint32_t control{};
+            std::uint64_t destination_address{};
+            DeferredDataWrite write{
+                .standard_packet = standard_write_data,
+            };
+            bool readable =
+                TryReadGuestValue(
+                    packet_address + 4u, control) &&
+                TryReadGuestValue(
+                    packet_address + 8u,
+                    destination_address);
+            if (standard_write_data) {
+                write.destination_selection =
+                    (control >> 8u) & 0x0fu;
+                write.increment_address =
+                    (control & (1u << 16u)) == 0;
+            } else {
+                write.destination_selection =
+                    control & 0xffu;
+                write.increment_address =
+                    ((control >> 16u) & 0xffu) == 0;
+            }
+            write.destination_address =
+                destination_address;
+            const auto value_count = length - 4u;
+            write.values.reserve(value_count);
+            for (std::uint32_t value_index = 0;
+                 readable && value_index < value_count;
+                 ++value_index) {
+                std::uint32_t value{};
+                readable = TryReadGuestValue(
+                    packet_address + 16u +
+                        static_cast<std::uint64_t>(
+                            value_index) * 4u,
+                    value);
+                if (readable) {
+                    write.values.push_back(value);
+                }
+            }
+            const bool supported_destination =
+                write.destination_selection == 1u ||
+                write.destination_selection == 2u ||
+                write.destination_selection == 4u ||
+                write.destination_selection == 5u;
+            if (readable && supported_destination &&
+                destination_address != 0 &&
+                write.values.size() == value_count) {
+                deferred_data_writes.push_back(
+                    std::move(write));
+            } else {
+                ++data_write_failures;
+            }
+        }
+        if (opcode == AgcItDmaData && length >= 7u) {
+            std::uint32_t control{};
+            std::uint32_t command{};
+            std::uint64_t destination_address{};
+            std::uint64_t source_address{};
+            bool copied{};
+            std::uint32_t byte_count{};
+            std::uint32_t source_selection{};
+            std::uint32_t destination_selection{};
+            const bool readable =
+                TryReadGuestValue(packet_address + 4u, control) &&
+                TryReadGuestValue(
+                    packet_address + 8u, source_address) &&
+                TryReadGuestValue(
+                    packet_address + 16u, destination_address) &&
+                TryReadGuestValue(packet_address + 24u, command);
+            if (readable) {
+                byte_count = command & 0x03ffffffu;
+                source_selection =
+                    ((control >> 29u) & 0x3u) |
+                    ((command >> 24u) & 0x4u) |
+                    ((command >> 25u) & 0x8u);
+                destination_selection =
+                    ((control >> 20u) & 0x3u) |
+                    ((command >> 25u) & 0x4u) |
+                    ((command >> 26u) & 0x8u);
+                const bool destination_memory =
+                    destination_selection == 0u ||
+                    destination_selection == 3u;
+                const bool source_memory =
+                    source_selection == 0u ||
+                    source_selection == 3u;
+                if (byte_count != 0 &&
+                    byte_count <= 256u * 1024u * 1024u &&
+                    destination_address != 0 &&
+                    destination_memory) {
+                    std::vector<std::uint8_t> bytes(byte_count);
+                    if (source_selection == 2u) {
+                        const auto fill =
+                            static_cast<std::uint32_t>(
+                                source_address);
+                        for (std::size_t index = 0;
+                             index < bytes.size(); ++index) {
+                            bytes[index] =
+                                static_cast<std::uint8_t>(
+                                    fill >>
+                                    ((index & 3u) * 8u));
+                        }
+                        copied = TryWriteGuestBytes(
+                            destination_address,
+                            bytes.data(), bytes.size());
+                    } else if (source_memory &&
+                               source_address != 0 &&
+                               TryReadGuestBytes(
+                                   source_address,
+                                   bytes.data(), bytes.size())) {
+                        copied = TryWriteGuestBytes(
+                            destination_address,
+                            bytes.data(), bytes.size());
+                    }
+                }
+            }
+            dma_write_count += copied;
+            dma_write_failures += !copied;
+#ifdef __ANDROID__
+            static std::atomic<std::uint32_t> standard_dma_logs{};
+            if (standard_dma_logs.fetch_add(
+                    1u, std::memory_order_relaxed) < 8u) {
+                __android_log_print(
+                    copied ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+                    "LSX4-PS5",
+                    "dma_data standard=1 dst=0x%llx src=0x%llx "
+                    "bytes=%u src_sel=%u dst_sel=%u copied=%d",
+                    static_cast<unsigned long long>(
+                        destination_address),
+                    static_cast<unsigned long long>(
+                        source_address),
+                    byte_count, source_selection,
+                    destination_selection, copied ? 1 : 0);
+            }
+#endif
+        }
         if (opcode == AgcItNop &&
             packet_register == AgcRDmaData &&
             length >= 7u) {
@@ -7073,13 +11276,19 @@ skip_packet_diagnostic_log:
                 compact_layout ? 4u : 16u;
             const auto source_offset =
                 compact_layout ? 12u : 24u;
+            const auto selector_offset =
+                compact_layout ? 24u : 4u;
             std::uint32_t byte_count{};
+            std::uint32_t selectors{};
             std::uint64_t destination_address{};
             std::uint64_t source_address{};
             bool copied{};
             if (TryReadGuestValue(
                     packet_address + byte_count_offset,
                     byte_count) &&
+                TryReadGuestValue(
+                    packet_address + selector_offset,
+                    selectors) &&
                 TryReadGuestValue(
                     packet_address + destination_offset,
                     destination_address) &&
@@ -7090,11 +11299,16 @@ skip_packet_diagnostic_log:
                 byte_count <= 256u * 1024u * 1024u &&
                 destination_address != 0) {
                 std::vector<std::uint8_t> bytes(byte_count);
+                const auto source_selection =
+                    compact_layout
+                        ? selectors & 0xffu
+                        : (selectors >> 16u) & 0xffu;
                 const bool immediate_fill =
-                    compact_layout &&
-                    destination_address >= 0x10000u &&
-                    source_address <=
-                        std::numeric_limits<std::uint32_t>::max();
+                    source_selection == 2u ||
+                    (compact_layout &&
+                     destination_address >= 0x10000u &&
+                     source_address <=
+                         std::numeric_limits<std::uint32_t>::max());
                 if (immediate_fill) {
                     const auto fill =
                         static_cast<std::uint32_t>(
@@ -7132,14 +11346,14 @@ skip_packet_diagnostic_log:
                            : ANDROID_LOG_WARN,
                     "LSX4-PS5",
                     "dma_data compact=%d dst=0x%llx "
-                    "src=0x%llx bytes=%u copied=%d "
+                    "src=0x%llx bytes=%u selectors=%08x copied=%d "
                     "observed=0x%llx read=%d",
                     compact_layout ? 1 : 0,
                     static_cast<unsigned long long>(
                         destination_address),
                     static_cast<unsigned long long>(
                         source_address),
-                    byte_count, copied ? 1 : 0,
+                    byte_count, selectors, copied ? 1 : 0,
                     static_cast<unsigned long long>(observed),
                     observed_ok ? 1 : 0);
             }
@@ -7153,6 +11367,7 @@ skip_packet_diagnostic_log:
             index_buffer_address = 0;
             index_buffer_count = 0;
             index_size = 0;
+            instance_count = 1;
         }
         if (opcode == AgcItNop &&
             (packet_register == AgcRCxRegsIndirect ||
@@ -7216,10 +11431,39 @@ skip_packet_diagnostic_log:
                 }
             }
         }
+        if (opcode == AgcItSetBase && length == 4u) {
+            std::uint32_t base_index{};
+            std::uint32_t address_low{};
+            std::uint32_t address_high{};
+            if (TryReadGuestValue(
+                    packet_address + 4u, base_index) &&
+                TryReadGuestValue(
+                    packet_address + 8u, address_low) &&
+                TryReadGuestValue(
+                    packet_address + 12u, address_high) &&
+                (base_index & 0xfu) == 1u) {
+                // libSceAgc encodes Gnmp::ShaderType in PM4 header bit 1:
+                // zero is draw, one is dispatch.
+                const auto shader_type = (header >> 1u) & 0x3u;
+                if (shader_type == 1u) {
+                    dispatch_indirect_args_base =
+                        static_cast<std::uint64_t>(
+                            address_low & ~7u) |
+                        (static_cast<std::uint64_t>(
+                             address_high & 0xffffu)
+                         << 32u);
+                }
+            }
+        }
         if (opcode == AgcItIndexBase && length >= 3u) {
             (void)TryReadGuestValue(
                 packet_address + 4u, index_buffer_address);
         } else if (opcode == AgcItIndexBufferSize &&
+                   length >= 2u) {
+            (void)TryReadGuestValue(
+                packet_address + 4u, index_buffer_count);
+        } else if (opcode == AgcItNop &&
+                   packet_register == AgcRIndexCount &&
                    length >= 2u) {
             (void)TryReadGuestValue(
                 packet_address + 4u, index_buffer_count);
@@ -7228,9 +11472,628 @@ skip_packet_diagnostic_log:
             (void)TryReadGuestValue(
                 packet_address + 4u, index_size);
             index_size &= 3u;
+        } else if (opcode == AgcItNumInstances &&
+                   length >= 2u) {
+            (void)TryReadGuestValue(
+                packet_address + 4u, instance_count);
+            instance_count = std::max(instance_count, 1u);
         }
-        if (opcode == AgcItDrawIndexOffset2 &&
-            length >= 5u) {
+#ifdef __ANDROID__
+        if ((opcode == AgcItDispatchDirect ||
+             opcode == AgcItDispatchIndirect) &&
+            length >= 3u) {
+            static std::atomic<std::uint32_t> dispatch_logs{};
+            const auto log_index = dispatch_logs.fetch_add(
+                1u, std::memory_order_relaxed);
+            {
+                std::uint64_t dimensions_address =
+                    packet_address + 4u;
+                std::uint32_t initiator{};
+                if (opcode == AgcItDispatchIndirect) {
+                    if (length >= 4u) {
+                        // ACB packet: absolute 64-bit argument address.
+                        (void)TryReadGuestValue(
+                            packet_address + 4u,
+                            dimensions_address);
+                        (void)TryReadGuestValue(
+                            packet_address + 12u, initiator);
+                    } else {
+                        // DCB packet: 32-bit byte offset from the
+                        // dispatch argument base established by SET_BASE.
+                        std::uint32_t data_offset{};
+                        (void)TryReadGuestValue(
+                            packet_address + 4u, data_offset);
+                        dimensions_address =
+                            dispatch_indirect_args_base +
+                            data_offset;
+                        (void)TryReadGuestValue(
+                            packet_address + 8u, initiator);
+                    }
+                } else if (opcode == AgcItDispatchDirect &&
+                           length >= 5u) {
+                    (void)TryReadGuestValue(
+                        packet_address + 16u, initiator);
+                }
+                std::array<std::uint32_t, 3> dimensions{};
+                (void)TryReadGuestBytes(
+                    dimensions_address, dimensions.data(),
+                    sizeof(dimensions));
+                if (opcode == AgcItDispatchDirect &&
+                    length < 5u) {
+                    dimensions[2] = 1u;
+                    if (length >= 4u) {
+                        (void)TryReadGuestValue(
+                            packet_address + 12u, initiator);
+                    }
+                }
+                for (auto& dimension : dimensions) {
+                    if (dimension > 65535u) {
+                        dimension = 1u;
+                    }
+                }
+                const auto value =
+                    [&](const std::uint32_t index) {
+                        const auto found = sh_registers.find(index);
+                        return found == sh_registers.end()
+                            ? 0u : found->second;
+                    };
+                const auto shader_address =
+                    (static_cast<std::uint64_t>(
+                         value(AgcComputePgmHi)) << 40u) |
+                    (static_cast<std::uint64_t>(
+                         value(AgcComputePgmLo)) << 8u);
+                struct CachedGen5Kernel {
+                    bool attempted{};
+                    bool compiled{};
+                    std::vector<std::uint32_t> spirv;
+                    Lsx4::Ps5Desktop::Gen5ComputeProgramInfo info;
+                };
+                static std::mutex gen5_cache_mutex;
+                static std::unordered_map<
+                    std::uint64_t, CachedGen5Kernel> gen5_cache;
+                Lsx4::Ps5Desktop::Gen5ComputeProgramInfo
+                    program_info{};
+                std::vector<std::uint32_t> program_spirv;
+                bool compiled{};
+                if (shader_address != 0) {
+                    auto kernel_key = shader_address;
+                    for (std::uint32_t index = 0;
+                         index < 64u; ++index) {
+                        const auto word =
+                            value(AgcComputeUserData + index);
+                        kernel_key ^=
+                            static_cast<std::uint64_t>(word) +
+                            UINT64_C(0x9e3779b97f4a7c15) +
+                            (kernel_key << 6u) +
+                            (kernel_key >> 2u);
+                    }
+                    for (const auto word : {
+                             value(AgcComputeNumThreadX),
+                             value(AgcComputeNumThreadY),
+                             value(AgcComputeNumThreadZ),
+                             value(AgcComputePgmRsrc1),
+                             value(AgcComputePgmRsrc2),
+                             initiator & UINT32_C(0x20),
+                             dimensions[0], dimensions[1],
+                             dimensions[2]}) {
+                        kernel_key ^=
+                            static_cast<std::uint64_t>(word) +
+                            UINT64_C(0x9e3779b97f4a7c15) +
+                            (kernel_key << 6u) +
+                            (kernel_key >> 2u);
+                    }
+                    const std::lock_guard cache_lock{
+                        gen5_cache_mutex};
+                    auto& cached = gen5_cache[kernel_key];
+                    if (!cached.attempted &&
+                        gen5_cache.size() <= 256u) {
+                        cached.attempted = true;
+                        std::array<std::uint32_t, 4096>
+                            shader_code{};
+                        if (TryReadGuestBytes(
+                                shader_address, shader_code.data(),
+                                sizeof(shader_code))) {
+                            Lsx4::Ps5Desktop::
+                                Gen5ComputeCompileRequest
+                                    compile_request{};
+                            compile_request.shader_address =
+                                shader_address;
+                            compile_request.code = shader_code;
+                            for (std::uint32_t index = 0;
+                                 index <
+                                     compile_request.user_data.size();
+                                 ++index) {
+                                compile_request.user_data[index] =
+                                    value(
+                                        AgcComputeUserData + index);
+                            }
+                            compile_request.local_size = {
+                                std::max(
+                                    value(AgcComputeNumThreadX), 1u),
+                                std::max(
+                                    value(AgcComputeNumThreadY), 1u),
+                                std::max(
+                                    value(AgcComputeNumThreadZ), 1u)};
+                            const auto compute_rsrc2 =
+                                value(AgcComputePgmRsrc2);
+                            compile_request.user_data_count =
+                                (compute_rsrc2 >> 1u) &
+                                UINT32_C(0x1f);
+                            compile_request.compute_group_id = {
+                                ((compute_rsrc2 >> 7u) & 1u) != 0u,
+                                ((compute_rsrc2 >> 8u) & 1u) != 0u,
+                                ((compute_rsrc2 >> 9u) & 1u) != 0u};
+                            compile_request.compute_tg_size_en =
+                                ((compute_rsrc2 >> 10u) & 1u) != 0u;
+                            compile_request.compute_thread_ids_num =
+                                ((compute_rsrc2 >> 11u) & 3u) + 1u;
+                            compile_request.compute_workgroup_register =
+                                compile_request.user_data_count;
+                            compile_request
+                                .dispatch_thread_dimensions =
+                                    (initiator & UINT32_C(0x20)) != 0u;
+                            compile_request.dispatch_threads =
+                                dimensions;
+                            compile_request.wave_size =
+                                (value(AgcComputePgmRsrc1) &
+                                 UINT32_C(0x40000000)) != 0
+                                ? 32u : 64u;
+                            compile_request.read_memory =
+                                [](void*,
+                                   const std::uint64_t address,
+                                   std::uint32_t* const output) {
+                                    return output != nullptr &&
+                                        TryReadGuestValue(
+                                            address, *output);
+                            };
+                            std::string compile_error;
+                            __android_log_print(
+                                ANDROID_LOG_INFO,
+                                "LSX4-PS5-GEN5",
+                                "compile begin shader=0x%llx wave=%u "
+                                "local=%u/%u/%u",
+                                static_cast<unsigned long long>(
+                                    shader_address),
+                                compile_request.wave_size,
+                                compile_request.local_size[0],
+                                compile_request.local_size[1],
+                                compile_request.local_size[2]);
+                            cached.compiled =
+                                Lsx4::Ps5Desktop::
+                                    TryCompileGen5Compute(
+                                        compile_request, cached.spirv,
+                                        &cached.info,
+                                        compile_error);
+                            __android_log_print(
+                                cached.compiled
+                                    ? ANDROID_LOG_INFO
+                                    : ANDROID_LOG_WARN,
+                                "LSX4-PS5-GEN5",
+                                "compile shader=0x%llx wave=%u "
+                                "local=%u/%u/%u ok=%u words=%zu "
+                                "buffers=%zu images=%zu addresses=%zu "
+                                "copy=%u image_copy=%u "
+                                "src_ud=%u dst_ud=%u error=%s",
+                                static_cast<unsigned long long>(
+                                    shader_address),
+                                compile_request.wave_size,
+                                compile_request.local_size[0],
+                                compile_request.local_size[1],
+                                compile_request.local_size[2],
+                                cached.compiled ? 1u : 0u,
+                                cached.spirv.size(),
+                                cached.info.buffers.size(),
+                                cached.info.images.size(),
+                                cached.info.address_count,
+                                cached.info.simple_buffer_copy
+                                    ? 1u : 0u,
+                                cached.info.simple_image_copy
+                                    ? 1u : 0u,
+                                cached.info.copy_source_user_data,
+                                cached.info
+                                    .copy_destination_user_data,
+                                compile_error.c_str());
+                            if (cached.compiled) {
+                                for (const auto& binding :
+                                     cached.info.descriptors) {
+                                    __android_log_print(
+                                        ANDROID_LOG_INFO,
+                                        "LSX4-PS5-GEN5",
+                                        "layout shader=0x%llx set=%u "
+                                        "binding=%u kind=%u count=%zu "
+                                        "push=%u+%u",
+                                        static_cast<unsigned long long>(
+                                            shader_address),
+                                        cached.info.descriptor_set,
+                                        binding.binding, binding.kind,
+                                        binding.resources.size(),
+                                        cached.info.push_constant_offset,
+                                        cached.info.push_constant_size);
+                                }
+                                for (std::uint32_t index = 0;
+                                     index < cached.info.images.size();
+                                     ++index) {
+                                    const auto& image =
+                                        cached.info.images[index];
+                                    __android_log_print(
+                                        ANDROID_LOG_INFO,
+                                        "LSX4-PS5-GEN5",
+                                        "image shader=0x%llx i=%u "
+                                        "addr=0x%llx size=%ux%ux%u "
+                                        "type=%u fmt=%u tile=%u kind=%u "
+                                        "rw=%u/%u/%u",
+                                        static_cast<unsigned long long>(
+                                            shader_address),
+                                        index,
+                                        static_cast<unsigned long long>(
+                                            image.guest_address),
+                                        image.width, image.height,
+                                        image.depth, image.type,
+                                        image.format, image.tile_mode,
+                                        image.resource_kind,
+                                        image.read ? 1u : 0u,
+                                        image.written ? 1u : 0u,
+                                        image.atomic ? 1u : 0u);
+                                }
+                                for (std::uint32_t index = 0;
+                                     index <
+                                         cached.info.addresses.size();
+                                     ++index) {
+                                    const auto& address =
+                                        cached.info.addresses[index];
+                                    __android_log_print(
+                                        ANDROID_LOG_INFO,
+                                        "LSX4-PS5-GEN5",
+                                        "address shader=0x%llx i=%u "
+                                        "guest=0x%llx binding=0x%llx "
+                                        "min=%d rw=%u/%u/%u",
+                                        static_cast<unsigned long long>(
+                                            shader_address),
+                                        index,
+                                        static_cast<unsigned long long>(
+                                            address.guest_base),
+                                        static_cast<unsigned long long>(
+                                            address.binding_base),
+                                        address.min_offset,
+                                        address.read ? 1u : 0u,
+                                        address.written ? 1u : 0u,
+                                        address.atomic ? 1u : 0u);
+                                }
+                            }
+                        }
+                    }
+                    compiled = cached.compiled;
+                    program_info = cached.info;
+                    program_spirv = cached.spirv;
+                }
+                if (compiled) {
+                    for (auto& buffer : program_info.buffers) {
+                        const auto offset =
+                            buffer.user_data_dword;
+                        if (offset == UINT32_MAX ||
+                            offset + 2u >= 64u) {
+                            continue;
+                        }
+                        for (std::uint32_t word = 0;
+                             word <
+                                 buffer.descriptor_dword_count &&
+                             offset + word < 64u;
+                             ++word) {
+                            buffer.descriptor[word] =
+                                value(
+                                    AgcComputeUserData +
+                                    offset + word);
+                        }
+                        buffer.guest_address =
+                            static_cast<std::uint64_t>(
+                                buffer.descriptor[0]) |
+                            (static_cast<std::uint64_t>(
+                                 buffer.descriptor[1] &
+                                 UINT32_C(0xffff))
+                             << 32u);
+                        const auto stride =
+                            (buffer.descriptor[1] >> 16u) &
+                            UINT32_C(0x3fff);
+                        buffer.byte_count =
+                            static_cast<std::uint64_t>(
+                                buffer.descriptor[2]) *
+                            std::max(stride, 1u);
+                    }
+                    for (std::size_t index = 0;
+                         index <
+                             program_info.packed_user_data.size() &&
+                         index <
+                             program_info
+                                 .packed_user_data_indices.size();
+                         ++index) {
+                        const auto source =
+                            program_info
+                                .packed_user_data_indices[index];
+                        if (source < 64u) {
+                            program_info.packed_user_data[index] =
+                                value(
+                                    AgcComputeUserData + source);
+                        }
+                    }
+                }
+                if ((initiator & UINT32_C(0x20)) != 0u) {
+                    const std::array<std::uint32_t, 3> local_size{
+                        std::max(
+                            value(AgcComputeNumThreadX), 1u),
+                        std::max(
+                            value(AgcComputeNumThreadY), 1u),
+                        std::max(
+                            value(AgcComputeNumThreadZ), 1u)};
+                    for (std::uint32_t axis = 0; axis < 3u;
+                         ++axis) {
+                        dimensions[axis] =
+                            dimensions[axis] == 0u ? 0u :
+                            (dimensions[axis] +
+                             local_size[axis] - 1u) /
+                                local_size[axis];
+                    }
+                }
+                bool vulkan_compute{};
+                if (compiled && !program_info.buffers.empty() &&
+                    program_info.images.empty() &&
+                    program_info.addresses.empty()) {
+                    vulkan_compute =
+                        Lsx4::Ps5Desktop::
+                            ExecuteVulkanGen5ComputeBuffers(
+                                program_spirv, program_info,
+                                dimensions,
+                                [](void*,
+                                   const std::uint64_t address,
+                                   void* const output,
+                                   const std::size_t size) {
+                                    return TryReadGuestBytes(
+                                        address, output, size);
+                                },
+                                [](void*,
+                                   const std::uint64_t address,
+                                   const void* const input,
+                                   const std::size_t size) {
+                                    return TryWriteGuestBytes(
+                                        address, input, size);
+                                },
+                                nullptr);
+                    static std::atomic<std::uint32_t>
+                        vulkan_compute_logs{};
+                    const auto compute_index =
+                        vulkan_compute_logs.fetch_add(
+                            1u, std::memory_order_relaxed);
+                    if (compute_index < 64u) {
+                        __android_log_print(
+                            vulkan_compute
+                                ? ANDROID_LOG_INFO
+                                : ANDROID_LOG_WARN,
+                            "LSX4-PS5-GEN5",
+                            "vulkan buffer dispatch n=%u "
+                            "shader=0x%llx groups=%u/%u/%u "
+                            "buffers=%zu ok=%u",
+                            compute_index + 1u,
+                            static_cast<unsigned long long>(
+                                shader_address),
+                            dimensions[0], dimensions[1],
+                            dimensions[2],
+                            program_info.buffers.size(),
+                            vulkan_compute ? 1u : 0u);
+                    }
+                }
+                bool vulkan_image_compute{};
+                if (compiled &&
+                    !program_info.images.empty()) {
+                    vulkan_image_compute =
+                        Lsx4::Ps5Desktop::
+                            ExecuteVulkanGen5ComputeImages(
+                                program_spirv, program_info,
+                                dimensions,
+                                [](void*,
+                                   const std::uint64_t address,
+                                   void* const output,
+                                   const std::size_t size) {
+                                    return TryReadGuestBytes(
+                                        address, output, size);
+                                },
+                                [](void*,
+                                   const std::uint64_t address,
+                                   const void* const input,
+                                   const std::size_t size) {
+                                    return TryWriteGuestBytes(
+                                        address, input, size);
+                                },
+                                nullptr);
+                    static std::atomic<std::uint32_t>
+                        vulkan_image_logs{};
+                    const auto compute_index =
+                        vulkan_image_logs.fetch_add(
+                            1u, std::memory_order_relaxed);
+                    if (compute_index < 64u) {
+                        __android_log_print(
+                            vulkan_image_compute
+                                ? ANDROID_LOG_INFO
+                                : ANDROID_LOG_WARN,
+                            "LSX4-PS5-GEN5",
+                            "vulkan image dispatch n=%u "
+                            "shader=0x%llx groups=%u/%u/%u "
+                            "images=%zu samplers=%zu ok=%u",
+                            compute_index + 1u,
+                            static_cast<unsigned long long>(
+                                shader_address),
+                            dimensions[0], dimensions[1],
+                            dimensions[2],
+                            program_info.images.size(),
+                            program_info.samplers.size(),
+                            vulkan_image_compute ? 1u : 0u);
+                    }
+                }
+                if (compiled && !vulkan_compute &&
+                    program_info.simple_buffer_copy) {
+                    const auto decode_buffer =
+                        [&](const std::uint32_t offset,
+                            std::uint64_t& address,
+                            std::uint64_t& byte_count) {
+                            if (offset + 2u >= 64u) {
+                                return false;
+                            }
+                            const auto word0 =
+                                value(AgcComputeUserData + offset);
+                            const auto word1 =
+                                value(AgcComputeUserData + offset + 1u);
+                            const auto records =
+                                value(AgcComputeUserData + offset + 2u);
+                            address =
+                                static_cast<std::uint64_t>(word0) |
+                                (static_cast<std::uint64_t>(
+                                     word1 & UINT32_C(0xffff)) << 32u);
+                            const auto stride =
+                                (word1 >> 16u) & UINT32_C(0x3fff);
+                            byte_count =
+                                static_cast<std::uint64_t>(records) *
+                                std::max(stride, 1u);
+                            return address != 0 && byte_count != 0 &&
+                                byte_count <= UINT64_C(0x10000000);
+                        };
+                    std::uint64_t source_address{};
+                    std::uint64_t source_size{};
+                    std::uint64_t destination_address{};
+                    std::uint64_t destination_size{};
+                    if (decode_buffer(
+                            program_info.copy_source_user_data,
+                            source_address, source_size) &&
+                        decode_buffer(
+                            program_info.copy_destination_user_data,
+                            destination_address,
+                            destination_size)) {
+                        const auto copy_size = static_cast<std::size_t>(
+                            std::min(source_size, destination_size));
+                        thread_local std::vector<std::uint8_t>
+                            copy_buffer;
+                        copy_buffer.resize(copy_size);
+                        const auto copied =
+                            TryReadGuestBytes(
+                                source_address, copy_buffer.data(),
+                                copy_size) &&
+                            TryWriteGuestBytes(
+                                destination_address,
+                                copy_buffer.data(), copy_size);
+                        static std::atomic<std::uint32_t>
+                            copy_logs{};
+                        const auto copy_index =
+                            copy_logs.fetch_add(
+                                1u, std::memory_order_relaxed);
+                        if (copy_index < 32u) {
+                            __android_log_print(
+                                copied ? ANDROID_LOG_INFO
+                                       : ANDROID_LOG_WARN,
+                                "LSX4-PS5-GEN5",
+                                "copy n=%u shader=0x%llx "
+                                "source=0x%llx destination=0x%llx "
+                                "bytes=%zu ok=%u",
+                                copy_index + 1u,
+                                static_cast<unsigned long long>(
+                                    shader_address),
+                                static_cast<unsigned long long>(
+                                    source_address),
+                                static_cast<unsigned long long>(
+                                    destination_address),
+                                copy_size, copied ? 1u : 0u);
+                        }
+                    }
+                }
+                if (compiled && !vulkan_image_compute &&
+                    program_info.simple_image_copy) {
+                    const auto& source = program_info.images[
+                        program_info.copy_source_image];
+                    const auto& destination = program_info.images[
+                        program_info.copy_destination_image];
+                    const auto bytes_per_pixel =
+                        source.format == UINT32_C(0x47) ? 8u :
+                        source.format == UINT32_C(0x1) ? 1u : 4u;
+                    const auto byte_count64 =
+                        static_cast<std::uint64_t>(source.width) *
+                        source.height * bytes_per_pixel;
+                    if (byte_count64 != 0 &&
+                        byte_count64 <= UINT64_C(0x10000000)) {
+                        const auto byte_count =
+                            static_cast<std::size_t>(byte_count64);
+                        thread_local std::vector<std::uint8_t>
+                            image_copy_buffer;
+                        image_copy_buffer.resize(byte_count);
+                        const auto copied =
+                            TryReadGuestBytes(
+                                source.guest_address,
+                                image_copy_buffer.data(), byte_count) &&
+                            TryWriteGuestBytes(
+                                destination.guest_address,
+                                image_copy_buffer.data(), byte_count);
+                        static std::atomic<std::uint32_t>
+                            image_copy_logs{};
+                        const auto copy_index =
+                            image_copy_logs.fetch_add(
+                                1u, std::memory_order_relaxed);
+                        if (copy_index < 32u) {
+                            __android_log_print(
+                                copied ? ANDROID_LOG_INFO
+                                       : ANDROID_LOG_WARN,
+                                "LSX4-PS5-GEN5",
+                                "image copy n=%u shader=0x%llx "
+                                "source=0x%llx destination=0x%llx "
+                                "size=%ux%u format=%02x tile=%u "
+                                "bytes=%zu ok=%u",
+                                copy_index + 1u,
+                                static_cast<unsigned long long>(
+                                    shader_address),
+                                static_cast<unsigned long long>(
+                                    source.guest_address),
+                                static_cast<unsigned long long>(
+                                    destination.guest_address),
+                                source.width, source.height,
+                                source.format, source.tile_mode,
+                                byte_count, copied ? 1u : 0u);
+                        }
+                    }
+                }
+                if (log_index < 96u) {
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5-AGC",
+                        "dispatch n=%u op=%02x packet=0x%llx "
+                        "shader=0x%llx dims=%u/%u/%u init=%08x "
+                        "start=%u/%u/%u local=%08x/%08x/%08x "
+                        "ud=%08x:%08x:%08x:%08x:"
+                        "%08x:%08x:%08x:%08x",
+                        log_index + 1u, opcode,
+                        static_cast<unsigned long long>(
+                            packet_address),
+                        static_cast<unsigned long long>(
+                            shader_address),
+                        dimensions[0], dimensions[1],
+                        dimensions[2], initiator,
+                        value(AgcComputeStartX),
+                        value(AgcComputeStartY),
+                        value(AgcComputeStartZ),
+                        value(AgcComputeNumThreadX),
+                        value(AgcComputeNumThreadY),
+                        value(AgcComputeNumThreadZ),
+                        value(AgcComputeUserData + 0u),
+                        value(AgcComputeUserData + 1u),
+                        value(AgcComputeUserData + 2u),
+                        value(AgcComputeUserData + 3u),
+                        value(AgcComputeUserData + 4u),
+                        value(AgcComputeUserData + 5u),
+                        value(AgcComputeUserData + 6u),
+                        value(AgcComputeUserData + 7u));
+                }
+            }
+        }
+#endif
+        const bool draw_index_offset =
+            opcode == AgcItDrawIndexOffset2 && length >= 5u;
+        const bool draw_index_auto =
+            opcode == AgcItNop &&
+            packet_register == AgcRDrawIndexAuto &&
+            length >= 7u;
+        if (draw_index_offset || draw_index_auto) {
             ++parsed_draw_count;
             const auto presenter_word0 = sh_registers[0x0c];
             const auto presenter_word1 = sh_registers[0x0d];
@@ -7253,13 +12116,20 @@ skip_packet_diagnostic_log:
             };
             AgcDiagnosticDraw diagnostic{
                 .texture_address = presenter.address,
-                .index_buffer_address = index_buffer_address,
+                .index_buffer_address =
+                    draw_index_auto ? 0u : index_buffer_address,
                 .texture_width = presenter.width,
                 .texture_height = presenter.height,
                 .texture_tile_mode = presenter.tile_mode,
                 .texture_format = presenter.unified_format,
-                .index_buffer_count = index_buffer_count,
+                .index_buffer_count =
+                    draw_index_auto ? 0u : index_buffer_count,
                 .index_size = index_size,
+                .instance_count = instance_count,
+                .primitive_type =
+                    uc_registers.contains(UINT32_C(0x242))
+                    ? uc_registers[UINT32_C(0x242)]
+                    : 0u,
             };
             const auto register_value =
                 [](const auto& registers,
@@ -7270,7 +12140,9 @@ skip_packet_diagnostic_log:
                         : 0u;
                 };
             diagnostic.cx_target_mask =
-                register_value(cx_registers, AgcCbTargetMask);
+                cx_registers.contains(AgcCbTargetMask)
+                ? cx_registers.at(AgcCbTargetMask)
+                : UINT32_MAX;
             diagnostic.cx_blend0_control =
                 register_value(cx_registers, AgcCbBlend0Control);
             diagnostic.cx_color_base =
@@ -7327,6 +12199,12 @@ skip_packet_diagnostic_log:
             }
 #endif
             for (std::uint32_t word = 0; word < 16u; ++word) {
+                diagnostic.sh_ps_user_data[word] =
+                    register_value(
+                        sh_registers, 0x0c + word);
+                diagnostic.sh_vs_user_data[word] =
+                    register_value(
+                        sh_registers, 0x4c + word);
                 diagnostic.sh_gs_user_data[word] =
                     register_value(
                         sh_registers, 0x8c + word);
@@ -7334,10 +12212,397 @@ skip_packet_diagnostic_log:
                     register_value(
                         sh_registers, 0xcc + word);
             }
-            (void)TryReadGuestValue(
-                packet_address + 8u, diagnostic.index_offset);
-            (void)TryReadGuestValue(
-                packet_address + 12u, diagnostic.draw_count);
+#ifdef __ANDROID__
+            struct CompiledGraphicsStage {
+                std::vector<std::uint32_t> spirv;
+                Lsx4::Ps5Desktop::Gen5ComputeProgramInfo info;
+                bool ok{};
+            };
+            const auto probe_graphics_stage =
+                [&](const std::uint64_t shader_address,
+                    const Lsx4::Ps5Desktop::Gen5ShaderStage stage,
+                    const std::array<std::uint32_t, 16>& user_data,
+                    const std::uint32_t rsrc1,
+                    const std::uint32_t rsrc2)
+                    -> std::shared_ptr<const CompiledGraphicsStage> {
+                    if (shader_address == 0u) {
+                        return {};
+                    }
+                    static std::mutex graphics_probe_mutex;
+                    static std::unordered_map<
+                        std::uint64_t,
+                        std::shared_ptr<CompiledGraphicsStage>>
+                        graphics_probe_cache;
+                    auto cache_key =
+                        shader_address |
+                        (stage ==
+                                 Lsx4::Ps5Desktop::Gen5ShaderStage::Pixel
+                             ? UINT64_C(0x8000000000000000)
+                             : 0u);
+                    for (const auto word : user_data) {
+                        cache_key ^=
+                            static_cast<std::uint64_t>(word) +
+                            UINT64_C(0x9e3779b97f4a7c15) +
+                            (cache_key << 6u) +
+                            (cache_key >> 2u);
+                    }
+                    cache_key ^=
+                        static_cast<std::uint64_t>(rsrc1) << 1u;
+                    cache_key ^=
+                        static_cast<std::uint64_t>(rsrc2) << 33u;
+                    if (stage ==
+                        Lsx4::Ps5Desktop::Gen5ShaderStage::Pixel) {
+                        constexpr std::array<std::uint32_t, 6>
+                            pixel_state_registers{
+                                AgcSpiPsInputEna,
+                                AgcSpiPsInputAddr,
+                                AgcSpiPsInControl,
+                                AgcSpiShaderColFormat,
+                                AgcDbShaderControl,
+                                AgcCbTargetMask};
+                        for (const auto reg :
+                             pixel_state_registers) {
+                            cache_key ^=
+                                static_cast<std::uint64_t>(
+                                    register_value(
+                                        cx_registers, reg)) +
+                                UINT64_C(0x9e3779b97f4a7c15) +
+                                (cache_key << 6u) +
+                                (cache_key >> 2u);
+                        }
+                        for (std::uint32_t input = 0;
+                             input < 32u; ++input) {
+                            cache_key ^=
+                                static_cast<std::uint64_t>(
+                                    register_value(
+                                        cx_registers,
+                                        AgcSpiPsInputCntl0 +
+                                            input)) +
+                                UINT64_C(0x9e3779b97f4a7c15) +
+                                (cache_key << 6u) +
+                                (cache_key >> 2u);
+                        }
+                    }
+                    const std::lock_guard probe_lock{
+                        graphics_probe_mutex};
+                    if (const auto found =
+                            graphics_probe_cache.find(cache_key);
+                        found != graphics_probe_cache.end()) {
+                        return found->second;
+                    }
+                    if (graphics_probe_cache.size() >= 256u) {
+                        return {};
+                    }
+                    std::array<std::uint32_t, 4096> shader_code{};
+                    if (!TryReadGuestBytes(
+                            shader_address, shader_code.data(),
+                            sizeof(shader_code))) {
+                        return {};
+                    }
+                    Lsx4::Ps5Desktop::Gen5ComputeCompileRequest
+                        request{};
+                    request.shader_address = shader_address;
+                    request.code = shader_code;
+                    request.stage = stage;
+                    request.wave_size =
+                        (rsrc1 & UINT32_C(0x40000000)) != 0u
+                        ? 32u : 64u;
+                    request.user_data_base =
+                        stage ==
+                                Lsx4::Ps5Desktop::Gen5ShaderStage::Vertex
+                        ? 8u : 0u;
+                    request.descriptor_set =
+                        stage ==
+                                Lsx4::Ps5Desktop::Gen5ShaderStage::Pixel
+                        ? 1u : 0u;
+                    request.user_data_count =
+                        ((rsrc2 >> 1u) & UINT32_C(0x1f)) |
+                        (((rsrc2 >> 27u) & 1u) << 5u);
+                    std::copy(
+                        user_data.begin(), user_data.end(),
+                        request.user_data.begin());
+                    if (stage ==
+                        Lsx4::Ps5Desktop::Gen5ShaderStage::Pixel) {
+                        request.pixel_input_enable =
+                            register_value(
+                                cx_registers,
+                                AgcSpiPsInputEna);
+                        request.pixel_input_address =
+                            register_value(
+                                cx_registers,
+                                AgcSpiPsInputAddr);
+                        request.pixel_input_count =
+                            register_value(
+                                cx_registers,
+                                AgcSpiPsInControl) &
+                            UINT32_C(0x3f);
+                        const auto shader_color_format =
+                            register_value(
+                                cx_registers,
+                                AgcSpiShaderColFormat);
+                        for (std::uint32_t slot = 0;
+                             slot < 8u; ++slot) {
+                            request.pixel_target_output_mode[slot] =
+                                static_cast<std::uint8_t>(
+                                    (shader_color_format >>
+                                     (slot * 4u)) &
+                                    0xfu);
+                            request.pixel_interpolator_settings[slot] =
+                                register_value(
+                                    cx_registers,
+                                    AgcSpiPsInputCntl0 +
+                                        slot);
+                        }
+                        for (std::uint32_t input = 8u;
+                             input < 32u; ++input) {
+                            request.pixel_interpolator_settings[input] =
+                                register_value(
+                                    cx_registers,
+                                    AgcSpiPsInputCntl0 +
+                                        input);
+                        }
+                        const auto target_mask =
+                            register_value(
+                                cx_registers,
+                                AgcCbTargetMask);
+                        request.pixel_mrt_output_mask = 0u;
+                        for (std::uint32_t slot = 0;
+                             slot < 8u; ++slot) {
+                            if (((target_mask >>
+                                  (slot * 4u)) &
+                                 0xfu) != 0u) {
+                                request.pixel_mrt_output_mask |=
+                                    1u << slot;
+                            }
+                            const auto color_info =
+                                register_value(
+                                    cx_registers,
+                                    AgcCbColor0Info +
+                                        slot *
+                                            AgcCbColorRegisterStride);
+                            const auto layout =
+                                (color_info >> 2u) & 0x1fu;
+                            const auto number_type =
+                                (color_info >> 8u) & 0x7u;
+                            const auto channel_order =
+                                (color_info >> 11u) & 0x3u;
+                            if (layout == 12u &&
+                                number_type == 7u) {
+                                if (channel_order == 1u) {
+                                    request
+                                        .pixel_target_export_mapping
+                                            [slot] = 0xc6u;
+                                } else if (
+                                    channel_order == 2u) {
+                                    request
+                                        .pixel_target_export_mapping
+                                            [slot] = 0x1bu;
+                                }
+                            }
+                        }
+                        const auto db_shader_control =
+                            register_value(
+                                cx_registers,
+                                AgcDbShaderControl);
+                        request.pixel_depth_export_enable =
+                            (db_shader_control & 1u) != 0u;
+                        const auto z_behavior =
+                            (db_shader_control >> 4u) & 3u;
+                        request.pixel_kill_enable =
+                            (db_shader_control &
+                             UINT32_C(0x40)) != 0u;
+                        request.pixel_sample_mask_export_enable =
+                            (db_shader_control &
+                             UINT32_C(0x100)) != 0u;
+                        request.pixel_execute_on_noop =
+                            (db_shader_control &
+                             UINT32_C(0x400)) != 0u;
+                        request.pixel_early_z =
+                            z_behavior == 1u &&
+                            !request.pixel_kill_enable &&
+                            !request.pixel_depth_export_enable &&
+                            !request.pixel_sample_mask_export_enable;
+                    }
+                    request.read_memory =
+                        [](void*, const std::uint64_t address,
+                           std::uint32_t* const output) {
+                            return output != nullptr &&
+                                TryReadGuestValue(address, *output);
+                        };
+                    auto compiled =
+                        std::make_shared<CompiledGraphicsStage>();
+                    std::string error;
+                    compiled->ok =
+                        Lsx4::Ps5Desktop::TryCompileGen5Compute(
+                            request, compiled->spirv,
+                            &compiled->info, error);
+                    graphics_probe_cache.emplace(
+                        cache_key, compiled);
+                    if (compiled->ok) {
+                        const std::filesystem::path dump_directory{
+                            "/data/user/0/app.lsx4.android/files/"
+                            "lsx4-home/ps5-shader-dumps"};
+                        std::error_code dump_error;
+                        std::filesystem::create_directories(
+                            dump_directory, dump_error);
+                        const auto stem =
+                            std::string{
+                                stage ==
+                                        Lsx4::Ps5Desktop::
+                                            Gen5ShaderStage::Vertex
+                                    ? "vs-" : "ps-"} +
+                            std::to_string(shader_address);
+                        if (auto* const stream = std::fopen(
+                                (dump_directory /
+                                 (stem + ".spv")).string().c_str(),
+                                "wb");
+                            stream != nullptr) {
+                            (void)std::fwrite(
+                                compiled->spirv.data(),
+                                sizeof(std::uint32_t),
+                                compiled->spirv.size(), stream);
+                            std::fclose(stream);
+                        }
+                        if (auto* const stream = std::fopen(
+                                (dump_directory /
+                                 (stem + ".bin")).string().c_str(),
+                                "wb");
+                            stream != nullptr) {
+                            (void)std::fwrite(
+                                shader_code.data(),
+                                sizeof(std::uint32_t),
+                                shader_code.size(), stream);
+                            std::fclose(stream);
+                        }
+                    }
+                    __android_log_print(
+                        compiled->ok
+                            ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+                        "LSX4-PS5-GFX",
+                        "stage=%s shader=0x%llx ok=%u words=%zu "
+                        "buffers=%zu images=%zu samplers=%zu "
+                        "addresses=%zu in=%08x out=%08x mrt=%08x "
+                        "frag=%u psabi=%08x/%08x/%u error=%s",
+                        stage ==
+                                Lsx4::Ps5Desktop::Gen5ShaderStage::Vertex
+                            ? "vs" : "ps",
+                        static_cast<unsigned long long>(
+                            shader_address),
+                        compiled->ok ? 1u : 0u,
+                        compiled->spirv.size(),
+                        compiled->info.buffers.size(),
+                        compiled->info.images.size(),
+                        compiled->info.samplers.size(),
+                        compiled->info.addresses.size(),
+                        compiled->info.parameter_input_mask,
+                        compiled->info.parameter_output_mask,
+                        compiled->info.mrt_output_mask,
+                        compiled->info.uses_fragment_coordinates
+                            ? 1u : 0u,
+                        request.pixel_input_enable,
+                        request.pixel_input_address,
+                        request.pixel_input_count,
+                        error.c_str());
+                    if (compiled->ok) {
+                        for (std::size_t image_index = 0;
+                             image_index <
+                                 compiled->info.images.size();
+                             ++image_index) {
+                            const auto& image =
+                                compiled->info.images[image_index];
+                            __android_log_print(
+                                ANDROID_LOG_INFO,
+                                "LSX4-PS5-GFX",
+                                "resource shader=0x%llx i=%zu "
+                                "addr=0x%llx size=%ux%ux%u "
+                                "type=%u fmt=%u tile=%u rw=%u/%u/%u",
+                                static_cast<unsigned long long>(
+                                    shader_address),
+                                image_index,
+                                static_cast<unsigned long long>(
+                                    image.guest_address),
+                                image.width, image.height,
+                                image.depth, image.type,
+                                image.format, image.tile_mode,
+                                image.read ? 1u : 0u,
+                                image.written ? 1u : 0u,
+                                image.atomic ? 1u : 0u);
+                        }
+                    }
+                    return compiled;
+                };
+            const auto vertex_address =
+                (static_cast<std::uint64_t>(
+                     diagnostic.sh_es_program_hi & 0xffu) << 40u) |
+                (static_cast<std::uint64_t>(
+                     diagnostic.sh_es_program_lo) << 8u);
+            const auto pixel_address =
+                (static_cast<std::uint64_t>(
+                     diagnostic.sh_ps_program_hi & 0xffu) << 40u) |
+                (static_cast<std::uint64_t>(
+                     diagnostic.sh_ps_program_lo) << 8u);
+            std::shared_ptr<const CompiledGraphicsStage>
+                compiled_vertex;
+            std::shared_ptr<const CompiledGraphicsStage>
+                compiled_pixel;
+#endif
+            const auto has_resource2 =
+                [&](const std::uint32_t user_data_register) {
+                    return sh_registers.contains(
+                        user_data_register - 1u);
+                };
+            const auto has_user_data =
+                [&](const std::uint32_t user_data_register) {
+                    for (std::uint32_t word = 0;
+                         word < 16u; ++word) {
+                        if (sh_registers.contains(
+                                user_data_register + word)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+            const std::array<std::uint32_t, 3>
+                export_user_data_candidates{
+                    0x8cu, 0xccu, 0x4cu};
+            auto export_user_data_register = 0xccu;
+            bool selected_export_bank{};
+            for (const auto candidate :
+                 export_user_data_candidates) {
+                if (has_resource2(candidate)) {
+                    export_user_data_register = candidate;
+                    selected_export_bank = true;
+                    break;
+                }
+            }
+            if (!selected_export_bank) {
+                for (const auto candidate :
+                     export_user_data_candidates) {
+                    if (has_user_data(candidate)) {
+                        export_user_data_register = candidate;
+                        break;
+                    }
+                }
+            }
+            for (std::uint32_t word = 0; word < 16u; ++word) {
+                diagnostic.sh_export_user_data[word] =
+                    register_value(
+                        sh_registers,
+                        export_user_data_register + word);
+            }
+            if (draw_index_auto) {
+                diagnostic.index_offset = 0;
+                (void)TryReadGuestValue(
+                    packet_address + 4u,
+                    diagnostic.draw_count);
+            } else {
+                (void)TryReadGuestValue(
+                    packet_address + 8u,
+                    diagnostic.index_offset);
+                (void)TryReadGuestValue(
+                    packet_address + 12u,
+                    diagnostic.draw_count);
+            }
             const auto target_mask =
                 cx_registers.contains(AgcCbTargetMask)
                 ? cx_registers[AgcCbTargetMask]
@@ -7388,12 +12653,138 @@ skip_packet_diagnostic_log:
                     (info >> 2u) & 0x1fu;
                 diagnostic.render_target_number_type =
                     (info >> 8u) & 0x7u;
+                diagnostic.render_target_channel_order =
+                    (info >> 11u) & 0x3u;
                 diagnostic.render_target_tile_mode =
                     (attrib3 >> 14u) & 0x1fu;
+                diagnostic.cx_blend0_control =
+                    register_value(
+                        cx_registers,
+                        AgcCbBlend0Control + slot);
                 break;
             }
+            if (UseFullGen5Graphics()) {
+                (void)TryResolveAgcTextureDescriptor(
+                    diagnostic, diagnostic_draws);
+            }
             diagnostic_draws.push_back(diagnostic);
-            (void)TryApplyAgcCpuClearOrCopy(diagnostic);
+            const bool prefer_cpu_fast_path =
+                is_cpu_draw_candidate(diagnostic);
+            const bool enable_gen5_graphics =
+                UseFullGen5Graphics() &&
+                gen5_only_shader_pairs.contains(
+                    gen5_shader_pair_key(diagnostic));
+            bool vulkan_graphics{};
+#ifdef __ANDROID__
+            if (!prefer_cpu_fast_path &&
+                enable_gen5_graphics) {
+                compiled_vertex = probe_graphics_stage(
+                    vertex_address,
+                    Lsx4::Ps5Desktop::Gen5ShaderStage::Vertex,
+                    diagnostic.sh_gs_user_data,
+                    register_value(sh_registers, 0x8a),
+                    register_value(sh_registers, 0x8b));
+                compiled_pixel = probe_graphics_stage(
+                    pixel_address,
+                    Lsx4::Ps5Desktop::Gen5ShaderStage::Pixel,
+                    diagnostic.sh_ps_user_data,
+                    register_value(sh_registers, 0x0a),
+                    register_value(sh_registers, 0x0b));
+            }
+            if (compiled_vertex && compiled_vertex->ok &&
+                compiled_pixel && compiled_pixel->ok &&
+                diagnostic.draw_count != 0u) {
+                const auto index_bytes =
+                    diagnostic.index_size == 4u ? 4u : 2u;
+                const Lsx4::Ps5Desktop::VulkanGen5GraphicsDraw
+                    graphics_draw{
+                        .target_address =
+                            diagnostic.render_target_address,
+                        .index_address =
+                            diagnostic.index_buffer_address +
+                            static_cast<std::uint64_t>(
+                                diagnostic.index_offset) *
+                                index_bytes,
+                        .target_width =
+                            diagnostic.render_target_width,
+                        .target_height =
+                            diagnostic.render_target_height,
+                        .target_tile_mode =
+                            diagnostic.render_target_tile_mode,
+                        .target_format =
+                            diagnostic.render_target_format,
+                        .target_number_type =
+                            diagnostic.render_target_number_type,
+                        .target_channel_order =
+                            diagnostic.render_target_channel_order,
+                        .blend_control =
+                            diagnostic.cx_blend0_control,
+                        .color_write_mask =
+                            (diagnostic.cx_target_mask >>
+                             (diagnostic.render_target_slot * 4u)) &
+                            0xfu,
+                        .primitive_type =
+                            diagnostic.primitive_type,
+                        .vertex_count = diagnostic.draw_count,
+                        .instance_count =
+                            diagnostic.instance_count,
+                        .index_size = index_bytes,
+                        .indexed = !draw_index_auto,
+                    };
+                vulkan_graphics =
+                    Lsx4::Ps5Desktop::ExecuteVulkanGen5Graphics(
+                        compiled_vertex->spirv,
+                        compiled_vertex->info,
+                        compiled_pixel->spirv,
+                        compiled_pixel->info,
+                        graphics_draw,
+                        [](void*, const std::uint64_t address,
+                           void* const output,
+                           const std::size_t size) {
+                            return TryReadGuestBytes(
+                                address, output, size);
+                        },
+                        [](void*, const std::uint64_t address,
+                           const void* const input,
+                           const std::size_t size) {
+                            return TryWriteGuestBytes(
+                                address, input, size);
+                        },
+                        nullptr);
+                static std::atomic<std::uint32_t>
+                    graphics_execution_logs{};
+                const auto execution_index =
+                    graphics_execution_logs.fetch_add(
+                        1u, std::memory_order_relaxed);
+                if (execution_index < 128u) {
+                    __android_log_print(
+                        vulkan_graphics
+                            ? ANDROID_LOG_INFO
+                            : ANDROID_LOG_WARN,
+                        "LSX4-PS5-GFX",
+                        "execute n=%u vs=0x%llx ps=0x%llx "
+                        "target=0x%llx %ux%u tile=%u "
+                        "primitive=%u count=%u indexed=%u ok=%u",
+                        execution_index + 1u,
+                        static_cast<unsigned long long>(
+                            vertex_address),
+                        static_cast<unsigned long long>(
+                            pixel_address),
+                        static_cast<unsigned long long>(
+                            diagnostic.render_target_address),
+                        diagnostic.render_target_width,
+                        diagnostic.render_target_height,
+                        diagnostic.render_target_tile_mode,
+                        diagnostic.primitive_type,
+                        diagnostic.draw_count,
+                        draw_index_auto ? 0u : 1u,
+                        vulkan_graphics ? 1u : 0u);
+                }
+            }
+#endif
+            if (!vulkan_graphics) {
+                (void)TryApplyAgcCpuClearOrCopy(diagnostic);
+            }
             bool should_dump_draw_state{};
             bool should_dump_texture{};
             {
@@ -7593,38 +12984,55 @@ skip_packet_diagnostic_log:
         }
         offset += length;
     }
-    const auto is_cpu_draw_candidate =
-        [](const AgcDiagnosticDraw& draw) {
-            if ((draw.sh_es_program_lo & UINT32_C(0xfff)) ==
-                    UINT32_C(0xc40) &&
-                (draw.sh_ps_program_lo & UINT32_C(0xfff)) ==
-                    UINT32_C(0xc38)) {
-                return false;
-            }
-            return draw.sh_es_program_hi == 0 &&
-                (draw.sh_es_program_lo &
-                 UINT32_C(0xff000000)) ==
-                    UINT32_C(0x20000000) &&
-                draw.sh_ps_program_hi == 0 &&
-                (draw.sh_ps_program_lo &
-                 UINT32_C(0xff000000)) ==
-                    UINT32_C(0x20000000) &&
-                (draw.texture_tile_mode == 0 ||
-                 draw.texture_tile_mode == 5) &&
-                (draw.texture_format == UINT32_C(0x1) ||
-                 draw.texture_format == UINT32_C(0x38) ||
-                 draw.texture_format == UINT32_C(0xad) ||
-                 draw.texture_format == UINT32_C(0xb5)) &&
-                draw.texture_width >= 16u &&
-                draw.texture_height >= 16u;
-        };
     cpu_render_decided = std::ranges::any_of(
         diagnostic_draws, is_cpu_draw_candidate);
+    if (UseFullGen5Graphics()) {
+        if (cpu_render_decided) {
+            for (const auto& draw : diagnostic_draws) {
+                gen5_only_shader_pairs.erase(
+                    gen5_shader_pair_key(draw));
+            }
+        } else {
+            for (const auto& draw : diagnostic_draws) {
+                if (draw.sh_es_program_lo != 0u &&
+                    draw.sh_ps_program_lo != 0u) {
+                    gen5_only_shader_pairs.insert(
+                        gen5_shader_pair_key(draw));
+                }
+            }
+        }
+    }
     if (cpu_render_decided) {
         const std::lock_guard lock{g_runtime.mutex};
         if (g_runtime.agc_cpu_capture_active) {
             cpu_capture_target =
                 g_runtime.agc_cpu_capture_target;
+        }
+    }
+    if (UseVulkanGuestRaster() && cpu_render_decided) {
+        const auto display_copy = std::ranges::find_if(
+            diagnostic_draws,
+            [](const AgcDiagnosticDraw& draw) {
+                return draw.draw_count == 4u &&
+                    draw.texture_address != 0 &&
+                    draw.texture_width ==
+                        draw.render_target_width &&
+                    draw.texture_height ==
+                        draw.render_target_height &&
+                    draw.texture_tile_mode ==
+                        draw.render_target_tile_mode;
+            });
+        const auto last_candidate = std::ranges::find_if(
+            diagnostic_draws.rbegin(),
+            diagnostic_draws.rend(),
+            is_cpu_draw_candidate);
+        if (display_copy != diagnostic_draws.end()) {
+            cpu_capture_target = display_copy->texture_address;
+        } else if (cpu_capture_target == 0) {
+            if (last_candidate != diagnostic_draws.rend()) {
+                cpu_capture_target =
+                    last_candidate->render_target_address;
+            }
         }
     }
     const auto is_cpu_target_relevant =
@@ -7646,7 +13054,137 @@ skip_packet_diagnostic_log:
                 return is_cpu_draw_candidate(draw) &&
                     is_cpu_target_relevant(draw);
             });
+#ifdef __ANDROID__
+    if (!diagnostic_draws.empty()) {
+        static std::atomic<bool> logged_gameplay_draws{};
+        static std::atomic<bool> logged_gameplay_multi_draws{};
+        auto& log_gate =
+            diagnostic_draws.size() > 1u
+            ? logged_gameplay_multi_draws
+            : logged_gameplay_draws;
+        if (!log_gate.exchange(
+                true, std::memory_order_relaxed)) {
+            for (std::size_t ordinal = 0;
+                 ordinal < diagnostic_draws.size(); ++ordinal) {
+                const auto& draw = diagnostic_draws[ordinal];
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "gameplay draw=%zu target=0x%llx/%ux%u/t%u "
+                    "texture=0x%llx/%ux%u/f%02x/t%u "
+                    "es=%08x ps=%08x indices=%u/%u/%u "
+                    "instances=%u relevant=%u candidate=%u",
+                    ordinal,
+                    static_cast<unsigned long long>(
+                        draw.render_target_address),
+                    draw.render_target_width,
+                    draw.render_target_height,
+                    draw.render_target_tile_mode,
+                    static_cast<unsigned long long>(
+                        draw.texture_address),
+                    draw.texture_width, draw.texture_height,
+                    draw.texture_format, draw.texture_tile_mode,
+                    draw.sh_es_program_lo, draw.sh_ps_program_lo,
+                    draw.index_buffer_count, draw.index_offset,
+                    draw.draw_count, draw.instance_count,
+                    is_cpu_target_relevant(draw) ? 1u : 0u,
+                    is_cpu_draw_candidate(draw) ? 1u : 0u);
+            }
+        }
+        if (diagnostic_draws.size() >= 8u) {
+            static std::atomic<bool> logged_large_ps5_batch{};
+            if (!logged_large_ps5_batch.exchange(
+                    true, std::memory_order_relaxed)) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "large draw batch count=%zu capture=0x%llx "
+                    "decided=%u allowed=%u",
+                    diagnostic_draws.size(),
+                    static_cast<unsigned long long>(
+                        cpu_capture_target),
+                    cpu_render_decided ? 1u : 0u,
+                    cpu_render_allowed ? 1u : 0u);
+                for (std::size_t ordinal = 0;
+                     ordinal < diagnostic_draws.size(); ++ordinal) {
+                    const auto& draw = diagnostic_draws[ordinal];
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5",
+                        "large draw=%zu target=0x%llx/%ux%u/f%02x/t%u "
+                        "texture=0x%llx/%ux%u/f%02x/t%u "
+                        "prim=%u es=%08x/%08x ps=%08x/%08x "
+                        "count=%u candidate=%u relevant=%u",
+                        ordinal,
+                        static_cast<unsigned long long>(
+                            draw.render_target_address),
+                        draw.render_target_width,
+                        draw.render_target_height,
+                        draw.render_target_format,
+                        draw.render_target_tile_mode,
+                        static_cast<unsigned long long>(
+                            draw.texture_address),
+                        draw.texture_width, draw.texture_height,
+                        draw.texture_format, draw.texture_tile_mode,
+                        draw.primitive_type,
+                        draw.sh_es_program_lo,
+                        draw.sh_es_program_hi,
+                        draw.sh_ps_program_lo,
+                        draw.sh_ps_program_hi,
+                        draw.draw_count,
+                        is_cpu_draw_candidate(draw) ? 1u : 0u,
+                        is_cpu_target_relevant(draw) ? 1u : 0u);
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5",
+                        "large draw=%zu psud="
+                        "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x "
+                        "index=0x%llx/%u",
+                        ordinal,
+                        draw.sh_ps_user_data[0],
+                        draw.sh_ps_user_data[1],
+                        draw.sh_ps_user_data[2],
+                        draw.sh_ps_user_data[3],
+                        draw.sh_ps_user_data[4],
+                        draw.sh_ps_user_data[5],
+                        draw.sh_ps_user_data[6],
+                        draw.sh_ps_user_data[7],
+                        static_cast<unsigned long long>(
+                            draw.index_buffer_address),
+                        draw.index_buffer_count);
+                    std::array<std::uint32_t, 16> ps_root{};
+                    const auto ps_root_address =
+                        static_cast<std::uint64_t>(
+                            draw.sh_ps_user_data[0]) |
+                        (static_cast<std::uint64_t>(
+                             draw.sh_ps_user_data[1] &
+                             UINT32_C(0xffff))
+                         << 32u);
+                    const auto ps_root_read =
+                        TryReadGuestBytes(
+                            ps_root_address, ps_root.data(),
+                            sizeof(ps_root));
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5",
+                        "large draw=%zu psroot=0x%llx read=%u "
+                        "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x,"
+                        "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x",
+                        ordinal,
+                        static_cast<unsigned long long>(
+                            ps_root_address),
+                        ps_root_read ? 1u : 0u,
+                        ps_root[0], ps_root[1], ps_root[2],
+                        ps_root[3], ps_root[4], ps_root[5],
+                        ps_root[6], ps_root[7], ps_root[8],
+                        ps_root[9], ps_root[10], ps_root[11],
+                        ps_root[12], ps_root[13], ps_root[14],
+                        ps_root[15]);
+                }
+            }
+        }
+    }
+#endif
+    const auto cpu_render_started =
+        std::chrono::steady_clock::now();
     if (cpu_render_allowed) {
+        std::vector<Lsx4::Ps5Desktop::VulkanGuestPass>
+            gpu_command_passes;
         std::erase_if(
             cpu_texture_cache,
             [&](const AgcCpuDecodedTexture& texture) {
@@ -7672,10 +13210,116 @@ skip_packet_diagnostic_log:
                     (draw.sh_es_program_lo & UINT32_C(0xfff)) ==
                         UINT32_C(0xbaa);
             });
+        const bool has_game_maker_pass = std::ranges::any_of(
+            diagnostic_draws,
+            [](const AgcDiagnosticDraw& draw) {
+                const auto suffix =
+                    draw.sh_ps_program_lo & UINT32_C(0xfff);
+                return suffix == UINT32_C(0xf13) ||
+                    suffix == UINT32_C(0x311) ||
+                    suffix == UINT32_C(0x459);
+            });
+#ifdef __ANDROID__
+        static std::atomic<bool> observed_game_maker_pass{};
+        static std::atomic<bool> observed_full_menu_pass{};
+        if (has_game_maker_pass) {
+            observed_game_maker_pass.store(
+                true, std::memory_order_relaxed);
+            if (diagnostic_draws.size() == 17u) {
+                observed_full_menu_pass.store(
+                    true, std::memory_order_relaxed);
+            }
+        }
+        if (observed_full_menu_pass.load(
+                std::memory_order_relaxed) &&
+            diagnostic_draws.size() == 15u) {
+            static std::atomic<bool> logged_gameplay_pass{};
+            if (!logged_gameplay_pass.exchange(
+                    true, std::memory_order_relaxed)) {
+                for (std::size_t ordinal = 0;
+                     ordinal < diagnostic_draws.size(); ++ordinal) {
+                    const auto& draw = diagnostic_draws[ordinal];
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5",
+                        "gm gameplay draw=%zu target=0x%llx/%ux%u/t%u "
+                        "texture=0x%llx/%ux%u/f%02x/t%u "
+                        "es=%03x ps=%03x count=%u index=0x%llx",
+                        ordinal,
+                        static_cast<unsigned long long>(
+                            draw.render_target_address),
+                        draw.render_target_width,
+                        draw.render_target_height,
+                        draw.render_target_tile_mode,
+                        static_cast<unsigned long long>(
+                            draw.texture_address),
+                        draw.texture_width, draw.texture_height,
+                        draw.texture_format, draw.texture_tile_mode,
+                        draw.sh_es_program_lo & UINT32_C(0xfff),
+                        draw.sh_ps_program_lo & UINT32_C(0xfff),
+                        draw.draw_count,
+                        static_cast<unsigned long long>(
+                            draw.index_buffer_address));
+                }
+            }
+        }
+        if (observed_game_maker_pass.load(
+                std::memory_order_relaxed) &&
+            (!has_game_maker_pass ||
+             (observed_full_menu_pass.load(
+                  std::memory_order_relaxed) &&
+              diagnostic_draws.size() != 17u))) {
+            static std::atomic<std::uint32_t> post_menu_draw_logs{};
+            for (const auto& draw : diagnostic_draws) {
+                if (post_menu_draw_logs.fetch_add(
+                        1u, std::memory_order_relaxed) >= 60u) {
+                    break;
+                }
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5",
+                    "post-menu draw target=0x%llx/%ux%u/t%u "
+                    "texture=0x%llx/%ux%u/f%02x/t%u "
+                    "es=%03x ps=%03x count=%u index=0x%llx",
+                    static_cast<unsigned long long>(
+                        draw.render_target_address),
+                    draw.render_target_width,
+                    draw.render_target_height,
+                    draw.render_target_tile_mode,
+                    static_cast<unsigned long long>(
+                        draw.texture_address),
+                    draw.texture_width, draw.texture_height,
+                    draw.texture_format, draw.texture_tile_mode,
+                    draw.sh_es_program_lo & UINT32_C(0xfff),
+                    draw.sh_ps_program_lo & UINT32_C(0xfff),
+                    draw.draw_count,
+                    static_cast<unsigned long long>(
+                        draw.index_buffer_address));
+            }
+        }
+#endif
         for (std::size_t ordinal = 0;
              ordinal < diagnostic_draws.size(); ++ordinal) {
             const auto& draw = diagnostic_draws[ordinal];
-            if (!is_cpu_draw_candidate(draw) ||
+            const auto is_surface_copy =
+                draw.texture_address != 0u &&
+                draw.render_target_address != 0u &&
+                draw.texture_address !=
+                    draw.render_target_address &&
+                (draw.draw_count == 4u ||
+                 draw.draw_count == 6u) &&
+                draw.texture_width >= 16u &&
+                draw.texture_height >= 16u &&
+                (draw.texture_width ==
+                     draw.render_target_width ||
+                 draw.render_target_width %
+                         draw.texture_width ==
+                     0u) &&
+                (draw.texture_height ==
+                     draw.render_target_height ||
+                 draw.render_target_height %
+                          draw.texture_height ==
+                      0u);
+            if ((!is_cpu_draw_candidate(draw) &&
+                 !(has_game_maker_pass && is_surface_copy)) ||
                 !is_cpu_target_relevant(draw)) {
                 continue;
             }
@@ -7683,7 +13327,7 @@ skip_packet_diagnostic_log:
                 cpu_frame_target != draw.render_target_address) {
                 if (cpu_frame != nullptr &&
                     cpu_frame_target != 0 &&
-                    !cpu_frame->rgba.empty()) {
+                    HasAgcFrameContent(*cpu_frame)) {
                     cpu_command_surfaces[cpu_frame_target] =
                         cpu_frame;
                 }
@@ -7695,9 +13339,9 @@ skip_packet_diagnostic_log:
                 if (command_surface !=
                         cpu_command_surfaces.end() &&
                     command_surface->second != nullptr &&
-                    !command_surface->second->rgba.empty()) {
+                    HasAgcFrameContent(*command_surface->second)) {
                     *accumulated = *command_surface->second;
-                } else {
+                } else if (!has_game_maker_pass) {
                     const std::lock_guard lock{g_runtime.mutex};
                     auto existing =
                         g_runtime.agc_cpu_working_surfaces.find(
@@ -7705,7 +13349,7 @@ skip_packet_diagnostic_log:
                     if (existing !=
                             g_runtime.agc_cpu_working_surfaces.end() &&
                         existing->second != nullptr &&
-                        !existing->second->rgba.empty()) {
+                        HasAgcFrameContent(*existing->second)) {
                         *accumulated = *existing->second;
                     } else {
                         existing = g_runtime.agc_cpu_surfaces.find(
@@ -7713,7 +13357,7 @@ skip_packet_diagnostic_log:
                         if (existing !=
                                 g_runtime.agc_cpu_surfaces.end() &&
                             existing->second != nullptr &&
-                            !existing->second->rgba.empty()) {
+                            HasAgcFrameContent(*existing->second)) {
                             *accumulated = *existing->second;
                         }
                     }
@@ -7723,12 +13367,49 @@ skip_packet_diagnostic_log:
                 accumulated->eligible_draw_mask = 0;
                 accumulated->rendered_draw_mask = 0;
                 accumulated->draw_coverage.fill(0);
+                accumulated->gpu_frame =
+                    accumulated->gpu_frame != nullptr
+                    ? std::make_shared<
+                          Lsx4::Ps5Desktop::VulkanGuestFrame>(
+                          *accumulated->gpu_frame)
+                    : nullptr;
+                if (accumulated->gpu_frame != nullptr) {
+                    accumulated->gpu_frame->target_key =
+                        draw.render_target_address;
+                    accumulated->gpu_frame->base_batch_id =
+                        accumulated->gpu_frame->batch_id;
+                    accumulated->gpu_frame->first_new_draw =
+                        accumulated->gpu_frame->draws.size();
+                    accumulated->gpu_frame->preserve_target =
+                        !accumulated->gpu_frame->draws.empty();
+                }
                 cpu_frame = std::move(accumulated);
                 cpu_frame_target = draw.render_target_address;
             }
-            (void)TryCompositeAgcCpuDraw(
+            const auto composited = TryCompositeAgcCpuDraw(
                 draw, *cpu_frame, ordinal, !has_splash_overlay,
-                cpu_texture_cache);
+                cpu_texture_cache,
+                has_game_maker_pass ? &gpu_command_passes : nullptr,
+                has_game_maker_pass && is_surface_copy,
+                cpu_texture_probe_serial);
+#ifdef __ANDROID__
+            if (has_game_maker_pass) {
+                static std::atomic<std::uint32_t>
+                    game_maker_composite_logs{};
+                if (game_maker_composite_logs.fetch_add(
+                        1u, std::memory_order_relaxed) < 40u) {
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5",
+                        "gm composite draw=%zu copy=%u ok=%u "
+                        "target=0x%llx passes=%zu",
+                        ordinal, is_surface_copy ? 1u : 0u,
+                        composited ? 1u : 0u,
+                        static_cast<unsigned long long>(
+                            draw.render_target_address),
+                        gpu_command_passes.size());
+                }
+            }
+#endif
             cpu_command_surfaces[cpu_frame_target] = cpu_frame;
             if (cpu_texture_cache.size() >
                 AgcCpuTextureCacheLimit) {
@@ -7745,42 +13426,71 @@ skip_packet_diagnostic_log:
                     draw.texture_height ==
                         draw.render_target_height &&
                     draw.texture_tile_mode ==
-                        draw.render_target_tile_mode;
+                    draw.render_target_tile_mode;
             });
+        auto selected_final_blit = final_blit;
+        if (has_game_maker_pass) {
+            const auto display_blit = std::ranges::find_if(
+                diagnostic_draws,
+                [](const AgcDiagnosticDraw& draw) {
+                    return draw.texture_address != 0u &&
+                        draw.texture_width == 1280u &&
+                        draw.texture_height == 720u &&
+                        draw.render_target_width >= 2560u &&
+                        draw.render_target_height >= 1440u;
+                });
+            if (display_blit != diagnostic_draws.end()) {
+                selected_final_blit = display_blit;
+            }
+        }
         std::shared_ptr<AgcCpuFrame> final_blit_frame;
-        if (final_blit != diagnostic_draws.end()) {
+        if (selected_final_blit != diagnostic_draws.end()) {
+            const auto final_surface_key =
+                selected_final_blit->texture_address;
             const auto command_source =
                 cpu_command_surfaces.find(
-                    final_blit->texture_address);
+                    final_surface_key);
             if (command_source != cpu_command_surfaces.end()) {
                 final_blit_frame = command_source->second;
             } else {
                 const std::lock_guard lock{g_runtime.mutex};
                 const auto working_source =
                     g_runtime.agc_cpu_working_surfaces.find(
-                        final_blit->texture_address);
+                        final_surface_key);
                 if (working_source !=
                         g_runtime.agc_cpu_working_surfaces.end() &&
                     working_source->second != nullptr &&
-                    !working_source->second->rgba.empty()) {
+                    HasAgcFrameContent(*working_source->second)) {
                     final_blit_frame = working_source->second;
                 } else {
                     const auto published_source =
                         g_runtime.agc_cpu_surfaces.find(
-                        final_blit->texture_address);
+                        final_surface_key);
                     if (published_source !=
                             g_runtime.agc_cpu_surfaces.end() &&
                         published_source->second != nullptr &&
-                        !published_source->second->rgba.empty()) {
+                        HasAgcFrameContent(*published_source->second)) {
                         final_blit_frame =
                             published_source->second;
                     }
                 }
             }
         }
-        if (final_blit != diagnostic_draws.end() &&
+        if (selected_final_blit != diagnostic_draws.end() &&
             final_blit_frame != nullptr &&
             final_blit_frame->rendered_draws != 0u) {
+            if (has_game_maker_pass &&
+                final_blit_frame->gpu_frame != nullptr &&
+                !gpu_command_passes.empty()) {
+                final_blit_frame->gpu_frame =
+                    std::make_shared<
+                        Lsx4::Ps5Desktop::VulkanGuestFrame>(
+                        *final_blit_frame->gpu_frame);
+                final_blit_frame->gpu_frame->target_key =
+                    selected_final_blit->texture_address;
+                final_blit_frame->gpu_frame->passes =
+                    std::move(gpu_command_passes);
+            }
             bool accepted{};
             std::uint64_t best_coverage{};
             std::uint32_t best_rendered_draws{};
@@ -7799,10 +13509,10 @@ skip_packet_diagnostic_log:
                     g_runtime.agc_cpu_best_coverage =
                         final_blit_frame->covered_pixels;
                     g_runtime.agc_cpu_surfaces[
-                        final_blit->texture_address] =
+                        selected_final_blit->texture_address] =
                             final_blit_frame;
                     g_runtime.agc_cpu_surfaces[
-                        final_blit->render_target_address] =
+                        selected_final_blit->render_target_address] =
                             final_blit_frame;
                     g_runtime.agc_cpu_frame = final_blit_frame;
                     g_runtime.agc_cpu_capture_active = false;
@@ -7843,6 +13553,42 @@ skip_packet_diagnostic_log:
             }
 #endif
         }
+    }
+    const auto cpu_render_finished =
+        std::chrono::steady_clock::now();
+    for (const auto& write : deferred_data_writes) {
+        bool wrote = true;
+        for (std::size_t index = 0;
+             wrote && index < write.values.size();
+             ++index) {
+            const auto target =
+                write.destination_address +
+                (write.increment_address
+                     ? static_cast<std::uint64_t>(index) * 4u
+                     : 0u);
+            wrote = TryWriteGuestValue(
+                target, write.values[index]);
+        }
+        data_write_count += wrote;
+        data_write_failures += !wrote;
+#ifdef __ANDROID__
+        static std::atomic<std::uint32_t> data_write_logs{};
+        if (data_write_logs.fetch_add(
+                1u, std::memory_order_relaxed) < 16u) {
+            __android_log_print(
+                wrote ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
+                "LSX4-PS5",
+                "write_data deferred=1 standard=%d dst_sel=%u "
+                "dst=0x%llx count=%zu increment=%d wrote=%d",
+                write.standard_packet ? 1 : 0,
+                write.destination_selection,
+                static_cast<unsigned long long>(
+                    write.destination_address),
+                write.values.size(),
+                write.increment_address ? 1 : 0,
+                wrote ? 1 : 0);
+        }
+#endif
     }
     for (const auto& write : deferred_release_writes) {
         const auto timestamp = static_cast<std::uint64_t>(
@@ -7886,13 +13632,56 @@ skip_packet_diagnostic_log:
              cpu_command_surfaces) {
             if (surface_target == 0 ||
                 surface == nullptr ||
-                surface->rgba.empty() ||
+                !HasAgcFrameContent(*surface) ||
                 surface->rendered_draws == 0u ||
                 surface->covered_pixels == 0u) {
                 continue;
             }
             g_runtime.agc_cpu_working_surfaces[surface_target] =
                 surface;
+            if (surface->gpu_frame != nullptr) {
+                const auto extended_frame =
+                    !surface->gpu_frame->passes.empty() ||
+                    std::ranges::any_of(
+                        surface->gpu_frame->draws,
+                        [](const auto& draw) {
+                            return draw.extended_blend_contract;
+                        });
+                if (!extended_frame) {
+                    // The original single-pass contract publishes only the
+                    // completed final blit below. Publishing its intermediate
+                    // display surfaces exposes alternating partial frames.
+                    continue;
+                }
+                const auto incoming_complete =
+                    surface->eligible_draw_mask != 0u &&
+                    surface->rendered_draw_mask ==
+                        surface->eligible_draw_mask;
+                const auto existing =
+                    g_runtime.agc_cpu_surfaces.find(surface_target);
+                const auto existing_complete =
+                    existing != g_runtime.agc_cpu_surfaces.end() &&
+                    existing->second != nullptr &&
+                    existing->second->eligible_draw_mask != 0u &&
+                    existing->second->rendered_draw_mask ==
+                        existing->second->eligible_draw_mask;
+                const auto is_display_surface =
+                    std::ranges::any_of(
+                        g_runtime.guest_video_out_ports,
+                        [&](const auto& entry) {
+                            return std::ranges::find(
+                                       entry.second.buffer_addresses,
+                                       surface_target) !=
+                                entry.second.buffer_addresses.end();
+                        });
+                if (is_display_surface &&
+                    (incoming_complete || !existing_complete)) {
+                    g_runtime.agc_cpu_surfaces[surface_target] =
+                        surface;
+                    g_runtime.agc_cpu_frame = surface;
+                }
+                continue;
+            }
             const auto incoming_complete =
                 surface->eligible_draw_mask != 0u &&
                 surface->rendered_draw_mask ==
@@ -7918,6 +13707,9 @@ skip_packet_diagnostic_log:
         g_runtime.agc_index_buffer_count =
             index_buffer_count;
         g_runtime.agc_index_size = index_size;
+        g_runtime.agc_instance_count = instance_count;
+        g_runtime.agc_dispatch_indirect_args_base =
+            dispatch_indirect_args_base;
     }
     if (has_diagnostic_flip) {
         ObserveAgcFlip(
@@ -7978,6 +13770,33 @@ skip_packet_diagnostic_log:
                 draw_signature);
             ++g_runtime.agc_draw_signature_logs;
         }
+    }
+    static std::atomic<std::uint64_t> profile_total_us{};
+    static std::atomic<std::uint64_t> profile_render_us{};
+    profile_total_us.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() -
+                submit_started).count()),
+        std::memory_order_relaxed);
+    profile_render_us.fetch_add(
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                cpu_render_finished -
+                cpu_render_started).count()),
+        std::memory_order_relaxed);
+    if (submit_count % 300u == 0u) {
+        const auto total_us = profile_total_us.exchange(
+            0u, std::memory_order_relaxed);
+        const auto render_us = profile_render_us.exchange(
+            0u, std::memory_order_relaxed);
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5",
+            "submit profile count=%llu total_avg_us=%llu "
+            "render_avg_us=%llu",
+            static_cast<unsigned long long>(submit_count),
+            static_cast<unsigned long long>(total_us / 300u),
+            static_cast<unsigned long long>(render_us / 300u));
     }
     if (log_draw_signature) {
         __android_log_print(
@@ -8098,6 +13917,14 @@ skip_packet_diagnostic_log:
 #endif
     result = 0;
     return true;
+}
+
+bool TryAgcDriverSubmitAcb(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    auto submit = request;
+    submit.integer_arguments[0] = request.integer_arguments[1];
+    return TryAgcDriverSubmitDcb(submit, result);
 }
 
 #ifdef __ANDROID__
@@ -8933,11 +14760,56 @@ std::shared_ptr<GuestMutex> FindOrCreateGuestMutex(
         return {};
     }
     const std::lock_guard lock{g_runtime.mutex};
+    std::uint64_t pointed_address{};
+    if (GuestReadU64Locked(address, pointed_address)) {
+        if (const auto pointed =
+                g_runtime.guest_mutexes.find(pointed_address);
+            pointed != g_runtime.guest_mutexes.end()) {
+            return pointed->second;
+        }
+    }
     auto& mutex = g_runtime.guest_mutexes[address];
     if (mutex == nullptr) {
         mutex = std::make_shared<GuestMutex>();
     }
     return mutex;
+}
+
+bool TryInitializeGuestMutex(
+    const std::uint64_t address, std::uint64_t& result) {
+    constexpr std::uint32_t InvalidArgument = 0x80020003;
+    constexpr std::uint32_t MemoryFault = 0x80020101;
+    if (address == 0) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    const std::lock_guard lock{g_runtime.mutex};
+    if (!HasAccessLocked(
+            address, sizeof(std::uint64_t),
+            LSX4_PS5_GUEST_WRITE)) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    if (!EnsureHleDataLocked() ||
+        g_runtime.next_mutex_object_offset >
+            Ps5HleDataSize - Ps5MutexObjectSize) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    auto* const object =
+        g_runtime.hle_data + g_runtime.next_mutex_object_offset;
+    const auto object_address =
+        reinterpret_cast<std::uint64_t>(object);
+    g_runtime.next_mutex_object_offset += Ps5MutexObjectSize;
+    std::fill_n(object, Ps5MutexObjectSize, std::uint8_t{});
+    std::memcpy(
+        reinterpret_cast<void*>(address),
+        &object_address, sizeof(object_address));
+    auto mutex = std::make_shared<GuestMutex>();
+    g_runtime.guest_mutexes[address] = mutex;
+    g_runtime.guest_mutexes[object_address] = std::move(mutex);
+    result = 0;
+    return true;
 }
 
 bool TryGuestMutexOperation(
@@ -8948,10 +14820,7 @@ bool TryGuestMutexOperation(
     constexpr std::uint32_t Busy = 0x80020010;
     if (symbol == "cmo1RIYva9o" ||
         symbol == "ttHNfU+qDBU") {
-        result = FindOrCreateGuestMutex(address) != nullptr
-            ? 0
-            : OrbisError(InvalidArgument);
-        return true;
+        return TryInitializeGuestMutex(address, result);
     }
     if (symbol == "2Of0f+3mhhE" ||
         symbol == "ltCfaGr2JGE") {
@@ -8960,7 +14829,18 @@ bool TryGuestMutexOperation(
             return true;
         }
         const std::lock_guard lock{g_runtime.mutex};
+        std::uint64_t pointed_address{};
+        (void)GuestReadU64Locked(address, pointed_address);
         g_runtime.guest_mutexes.erase(address);
+        g_runtime.guest_mutexes.erase(pointed_address);
+        constexpr std::uint64_t DestroyedMutex = 1;
+        if (HasAccessLocked(
+                address, sizeof(DestroyedMutex),
+                LSX4_PS5_GUEST_WRITE)) {
+            std::memcpy(
+                reinterpret_cast<void*>(address),
+                &DestroyedMutex, sizeof(DestroyedMutex));
+        }
         result = 0;
         return true;
     }
@@ -9407,6 +15287,605 @@ bool TryGuestConditionVariableOperation(
     return true;
 }
 
+struct GuestFiberLayout {
+    std::uint32_t magic_start{};
+    std::uint32_t state{};
+    std::uint64_t entry{};
+    std::uint64_t argument_on_initialize{};
+    std::uint64_t context_address{};
+    std::uint64_t context_size{};
+    std::array<char, 32> name{};
+    std::uint64_t reserved_context{};
+    std::uint32_t flags{};
+    std::uint32_t padding{};
+    std::uint64_t context_start{};
+    std::uint64_t context_end{};
+    std::uint32_t magic_end{};
+    std::uint32_t tail_padding{};
+};
+static_assert(sizeof(GuestFiberLayout) == 112);
+
+struct GuestFiberContinuation {
+    Lsx4::Translation::CpuFrame machine{};
+    Lsx4::Translation::StackWindow stack_window{};
+    std::uint64_t resume_argument_output{};
+    bool has_machine{};
+    bool owns_stack_window{};
+};
+
+struct GuestFiberThreadRuntime {
+    Lsx4::Translation::CpuFrame thread_machine{};
+    std::uint64_t current_fiber{};
+    std::uint64_t thread_return_output{};
+    bool active{};
+};
+
+thread_local GuestFiberThreadRuntime g_guest_fiber_runtime{};
+
+std::mutex g_guest_fiber_continuations_mutex;
+std::unordered_map<
+    std::uint64_t, std::shared_ptr<GuestFiberContinuation>>
+    g_guest_fiber_continuations;
+
+std::shared_ptr<GuestFiberContinuation> GuestFiberContinuationFor(
+    const std::uint64_t fiber, const bool create) {
+    const std::lock_guard lock{g_guest_fiber_continuations_mutex};
+    if (const auto found = g_guest_fiber_continuations.find(fiber);
+        found != g_guest_fiber_continuations.end()) {
+        return found->second;
+    }
+    if (!create) {
+        return {};
+    }
+    auto continuation = std::make_shared<GuestFiberContinuation>();
+    g_guest_fiber_continuations.emplace(fiber, continuation);
+    return continuation;
+}
+
+void EraseGuestFiberContinuation(const std::uint64_t fiber) {
+    const std::lock_guard lock{g_guest_fiber_continuations_mutex};
+    g_guest_fiber_continuations.erase(fiber);
+}
+
+bool CaptureGuestFiberContinuation(
+    Lsx4::Translation::CpuFrame& destination,
+    const std::uint64_t result) {
+    if (!Lsx4::Translation::SnapshotContinuationState(destination)) {
+        return false;
+    }
+    Lsx4::Translation::WriteInteger(
+        destination, Lsx4::Translation::IntegerRegister::A,
+        result, 64);
+    destination.dispatch_phase = 0;
+    return destination.resume_address != 0 &&
+           Lsx4::Translation::ReadInteger(
+               destination,
+               Lsx4::Translation::IntegerRegister::Stack,
+               64) != 0;
+}
+
+bool PublishGuestFiberState(
+    const Lsx4::Translation::CpuFrame& source) {
+    const auto current = Lsx4::Translation::PublishedLiveState();
+    return current && current.ReplaceWith(source) &&
+           Lsx4::Translation::RequestLiveStateReplacement();
+}
+
+bool BuildInitialGuestFiberState(
+    const GuestFiberLayout& fiber,
+    GuestFiberContinuation& continuation,
+    const std::uint64_t argument_on_run,
+    Lsx4::Translation::CpuFrame& destination) {
+    const auto current = Lsx4::Translation::PublishedLiveState();
+    if (!current || fiber.entry == 0 ||
+        !current.CopyTo(destination)) {
+        return false;
+    }
+    destination.integer.fill(0);
+    destination.resume_address = fiber.entry;
+    destination.condition_word = UINT64_C(0x202);
+    destination.dispatch_phase = 0;
+    destination.x87_status = 0;
+    destination.x87_opcode = 0;
+    destination.x87_code_address = 0;
+    destination.x87_data_address = 0;
+    if ((fiber.flags & UINT32_C(0x100)) != 0) {
+        destination.x87_control = UINT16_C(0x037f);
+        destination.simd_control = UINT32_C(0x9fc0);
+    }
+    Lsx4::Translation::WriteInteger(
+        destination,
+        Lsx4::Translation::IntegerRegister::Destination,
+        fiber.argument_on_initialize, 64);
+    Lsx4::Translation::WriteInteger(
+        destination,
+        Lsx4::Translation::IntegerRegister::Source,
+        argument_on_run, 64);
+
+    std::uint64_t stack_top{};
+    if (fiber.context_address != 0 &&
+        fiber.context_size != 0) {
+        stack_top = fiber.context_address + fiber.context_size;
+    } else {
+        continuation.stack_window =
+            Lsx4::Translation::AcquireStackWindow(current);
+        continuation.owns_stack_window =
+            continuation.stack_window.IsValid();
+        stack_top = continuation.stack_window.stack_pointer;
+    }
+    stack_top &= ~UINT64_C(0xf);
+    if (stack_top < sizeof(std::uint64_t)) {
+        return false;
+    }
+    const auto stack_pointer =
+        stack_top - sizeof(std::uint64_t);
+    const std::uint64_t return_address{};
+    if (!TryWriteGuestValue(stack_pointer, return_address)) {
+        return false;
+    }
+    Lsx4::Translation::WriteInteger(
+        destination,
+        Lsx4::Translation::IntegerRegister::Stack,
+        stack_pointer, 64);
+    return true;
+}
+
+bool TryHandleGuestFiber(
+    const std::string_view symbol,
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr std::uint32_t FiberMagicStart = 0xdef1649c;
+    constexpr std::uint32_t FiberMagicEnd = 0xb37592a0;
+    constexpr std::uint32_t FiberOptionMagic = 0xbb40e64d;
+    constexpr std::uint64_t FiberStackMagic =
+        UINT64_C(0x7149f2ca7149f2ca);
+    constexpr std::uint32_t FiberRun = 1;
+    constexpr std::uint32_t FiberIdle = 2;
+    constexpr std::uint32_t FiberTerminated = 3;
+    constexpr std::uint32_t ErrorNull = 0x80590001;
+    constexpr std::uint32_t ErrorAlignment = 0x80590002;
+    constexpr std::uint32_t ErrorRange = 0x80590003;
+    constexpr std::uint32_t ErrorInvalid = 0x80590004;
+    constexpr std::uint32_t ErrorPermission = 0x80590005;
+    constexpr std::uint32_t ErrorState = 0x80590006;
+
+    const auto fail = [&](const std::uint32_t error) {
+        result = OrbisError(error);
+        return true;
+    };
+    if (symbol == "asjUJJ+aa8s") {
+        if (request.integer_arguments[0] == 0) {
+            return fail(ErrorNull);
+        }
+        if ((request.integer_arguments[0] & 7u) != 0) {
+            return fail(ErrorAlignment);
+        }
+        if (!TryWriteGuestValue(
+                request.integer_arguments[0],
+                FiberOptionMagic)) {
+            return fail(ErrorInvalid);
+        }
+        result = 0;
+        return true;
+    }
+    if (symbol == "hVYD7Ou2pCQ" ||
+        symbol == "7+OJIpko9RY") {
+        const auto fiber_address = request.integer_arguments[0];
+        const auto name_address = request.integer_arguments[1];
+        const auto entry = request.integer_arguments[2];
+        const auto argument_on_initialize =
+            request.integer_arguments[3];
+        const auto context_address =
+            request.integer_arguments[4];
+        const auto context_size =
+            request.integer_arguments[5];
+        std::uint64_t option_address{};
+        std::uint64_t flags{};
+        std::uint64_t build_version{};
+        if (!TryReadGuestValue(
+                request.guest_stack + 8u, option_address)) {
+            return fail(ErrorInvalid);
+        }
+        if (symbol == "7+OJIpko9RY") {
+            if (!TryReadGuestValue(
+                    request.guest_stack + 16u, flags) ||
+                !TryReadGuestValue(
+                    request.guest_stack + 24u,
+                    build_version)) {
+                return fail(ErrorInvalid);
+            }
+        } else if (!TryReadGuestValue(
+                       request.guest_stack + 16u,
+                       build_version)) {
+            return fail(ErrorInvalid);
+        }
+        if (fiber_address == 0 || name_address == 0 ||
+            entry == 0) {
+            return fail(ErrorNull);
+        }
+        if ((fiber_address & 7u) != 0 ||
+            (context_address & 15u) != 0 ||
+            (option_address & 7u) != 0) {
+            return fail(ErrorAlignment);
+        }
+        if (context_size != 0 && context_size < 512u) {
+            return fail(ErrorRange);
+        }
+        if ((context_size & 15u) != 0 ||
+            ((context_address == 0) != (context_size == 0))) {
+            return fail(ErrorInvalid);
+        }
+        if (option_address != 0) {
+            std::uint32_t option_magic{};
+            if (!TryReadGuestValue(
+                    option_address, option_magic) ||
+                option_magic != FiberOptionMagic) {
+                return fail(ErrorInvalid);
+            }
+        }
+        GuestFiberLayout fiber{};
+        fiber.magic_start = FiberMagicStart;
+        fiber.state = FiberIdle;
+        fiber.entry = entry;
+        fiber.argument_on_initialize =
+            argument_on_initialize;
+        fiber.context_address = context_address;
+        fiber.context_size = context_size;
+        fiber.flags = static_cast<std::uint32_t>(flags);
+        if (build_version >= UINT64_C(0x3500000)) {
+            fiber.flags |= UINT32_C(0x100);
+        }
+        fiber.context_start = context_address;
+        fiber.context_end = context_address + context_size;
+        fiber.magic_end = FiberMagicEnd;
+        std::string name;
+        if (TryReadGuestCString(name_address, 32, name)) {
+            std::memcpy(
+                fiber.name.data(), name.data(),
+                std::min(name.size(), fiber.name.size() - 1u));
+        }
+        if (!TryWriteGuestBytes(
+                fiber_address, &fiber, sizeof(fiber))) {
+            return fail(ErrorInvalid);
+        }
+        if (context_address != 0 &&
+            !TryWriteGuestValue(
+                context_address, FiberStackMagic)) {
+            return fail(ErrorInvalid);
+        }
+#ifdef __ANDROID__
+        if (Ps5DiagnosticFaultProbeEnabled()) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5-FIBER",
+                "init fiber=0x%llx entry=0x%llx arg=0x%llx "
+                "context=0x%llx size=0x%llx name=%s",
+                static_cast<unsigned long long>(fiber_address),
+                static_cast<unsigned long long>(entry),
+                static_cast<unsigned long long>(
+                    argument_on_initialize),
+                static_cast<unsigned long long>(context_address),
+                static_cast<unsigned long long>(context_size),
+                name.empty() ? "<unnamed>" : name.c_str());
+        }
+#endif
+        result = 0;
+        return true;
+    }
+
+    if (symbol == "JzyT91ucGDc") {
+        const auto fiber_address = request.integer_arguments[0];
+        const auto name_address = request.integer_arguments[1];
+        GuestFiberLayout fiber{};
+        if (fiber_address == 0 || name_address == 0) {
+            return fail(ErrorNull);
+        }
+        if (!TryReadGuestValue(fiber_address, fiber) ||
+            fiber.magic_start != FiberMagicStart ||
+            fiber.magic_end != FiberMagicEnd) {
+            return fail(ErrorInvalid);
+        }
+        std::string name;
+        if (!TryReadGuestCString(name_address, 32, name)) {
+            return fail(ErrorInvalid);
+        }
+        fiber.name.fill(0);
+        std::memcpy(
+            fiber.name.data(), name.data(),
+            std::min(name.size(), fiber.name.size() - 1u));
+        result = TryWriteGuestValue(fiber_address, fiber)
+            ? 0
+            : OrbisError(ErrorInvalid);
+        return true;
+    }
+    if (symbol == "uq2Y5BFz0PE") {
+        const auto fiber_address = request.integer_arguments[0];
+        const auto output = request.integer_arguments[1];
+        GuestFiberLayout fiber{};
+        std::uint64_t requested_size{};
+        if (fiber_address == 0 || output == 0) {
+            return fail(ErrorNull);
+        }
+        if (!TryReadGuestValue(fiber_address, fiber) ||
+            !TryReadGuestValue(output, requested_size) ||
+            requested_size != 128u ||
+            fiber.magic_start != FiberMagicStart ||
+            fiber.magic_end != FiberMagicEnd) {
+            return fail(ErrorInvalid);
+        }
+        std::array<std::uint8_t, 128> info{};
+        std::memcpy(info.data(), &requested_size, 8);
+        std::memcpy(info.data() + 8, &fiber.entry, 8);
+        std::memcpy(
+            info.data() + 16,
+            &fiber.argument_on_initialize, 8);
+        std::memcpy(
+            info.data() + 24, &fiber.context_address, 8);
+        std::memcpy(
+            info.data() + 32, &fiber.context_size, 8);
+        std::memcpy(
+            info.data() + 40, fiber.name.data(),
+            fiber.name.size());
+        const std::uint64_t unknown_margin = UINT64_MAX;
+        std::memcpy(info.data() + 72, &unknown_margin, 8);
+        result = TryWriteGuestBytes(
+                     output, info.data(), info.size())
+            ? 0
+            : OrbisError(ErrorInvalid);
+        return true;
+    }
+    if (symbol == "JeNX5F-NzQU") {
+        const auto fiber_address = request.integer_arguments[0];
+        GuestFiberLayout fiber{};
+        if (fiber_address == 0) {
+            return fail(ErrorNull);
+        }
+        if (!TryReadGuestValue(fiber_address, fiber) ||
+            fiber.magic_start != FiberMagicStart ||
+            fiber.magic_end != FiberMagicEnd) {
+            return fail(ErrorInvalid);
+        }
+        if (fiber.state != FiberIdle) {
+            return fail(ErrorState);
+        }
+        fiber.state = FiberTerminated;
+        if (!TryWriteGuestValue(fiber_address, fiber)) {
+            return fail(ErrorInvalid);
+        }
+        if (const auto continuation =
+                GuestFiberContinuationFor(
+                    fiber_address, false);
+            continuation != nullptr &&
+            continuation->owns_stack_window) {
+            Lsx4::Translation::ReleaseStackWindow(
+                continuation->stack_window);
+        }
+        EraseGuestFiberContinuation(fiber_address);
+        result = 0;
+        return true;
+    }
+
+    if (symbol == "p+zLIOg27zU") {
+        const auto output = request.integer_arguments[0];
+        if (output == 0) {
+            return fail(ErrorNull);
+        }
+        if (!g_guest_fiber_runtime.active ||
+            g_guest_fiber_runtime.current_fiber == 0) {
+            return fail(ErrorPermission);
+        }
+        result = TryWriteGuestValue(
+                     output,
+                     g_guest_fiber_runtime.current_fiber)
+            ? 0
+            : OrbisError(ErrorInvalid);
+        return true;
+    }
+
+    if (symbol == "B0ZX2hx9DMw") {
+        auto& runtime = g_guest_fiber_runtime;
+        if (!runtime.active || runtime.current_fiber == 0) {
+            return fail(ErrorPermission);
+        }
+        GuestFiberLayout fiber{};
+        if (!TryReadGuestValue(
+                runtime.current_fiber, fiber)) {
+            return fail(ErrorInvalid);
+        }
+        const auto continuation =
+            GuestFiberContinuationFor(
+                runtime.current_fiber, true);
+        if (continuation == nullptr) {
+            return fail(ErrorInvalid);
+        }
+        if (fiber.context_address != 0) {
+            if (!CaptureGuestFiberContinuation(
+                    continuation->machine, 0)) {
+                return fail(ErrorInvalid);
+            }
+            continuation->resume_argument_output =
+                request.integer_arguments[1];
+            continuation->has_machine = true;
+        } else {
+            continuation->resume_argument_output = 0;
+            continuation->has_machine = false;
+        }
+        if (runtime.thread_return_output != 0) {
+            (void)TryWriteGuestValue(
+                runtime.thread_return_output,
+                request.integer_arguments[0]);
+        }
+        fiber.state = FiberIdle;
+        (void)TryWriteGuestValue(
+            runtime.current_fiber, fiber);
+        Lsx4::Translation::WriteInteger(
+            runtime.thread_machine,
+            Lsx4::Translation::IntegerRegister::A,
+            0, 64);
+        runtime.current_fiber = 0;
+        runtime.thread_return_output = 0;
+        runtime.active = false;
+        result = PublishGuestFiberState(
+                     runtime.thread_machine)
+            ? 0
+            : OrbisError(ErrorInvalid);
+        return true;
+    }
+
+    const bool run =
+        symbol == "a0LLrZWac0M" ||
+        symbol == "avfGJ94g36Q";
+    const bool switch_fiber =
+        symbol == "PFT2S-tJ7Uk" ||
+        symbol == "ZqhZFuzKT6U";
+    if (!run && !switch_fiber) {
+        return false;
+    }
+    const auto fiber_address = request.integer_arguments[0];
+    auto argument_on_run = request.integer_arguments[1];
+    auto argument_output = request.integer_arguments[2];
+    std::uint64_t attach_context{};
+    std::uint64_t attach_size{};
+    if (symbol == "avfGJ94g36Q" ||
+        symbol == "ZqhZFuzKT6U") {
+        attach_context = request.integer_arguments[1];
+        attach_size = request.integer_arguments[2];
+        argument_on_run = request.integer_arguments[3];
+        argument_output = request.integer_arguments[4];
+    }
+    if (fiber_address == 0) {
+        return fail(ErrorNull);
+    }
+    GuestFiberLayout fiber{};
+    if (!TryReadGuestValue(fiber_address, fiber) ||
+        fiber.magic_start != FiberMagicStart ||
+        fiber.magic_end != FiberMagicEnd) {
+        return fail(ErrorInvalid);
+    }
+    if (attach_context != 0 || attach_size != 0) {
+        if ((attach_context & 15u) != 0 ||
+            attach_size < 512u ||
+            (attach_size & 15u) != 0 ||
+            fiber.context_address != 0) {
+            return fail(ErrorInvalid);
+        }
+        fiber.context_address = attach_context;
+        fiber.context_size = attach_size;
+        fiber.context_start = attach_context;
+        fiber.context_end = attach_context + attach_size;
+        (void)TryWriteGuestValue(
+            attach_context, FiberStackMagic);
+    }
+    if (fiber.state != FiberIdle) {
+        return fail(ErrorState);
+    }
+    const auto next_continuation =
+        GuestFiberContinuationFor(
+            fiber_address, true);
+    if (next_continuation == nullptr) {
+        return fail(ErrorInvalid);
+    }
+    auto& runtime = g_guest_fiber_runtime;
+    if (run && runtime.active) {
+        return fail(ErrorPermission);
+    }
+
+    if (switch_fiber) {
+        if (!runtime.active ||
+            runtime.current_fiber == 0) {
+            return fail(ErrorPermission);
+        }
+        GuestFiberLayout previous{};
+        const auto previous_continuation =
+            GuestFiberContinuationFor(
+                runtime.current_fiber, true);
+        if (previous_continuation == nullptr ||
+            !TryReadGuestValue(
+                runtime.current_fiber, previous)) {
+            return fail(ErrorInvalid);
+        }
+        if (previous.context_address != 0) {
+            if (!CaptureGuestFiberContinuation(
+                    previous_continuation->machine, 0)) {
+                return fail(ErrorInvalid);
+            }
+            previous_continuation->resume_argument_output =
+                argument_output;
+            previous_continuation->has_machine = true;
+        } else {
+            previous_continuation->resume_argument_output = 0;
+            previous_continuation->has_machine = false;
+        }
+        previous.state = FiberIdle;
+        (void)TryWriteGuestValue(
+            runtime.current_fiber, previous);
+    }
+
+    Lsx4::Translation::CpuFrame next{};
+    if (fiber.context_address != 0 &&
+        next_continuation->has_machine) {
+        next = next_continuation->machine;
+        if (next_continuation->resume_argument_output != 0) {
+            (void)TryWriteGuestValue(
+                next_continuation->resume_argument_output,
+                argument_on_run);
+        }
+        Lsx4::Translation::WriteInteger(
+            next, Lsx4::Translation::IntegerRegister::A,
+            0, 64);
+    } else if (!BuildInitialGuestFiberState(
+                   fiber, *next_continuation,
+                   argument_on_run, next)) {
+        return fail(ErrorInvalid);
+    }
+    // Fibers may migrate between PS5 job-worker threads.  The saved CPU
+    // continuation belongs to the fiber, while FS/GS belong to the thread
+    // executing it (native setjmp/longjmp does not replace kernel TLS).
+    // Preserve the destination worker's segment origins on every transfer.
+    if (const auto current =
+            Lsx4::Translation::PublishedLiveState()) {
+        next.fs_origin = current.ReadScalar(
+            Lsx4::Translation::FrameScalar::FsOrigin);
+        next.gs_origin = current.ReadScalar(
+            Lsx4::Translation::FrameScalar::GsOrigin);
+    }
+    if (run &&
+        !CaptureGuestFiberContinuation(
+            runtime.thread_machine, 0)) {
+        return fail(ErrorInvalid);
+    }
+    fiber.state = FiberRun;
+    if (!TryWriteGuestValue(fiber_address, fiber)) {
+        return fail(ErrorInvalid);
+    }
+    runtime.current_fiber = fiber_address;
+    if (run) {
+        runtime.thread_return_output = argument_output;
+        runtime.active = true;
+    }
+    next_continuation->has_machine = false;
+    next_continuation->resume_argument_output = 0;
+#ifdef __ANDROID__
+    if (Ps5DiagnosticFaultProbeEnabled()) {
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5-FIBER",
+            "%s fiber=0x%llx entry=0x%llx arg=0x%llx "
+            "context=0x%llx size=0x%llx",
+            run ? "run" : "switch",
+            static_cast<unsigned long long>(fiber_address),
+            static_cast<unsigned long long>(fiber.entry),
+            static_cast<unsigned long long>(argument_on_run),
+            static_cast<unsigned long long>(
+                fiber.context_address),
+            static_cast<unsigned long long>(
+                fiber.context_size));
+    }
+#endif
+    result = PublishGuestFiberState(next)
+        ? 0
+        : OrbisError(ErrorInvalid);
+    return true;
+}
+
 bool TryHandleGuestEventFlag(
     const std::string_view symbol,
     const Lsx4::Translation::HleBridgeRequest& request,
@@ -9458,10 +15937,15 @@ bool TryHandleGuestEventFlag(
         }
 #ifdef __ANDROID__
         if (Ps5DiagnosticFaultProbeEnabled()) {
+            std::string name;
+            (void)TryReadGuestCString(
+                request.integer_arguments[1], 64, name);
             __android_log_print(
                 ANDROID_LOG_INFO, "LSX4-PS5-EVENTFLAG",
-                "create handle=0x%llx attr=0x%x bits=0x%llx",
-                static_cast<unsigned long long>(handle), attributes,
+                "create handle=0x%llx name=%s attr=0x%x bits=0x%llx",
+                static_cast<unsigned long long>(handle),
+                name.empty() ? "<unnamed>" : name.c_str(),
+                attributes,
                 static_cast<unsigned long long>(initial_pattern));
         }
 #endif
@@ -9470,15 +15954,33 @@ bool TryHandleGuestEventFlag(
     }
 
     const auto handle = request.integer_arguments[0];
+    struct EventFlagCache {
+        std::uint64_t generation{};
+        std::unordered_map<
+            std::uint64_t, std::shared_ptr<GuestEventFlag>> entries;
+    };
+    thread_local EventFlagCache cache;
+    const auto generation =
+        g_event_flag_generation.load(std::memory_order_acquire);
+    if (cache.generation != generation) {
+        cache.entries.clear();
+        cache.generation = generation;
+    }
     std::shared_ptr<GuestEventFlag> state;
-    {
+    if (const auto found = cache.entries.find(handle);
+        found != cache.entries.end()) {
+        state = found->second;
+    } else {
         const std::lock_guard lock{g_runtime.mutex};
-        const auto found = g_runtime.guest_event_flags.find(handle);
-        if (found != g_runtime.guest_event_flags.end()) {
-            state = found->second;
+        const auto runtime_found =
+            g_runtime.guest_event_flags.find(handle);
+        if (runtime_found != g_runtime.guest_event_flags.end()) {
+            state = runtime_found->second;
+            cache.entries.emplace(handle, state);
         }
     }
-    if (!state) {
+    if (!state ||
+        state->deleted.load(std::memory_order_acquire)) {
         result = OrbisError(NotFound);
         return true;
     }
@@ -9488,26 +15990,69 @@ bool TryHandleGuestEventFlag(
             const std::lock_guard lock{g_runtime.mutex};
             g_runtime.guest_event_flags.erase(handle);
         }
-        {
-            const std::lock_guard lock{state->mutex};
-            state->deleted = true;
-        }
+        state->deleted.store(true, std::memory_order_release);
         state->condition.notify_all();
         result = 0;
         return true;
     }
     if (symbol == "IOnSvHzqu6A") {
-        {
-            const std::lock_guard lock{state->mutex};
-            state->bits |= request.integer_arguments[1];
+        const auto requested_bits = request.integer_arguments[1];
+        const auto before_bits =
+            state->bits.load(std::memory_order_acquire);
+        const auto waiters = state->waiting_threads.load(
+            std::memory_order_acquire);
+        if (waiters != 0) {
+            std::uint64_t previous_bits{};
+            {
+                const std::lock_guard lock{state->mutex};
+                previous_bits = state->bits.fetch_or(
+                    request.integer_arguments[1],
+                    std::memory_order_acq_rel);
+            }
+            const auto changed_bits =
+                request.integer_arguments[1] & ~previous_bits;
+            if ((changed_bits &
+                 state->waiting_patterns.load(
+                     std::memory_order_acquire)) != 0) {
+                if (waiters == 1) {
+                    state->condition.notify_one();
+                } else {
+                    state->condition.notify_all();
+                }
+            }
+        } else {
+            state->bits.fetch_or(
+                requested_bits,
+                std::memory_order_release);
         }
-        state->condition.notify_all();
+#ifdef __ANDROID__
+        if (Ps5DiagnosticFaultProbeEnabled()) {
+            static std::atomic<std::uint64_t> set_logs{};
+            const auto log_index =
+                set_logs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (log_index <= 8u ||
+                (log_index & (log_index - 1u)) == 0u) {
+                __android_log_print(
+                    ANDROID_LOG_INFO, "LSX4-PS5-EVENTFLAG",
+                    "set count=%llu handle=0x%llx add=0x%llx "
+                    "before=0x%llx after=0x%llx waiters=%u",
+                    static_cast<unsigned long long>(log_index),
+                    static_cast<unsigned long long>(handle),
+                    static_cast<unsigned long long>(requested_bits),
+                    static_cast<unsigned long long>(before_bits),
+                    static_cast<unsigned long long>(
+                        state->bits.load(std::memory_order_acquire)),
+                    waiters);
+            }
+        }
+#endif
         result = 0;
         return true;
     }
     if (symbol == "7uhBFWRAS60") {
-        const std::lock_guard lock{state->mutex};
-        state->bits &= request.integer_arguments[1];
+        state->bits.fetch_and(
+            request.integer_arguments[1],
+            std::memory_order_acq_rel);
         result = 0;
         return true;
     }
@@ -9516,8 +16061,11 @@ bool TryHandleGuestEventFlag(
         std::uint32_t waiters{};
         {
             const std::lock_guard lock{state->mutex};
-            waiters = state->waiting_threads;
-            state->bits = request.integer_arguments[1];
+            waiters = state->waiting_threads.load(
+                std::memory_order_relaxed);
+            state->bits.store(
+                request.integer_arguments[1],
+                std::memory_order_release);
         }
         state->condition.notify_all();
         result = waiter_output == 0 ||
@@ -9547,32 +16095,50 @@ bool TryHandleGuestEventFlag(
         return true;
     }
 
-    const auto satisfied = [&] {
+    const auto satisfied = [&](const std::uint64_t bits) {
         return condition_mode == WaitAnd
-            ? (state->bits & pattern) == pattern
-            : (state->bits & pattern) != 0;
+            ? (bits & pattern) == pattern
+            : (bits & pattern) != 0;
     };
     const auto publish_result = [&](const std::uint64_t bits) {
         return result_output == 0 ||
                TryWriteGuestValue(result_output, bits);
     };
-    const auto apply_clear = [&] {
-        if (clear_mode == ClearAll) {
-            state->bits = 0;
-        } else if (clear_mode == ClearPattern) {
-            state->bits &= ~pattern;
+    const auto try_consume = [&](std::uint64_t& observed) {
+        observed = state->bits.load(std::memory_order_acquire);
+        for (;;) {
+            if (!satisfied(observed)) {
+                return false;
+            }
+            auto desired = observed;
+            if (clear_mode == ClearAll) {
+                desired = 0;
+            } else if (clear_mode == ClearPattern) {
+                desired &= ~pattern;
+            } else {
+                return true;
+            }
+            if (state->bits.compare_exchange_weak(
+                    observed, desired, std::memory_order_acq_rel,
+                    std::memory_order_acquire)) {
+                return true;
+            }
         }
     };
 
-    std::unique_lock lock{state->mutex};
+    std::uint64_t bits{};
     if (symbol == "9lvj5DjHZiA") {
-        const auto bits = state->bits;
-        if (!publish_result(bits)) {
-            result = OrbisError(MemoryFault);
-        } else if (!satisfied()) {
+        if (!try_consume(bits)) {
+            if (!publish_result(bits)) {
+                result = OrbisError(MemoryFault);
+                return true;
+            }
             result = OrbisError(Busy);
         } else {
-            apply_clear();
+            if (!publish_result(bits)) {
+                result = OrbisError(MemoryFault);
+                return true;
+            }
             result = 0;
         }
         return true;
@@ -9584,24 +16150,80 @@ bool TryHandleGuestEventFlag(
         result = OrbisError(MemoryFault);
         return true;
     }
-    ++state->waiting_threads;
+    if (try_consume(bits)) {
+        result = publish_result(bits)
+            ? 0
+            : OrbisError(MemoryFault);
+        return true;
+    }
+#ifdef __ANDROID__
+    if (Ps5DiagnosticFaultProbeEnabled()) {
+        static std::atomic<std::uint64_t> wait_logs{};
+        const auto log_index =
+            wait_logs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (log_index <= 8u ||
+            (log_index & (log_index - 1u)) == 0u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5-EVENTFLAG",
+                "wait count=%llu handle=0x%llx pattern=0x%llx "
+                "mode=0x%x bits=0x%llx timeout=%u timed=%d",
+                static_cast<unsigned long long>(log_index),
+                static_cast<unsigned long long>(handle),
+                static_cast<unsigned long long>(pattern), wait_mode,
+                static_cast<unsigned long long>(bits),
+                timeout_microseconds, timeout_output != 0 ? 1 : 0);
+        }
+    }
+#endif
+
+    // PS5 job-system flags are commonly set a few microseconds after the
+    // waiter reaches this point.  A short adaptive spin avoids a kernel
+    // futex sleep plus a producer-side futex wake for those hand-offs.
+    if (timeout_output == 0 || timeout_microseconds >= 50u) {
+        for (std::uint32_t spin = 0; spin < 192u; ++spin) {
+#if defined(__aarch64__) || defined(__arm__)
+            __asm__ __volatile__("yield");
+#elif defined(__x86_64__) || defined(__i386__)
+            __asm__ __volatile__("pause");
+#else
+            std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+            if (try_consume(bits)) {
+                result = publish_result(bits)
+                    ? 0
+                    : OrbisError(MemoryFault);
+                return true;
+            }
+        }
+    }
+
+    std::unique_lock lock{state->mutex};
+    state->waiting_patterns.fetch_or(
+        pattern, std::memory_order_release);
+    state->waiting_threads.fetch_add(
+        1, std::memory_order_acq_rel);
     const auto release_waiter = [&] {
-        if (state->waiting_threads != 0) {
-            --state->waiting_threads;
+        const auto previous = state->waiting_threads.fetch_sub(
+            1, std::memory_order_acq_rel);
+        if (previous == 1) {
+            state->waiting_patterns.store(
+                0, std::memory_order_release);
         }
     };
-    if (!satisfied()) {
+    if (!try_consume(bits)) {
         if (timeout_output != 0) {
             const auto ready = state->condition.wait_for(
                 lock,
                 std::chrono::microseconds(timeout_microseconds),
                 [&] {
-                    return state->deleted || satisfied() ||
+                    return state->deleted.load(
+                               std::memory_order_acquire) ||
+                           satisfied(state->bits.load(
+                               std::memory_order_acquire)) ||
                            g_runtime.shutdown_requested.load(
                                std::memory_order_acquire);
                 });
-            if (!ready || !satisfied()) {
-                const auto bits = state->bits;
+            if (!ready || !try_consume(bits)) {
                 release_waiter();
                 lock.unlock();
                 const std::uint32_t zero{};
@@ -9613,7 +16235,9 @@ bool TryHandleGuestEventFlag(
                 return true;
             }
         } else {
-            while (!state->deleted && !satisfied() &&
+            while (!state->deleted.load(
+                       std::memory_order_acquire) &&
+                   !try_consume(bits) &&
                    !g_runtime.shutdown_requested.load(
                        std::memory_order_acquire)) {
                 state->condition.wait_for(
@@ -9621,13 +16245,12 @@ bool TryHandleGuestEventFlag(
             }
         }
     }
-    if (state->deleted || !satisfied()) {
+    if (state->deleted.load(std::memory_order_acquire) ||
+        !satisfied(bits)) {
         release_waiter();
         result = OrbisError(NotFound);
         return true;
     }
-    const auto bits = state->bits;
-    apply_clear();
     release_waiter();
     lock.unlock();
     result = publish_result(bits)
@@ -9689,7 +16312,7 @@ bool TryCreateGuestPthread(
     entry.argument_count = 1;
     entry.arguments[0] = argument;
     entry.fs_base = thread_context.fs_base;
-    if (std::getenv("EXECUTOR_DIAG_JIT_RIP_PROBE") != nullptr) {
+    if (Ps5DiagnosticFaultProbeEnabled()) {
         std::array<std::uint64_t, 4> argument_words{};
         const auto has_argument_words =
             argument != 0 &&
@@ -9711,6 +16334,20 @@ bool TryCreateGuestPthread(
             static_cast<unsigned long long>(argument_words[2]),
             static_cast<unsigned long long>(argument_words[3]));
         std::fflush(stderr);
+#ifdef __ANDROID__
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5-THREAD",
+            "create handle=0x%llx entry=0x%llx arg=0x%llx "
+            "name=%s words=0x%llx,0x%llx,0x%llx,0x%llx",
+            static_cast<unsigned long long>(thread_context.handle),
+            static_cast<unsigned long long>(entry_address),
+            static_cast<unsigned long long>(argument),
+            thread_name.empty() ? "<unnamed>" : thread_name.c_str(),
+            static_cast<unsigned long long>(argument_words[0]),
+            static_cast<unsigned long long>(argument_words[1]),
+            static_cast<unsigned long long>(argument_words[2]),
+            static_cast<unsigned long long>(argument_words[3]));
+#endif
     }
     try {
         std::unique_lock lock{g_runtime.mutex};
@@ -9722,9 +16359,9 @@ bool TryCreateGuestPthread(
             return true;
         }
         g_runtime.guest_host_threads.emplace_back(
-            [entry, thread_handle = thread_context.handle]() {
-                if (std::getenv(
-                        "EXECUTOR_DIAG_JIT_RIP_PROBE") != nullptr) {
+            [entry, thread_handle = thread_context.handle,
+             thread_name = std::move(thread_name)]() {
+                if (Ps5DiagnosticFaultProbeEnabled()) {
                     std::fprintf(
                         stderr,
                         "PS5_GUEST_THREAD_START handle=0x%llx "
@@ -9735,12 +16372,24 @@ bool TryCreateGuestPthread(
                             entry.arguments[0]),
                         static_cast<unsigned long long>(entry.fs_base));
                     std::fflush(stderr);
+#ifdef __ANDROID__
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5-THREAD",
+                        "start handle=0x%llx entry=0x%llx "
+                        "arg=0x%llx fs=0x%llx name=%s",
+                        static_cast<unsigned long long>(thread_handle),
+                        static_cast<unsigned long long>(entry.address),
+                        static_cast<unsigned long long>(
+                            entry.arguments[0]),
+                        static_cast<unsigned long long>(entry.fs_base),
+                        thread_name.empty()
+                            ? "<unnamed>" : thread_name.c_str());
+#endif
                 }
                 Lsx4Ps5GuestResult thread_result{};
                 (void)executor_lsx4_ps5_runtime_execute(
                     &entry, &thread_result);
-                if (std::getenv(
-                        "EXECUTOR_DIAG_JIT_RIP_PROBE") != nullptr) {
+                if (Ps5DiagnosticFaultProbeEnabled()) {
                     const std::string runtime_status =
                         executor_lsx4_ps5_runtime_status();
                     std::fprintf(
@@ -9755,6 +16404,19 @@ bool TryCreateGuestPthread(
                             thread_result.value),
                         runtime_status.c_str());
                     std::fflush(stderr);
+#ifdef __ANDROID__
+                    __android_log_print(
+                        ANDROID_LOG_INFO, "LSX4-PS5-THREAD",
+                        "end handle=0x%llx entry=0x%llx status=%d "
+                        "value=0x%llx name=%s",
+                        static_cast<unsigned long long>(thread_handle),
+                        static_cast<unsigned long long>(entry.address),
+                        thread_result.status,
+                        static_cast<unsigned long long>(
+                            thread_result.value),
+                        thread_name.empty()
+                            ? "<unnamed>" : thread_name.c_str());
+#endif
                 }
                 (void)executor_lsx4_ps5_runtime_destroy_thread_context(
                     thread_handle);
@@ -9770,11 +16432,28 @@ bool TryCreateGuestPthread(
 }
 
 std::string HleSymbol(const std::uint64_t thunk) {
+    struct ThreadCache {
+        std::uint64_t generation{};
+        std::unordered_map<std::uint64_t, std::string> symbols;
+    };
+    thread_local ThreadCache cache;
+    const auto generation =
+        g_hle_binding_generation.load(std::memory_order_acquire);
+    if (cache.generation != generation) {
+        cache.symbols.clear();
+        cache.generation = generation;
+    }
+    if (const auto cached = cache.symbols.find(thunk);
+        cached != cache.symbols.end()) {
+        return cached->second;
+    }
     const std::lock_guard lock{g_runtime.mutex};
     const auto found = g_runtime.hle_bindings.find(thunk);
-    return found != g_runtime.hle_bindings.end()
+    auto symbol = found != g_runtime.hle_bindings.end()
         ? found->second.symbol
         : std::string{};
+    cache.symbols.emplace(thunk, symbol);
+    return symbol;
 }
 
 std::uint64_t OrbisError(const std::uint32_t value) noexcept {
@@ -9850,8 +16529,7 @@ bool TryAllocateDirectMemory(
     }
     std::uint64_t candidate{};
     if (!AlignUp(
-            std::max(search_start, g_runtime.next_direct_offset),
-            alignment, candidate)) {
+            search_start, alignment, candidate)) {
         result = OrbisError(TryAgain);
         return true;
     }
@@ -9916,6 +16594,248 @@ bool TryAllocateDirectMemory(
             static_cast<unsigned long long>(output_address));
 #endif
     }
+    result = 0;
+    return true;
+}
+
+bool TryAvailableDirectMemorySize(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr auto InvalidArgument = UINT32_C(0x80020003);
+    constexpr auto OutOfMemory = UINT32_C(0x8002000c);
+    constexpr auto MemoryFault = UINT32_C(0x80020101);
+    const auto search_start =
+        std::min(request.integer_arguments[0], Ps5DirectMemorySize);
+    const auto search_end =
+        std::min(request.integer_arguments[1], Ps5DirectMemorySize);
+    const auto alignment = request.integer_arguments[2];
+    const auto output_address = request.integer_arguments[3];
+    const auto output_size = request.integer_arguments[4];
+    if (search_start >= search_end || output_address == 0 ||
+        output_size == 0 ||
+        (alignment != 0 && !IsPowerOfTwo(alignment))) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+
+    const std::lock_guard lock{g_runtime.mutex};
+    auto allocations = g_runtime.direct_allocations;
+    std::ranges::sort(
+        allocations, {}, &DirectAllocation::offset);
+    std::uint64_t best_address{};
+    std::uint64_t best_size{};
+    std::uint64_t cursor = search_start;
+    const auto consider_gap =
+        [&](const std::uint64_t gap_begin,
+            const std::uint64_t gap_end) {
+            std::uint64_t aligned_begin = gap_begin;
+            if (alignment != 0 &&
+                !AlignUp(gap_begin, alignment, aligned_begin)) {
+                return;
+            }
+            if (aligned_begin < gap_end &&
+                gap_end - aligned_begin > best_size) {
+                best_address = aligned_begin;
+                best_size = gap_end - aligned_begin;
+            }
+        };
+    for (const auto& allocation : allocations) {
+        const auto allocation_end =
+            allocation.offset + allocation.byte_count;
+        if (allocation_end <= cursor ||
+            allocation.offset >= search_end) {
+            continue;
+        }
+        consider_gap(
+            cursor, std::min(allocation.offset, search_end));
+        cursor = std::max(
+            cursor, std::min(allocation_end, search_end));
+        if (cursor >= search_end) {
+            break;
+        }
+    }
+    consider_gap(cursor, search_end);
+    if (best_size == 0) {
+        result = OrbisError(OutOfMemory);
+        return true;
+    }
+    if (!GuestWriteU64Locked(output_address, best_address) ||
+        !GuestWriteU64Locked(output_size, best_size)) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    result = 0;
+    return true;
+}
+
+bool TryReserveVirtualRange(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr auto InvalidArgument = UINT32_C(0x80020003);
+    constexpr auto MemoryFault = UINT32_C(0x80020101);
+    const auto in_out_address = request.integer_arguments[0];
+    const auto byte_count = request.integer_arguments[1];
+    const auto flags =
+        static_cast<std::uint32_t>(request.integer_arguments[2]);
+    auto alignment = request.integer_arguments[3];
+    if (in_out_address == 0 || byte_count == 0 ||
+        (byte_count & (LSX4_PS5_GUEST_PAGE_SIZE - 1u)) != 0 ||
+        byte_count > std::numeric_limits<std::size_t>::max()) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    if (alignment == 0) {
+        alignment = LSX4_PS5_GUEST_PAGE_SIZE;
+    }
+    if (!IsPowerOfTwo(alignment) ||
+        alignment < LSX4_PS5_GUEST_PAGE_SIZE) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+
+    const std::lock_guard lock{g_runtime.mutex};
+    std::uint64_t requested_address{};
+    if (!GuestReadU64Locked(in_out_address, requested_address)) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    constexpr std::uint32_t FixedMapping = 0x10u;
+    const bool fixed_mapping = (flags & FixedMapping) != 0;
+    if (fixed_mapping && requested_address != 0 &&
+        g_runtime.mappings.Find(
+            requested_address, byte_count,
+            LSX4_PS5_GUEST_READ) != nullptr) {
+        result = 0;
+        return true;
+    }
+    const auto first_hint =
+        requested_address != 0
+            ? requested_address
+            : g_runtime.next_flexible_map_hint;
+    const auto stride = std::max<std::uint64_t>(
+        alignment, byte_count);
+    auto* const allocation = AllocateLowGuestRegionLocked(
+        first_hint, stride, static_cast<std::size_t>(byte_count),
+        alignment, fixed_mapping ? 1u : 4096u);
+    if (allocation == nullptr) {
+        result = OrbisError(UINT32_C(0x80020023));
+        return true;
+    }
+    const auto address =
+        reinterpret_cast<std::uint64_t>(allocation);
+    if (!RegisterMappingLocked(
+            address, byte_count,
+            LSX4_PS5_GUEST_READ | LSX4_PS5_GUEST_WRITE,
+            "ps5-flexible-memory", true) ||
+        !GuestWriteU64Locked(in_out_address, address)) {
+        (void)g_runtime.mappings.EraseExact(
+            address, byte_count, true);
+        munmap(allocation, static_cast<std::size_t>(byte_count));
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    g_runtime.owned_guest_mappings.push_back({
+        .allocation = allocation,
+        .byte_count = static_cast<std::size_t>(byte_count),
+    });
+    if (!fixed_mapping) {
+        g_runtime.next_flexible_map_hint =
+            std::max(
+                g_runtime.next_flexible_map_hint,
+                address + byte_count);
+    }
+    result = 0;
+    return true;
+}
+
+bool TryMapFlexibleMemory(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr auto InvalidArgument = UINT32_C(0x80020003);
+    constexpr auto MemoryFault = UINT32_C(0x80020101);
+    const auto in_out_address = request.integer_arguments[0];
+    const auto byte_count = request.integer_arguments[1];
+    const auto orbis_protection =
+        static_cast<std::uint32_t>(request.integer_arguments[2]);
+    if (in_out_address == 0 || byte_count == 0 ||
+        (byte_count & (LSX4_PS5_GUEST_PAGE_SIZE - 1u)) != 0 ||
+        byte_count > std::numeric_limits<std::size_t>::max()) {
+        result = OrbisError(InvalidArgument);
+        return true;
+    }
+    const std::lock_guard lock{g_runtime.mutex};
+    std::uint64_t requested_address{};
+    if (!GuestReadU64Locked(
+            in_out_address, requested_address)) {
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    std::uint32_t guest_protection{};
+    int host_protection{};
+    if ((orbis_protection & 0x01u) != 0) {
+        guest_protection |= LSX4_PS5_GUEST_READ;
+        host_protection |= PROT_READ;
+    }
+    if ((orbis_protection & 0x02u) != 0) {
+        guest_protection |=
+            LSX4_PS5_GUEST_READ | LSX4_PS5_GUEST_WRITE;
+        host_protection |= PROT_READ | PROT_WRITE;
+    }
+    if ((orbis_protection & 0x04u) != 0) {
+        guest_protection |=
+            LSX4_PS5_GUEST_READ | LSX4_PS5_GUEST_EXECUTE;
+        host_protection |= PROT_READ | PROT_EXEC;
+    }
+    if (guest_protection == 0) {
+        guest_protection =
+            LSX4_PS5_GUEST_READ | LSX4_PS5_GUEST_WRITE;
+        host_protection = PROT_READ | PROT_WRITE;
+    }
+    if (requested_address != 0 &&
+        g_runtime.mappings.Find(
+            requested_address, byte_count,
+            guest_protection) != nullptr) {
+        result = 0;
+        return true;
+    }
+    const auto first_hint =
+        requested_address != 0
+            ? requested_address
+            : g_runtime.next_flexible_map_hint;
+    auto* const allocation = AllocateLowGuestRegionLocked(
+        first_hint,
+        std::max<std::uint64_t>(
+            LSX4_PS5_GUEST_PAGE_SIZE, byte_count),
+        static_cast<std::size_t>(byte_count),
+        LSX4_PS5_GUEST_PAGE_SIZE,
+        4096u);
+    if (allocation == nullptr) {
+        result = OrbisError(UINT32_C(0x80020023));
+        return true;
+    }
+    const auto address =
+        reinterpret_cast<std::uint64_t>(allocation);
+    if (mprotect(
+            allocation, static_cast<std::size_t>(byte_count),
+            host_protection) != 0 ||
+        !RegisterMappingLocked(
+            address, byte_count, guest_protection,
+            "ps5-flexible-memory", true) ||
+        !GuestWriteU64Locked(in_out_address, address)) {
+        (void)g_runtime.mappings.EraseExact(
+            address, byte_count, true);
+        munmap(allocation, static_cast<std::size_t>(byte_count));
+        result = OrbisError(MemoryFault);
+        return true;
+    }
+    g_runtime.owned_guest_mappings.push_back({
+        .allocation = allocation,
+        .byte_count = static_cast<std::size_t>(byte_count),
+    });
+    g_runtime.next_flexible_map_hint =
+        std::max(
+            g_runtime.next_flexible_map_hint,
+            address + byte_count);
     result = 0;
     return true;
 }
@@ -10084,6 +17004,849 @@ bool TryMapDirectMemory(
     return true;
 }
 
+bool TryKernelBatchMap(
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr auto InvalidArgument = UINT32_C(0x80020003);
+    constexpr auto MemoryFault = UINT32_C(0x80020101);
+    constexpr std::uint64_t EntrySize = 0x20;
+    constexpr std::uint64_t FixedMap = 0x10;
+    const auto entries = request.integer_arguments[0];
+    const auto entry_count =
+        static_cast<std::int32_t>(request.integer_arguments[1]);
+    const auto processed_output = request.integer_arguments[2];
+    std::int32_t processed{};
+    result = 0;
+
+    if (entry_count < 0 || (entry_count != 0 && entries == 0)) {
+        result = OrbisError(InvalidArgument);
+    }
+    for (std::int32_t index = 0;
+         result == 0 && index < entry_count; ++index) {
+        std::array<std::uint8_t, EntrySize> bytes{};
+        const auto entry_address =
+            entries + static_cast<std::uint64_t>(index) * EntrySize;
+        if (entry_address < entries ||
+            !TryReadGuestBytes(
+                entry_address, bytes.data(), bytes.size())) {
+            result = OrbisError(MemoryFault);
+            break;
+        }
+        std::uint64_t start{};
+        std::uint64_t offset{};
+        std::uint64_t length{};
+        std::uint32_t operation{};
+        std::memcpy(&start, bytes.data() + 0x00, sizeof(start));
+        std::memcpy(&offset, bytes.data() + 0x08, sizeof(offset));
+        std::memcpy(&length, bytes.data() + 0x10, sizeof(length));
+        const auto protection = bytes[0x18];
+        const auto memory_type = bytes[0x19];
+        std::memcpy(
+            &operation, bytes.data() + 0x1c, sizeof(operation));
+        if (length == 0 || operation > 4) {
+            result = OrbisError(InvalidArgument);
+            break;
+        }
+#ifdef __ANDROID__
+        static std::atomic<std::uint32_t> batch_map_logs{};
+        if (batch_map_logs.fetch_add(
+                1, std::memory_order_relaxed) < 8) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5",
+                "batch map op=%u start=0x%llx offset=0x%llx "
+                "length=0x%llx prot=0x%x type=0x%x",
+                operation,
+                static_cast<unsigned long long>(start),
+                static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(length),
+                static_cast<unsigned int>(protection),
+                static_cast<unsigned int>(memory_type));
+        }
+#endif
+        Lsx4::Translation::HleBridgeRequest translated{};
+        translated.integer_arguments[0] = entry_address;
+        translated.integer_arguments[1] = length;
+        translated.integer_arguments[2] = protection;
+        translated.integer_arguments[3] = FixedMap;
+        switch (operation) {
+        case 0:
+            translated.integer_arguments[4] = offset;
+            translated.integer_arguments[5] = 0;
+            (void)TryMapDirectMemory(translated, result);
+            break;
+        case 1: {
+            const auto page_size = HostPageSize();
+            if (start == 0 || length >
+                    std::numeric_limits<std::size_t>::max() ||
+                (start & (page_size - 1u)) != 0 ||
+                (length & (page_size - 1u)) != 0) {
+                result = OrbisError(InvalidArgument);
+                break;
+            }
+            std::uint8_t* allocation{};
+            {
+                const std::lock_guard lock{g_runtime.mutex};
+                const auto found = std::ranges::find(
+                    g_runtime.owned_guest_mappings,
+                    start,
+                    [](const OwnedGuestMapping& mapping) {
+                        return reinterpret_cast<std::uint64_t>(
+                            mapping.allocation);
+                    });
+                if (found !=
+                        g_runtime.owned_guest_mappings.end() &&
+                    found->byte_count ==
+                        static_cast<std::size_t>(length)) {
+                    allocation = found->allocation;
+                    g_runtime.owned_guest_mappings.erase(found);
+                    (void)g_runtime.mappings.EraseExact(
+                        start, length, true);
+                }
+            }
+            if (allocation != nullptr) {
+                (void)munmap(
+                    allocation, static_cast<std::size_t>(length));
+            }
+            result = 0;
+            break;
+        }
+        case 2:
+        case 4: {
+            std::uint32_t guest_protection{};
+            int host_protection{};
+            if ((protection & 0x01u) != 0) {
+                guest_protection |= LSX4_PS5_GUEST_READ;
+                host_protection |= PROT_READ;
+            }
+            if ((protection & 0x02u) != 0) {
+                guest_protection |=
+                    LSX4_PS5_GUEST_READ |
+                    LSX4_PS5_GUEST_WRITE;
+                host_protection |= PROT_READ | PROT_WRITE;
+            }
+            if ((protection & 0x04u) != 0) {
+                guest_protection |=
+                    LSX4_PS5_GUEST_READ |
+                    LSX4_PS5_GUEST_EXECUTE;
+                host_protection |= PROT_READ | PROT_EXEC;
+            }
+            if (guest_protection == 0) {
+                guest_protection = LSX4_PS5_GUEST_READ;
+                host_protection = PROT_READ;
+            }
+            if (start == 0 ||
+                length > std::numeric_limits<std::size_t>::max() ||
+                mprotect(
+                    reinterpret_cast<void*>(start),
+                    static_cast<std::size_t>(length),
+                    host_protection) != 0) {
+                result = OrbisError(InvalidArgument);
+                break;
+            }
+            {
+                const std::lock_guard lock{g_runtime.mutex};
+                (void)RegisterMappingLocked(
+                    start, length, guest_protection,
+                    operation == 4
+                        ? "ps5-type-protected-memory"
+                        : "ps5-protected-memory",
+                    true);
+            }
+            result = 0;
+            break;
+        }
+        case 3:
+            (void)TryMapFlexibleMemory(translated, result);
+            break;
+        default:
+            result = OrbisError(InvalidArgument);
+            break;
+        }
+        if (result == 0) {
+            ++processed;
+        }
+    }
+    if (processed_output != 0 &&
+        !TryWriteGuestValue(processed_output, processed)) {
+        result = OrbisError(MemoryFault);
+    }
+    return true;
+}
+
+std::uint32_t ReadBigEndianU32(const std::uint8_t* const bytes) noexcept {
+    return (static_cast<std::uint32_t>(bytes[0]) << 24) |
+           (static_cast<std::uint32_t>(bytes[1]) << 16) |
+           (static_cast<std::uint32_t>(bytes[2]) << 8) |
+           static_cast<std::uint32_t>(bytes[3]);
+}
+
+bool TryCreateNgs2Handle(
+    const std::uint32_t type, const std::uint64_t owner,
+    std::uint64_t& handle) {
+    if (!TryAllocateLibcHeap(0x20, 16, handle) || handle == 0) {
+        return false;
+    }
+    std::array<std::uint8_t, 0x20> storage{};
+    std::memcpy(storage.data(), &handle, sizeof(handle));
+    std::memcpy(storage.data() + 8, &owner, sizeof(owner));
+    const std::uint32_t version = 1;
+    std::memcpy(storage.data() + 16, &version, sizeof(version));
+    std::memcpy(storage.data() + 24, &type, sizeof(type));
+    if (TryWriteGuestBytes(handle, storage.data(), storage.size())) {
+        return true;
+    }
+    FreeLibcHeap(handle);
+    handle = 0;
+    return false;
+}
+
+void RemoveNgs2RackLocked(const std::uint64_t rack_handle) {
+    g_ngs2_racks.erase(rack_handle);
+    for (auto voice = g_ngs2_voices.begin();
+         voice != g_ngs2_voices.end();) {
+        if (voice->second.rack_handle == rack_handle) {
+            voice = g_ngs2_voices.erase(voice);
+        } else {
+            ++voice;
+        }
+    }
+}
+
+bool TryDecodeNgs2Vag(
+    const std::uint64_t address, std::vector<std::int16_t>& samples,
+    std::uint32_t& sample_rate, std::int32_t& loop_start,
+    std::int32_t& loop_end) {
+    constexpr std::size_t HeaderSize = 0x30;
+    constexpr std::size_t MaximumDataSize = 8 * 1024 * 1024;
+    std::array<std::uint8_t, HeaderSize> header{};
+    if (!TryReadGuestBytes(address, header.data(), header.size()) ||
+        std::memcmp(header.data(), "VAGp", 4) != 0) {
+        return false;
+    }
+    const auto declared_size =
+        std::min<std::size_t>(ReadBigEndianU32(header.data() + 0x0c),
+                              MaximumDataSize);
+    const auto frame_bytes = declared_size - (declared_size % 16);
+    if (frame_bytes == 0) {
+        return false;
+    }
+    std::vector<std::uint8_t> frames(frame_bytes);
+    if (!TryReadGuestBytes(
+            address + HeaderSize, frames.data(), frames.size())) {
+        return false;
+    }
+
+    sample_rate = ReadBigEndianU32(header.data() + 0x10);
+    if (sample_rate == 0) {
+        sample_rate = 48000;
+    }
+    samples.clear();
+    samples.reserve((frame_bytes / 16) * 28);
+    loop_start = -1;
+    loop_end = -1;
+    constexpr std::array<std::int32_t, 5> Coeff0{0, 60, 115, 98, 122};
+    constexpr std::array<std::int32_t, 5> Coeff1{0, 0, -52, -55, -60};
+    std::int32_t history1{};
+    std::int32_t history2{};
+    bool ended{};
+    for (std::size_t offset = 0;
+         offset + 16 <= frames.size() && !ended; offset += 16) {
+        const auto predictor = frames[offset];
+        const auto shift = predictor & 0x0f;
+        auto filter = (predictor >> 4) & 0x0f;
+        if (filter > 4) {
+            filter = 0;
+        }
+        const auto flags = frames[offset + 1];
+        if (flags == 3) {
+            loop_start = static_cast<std::int32_t>(samples.size());
+        }
+        for (std::size_t index = 0; index != 14; ++index) {
+            const auto packed = frames[offset + 2 + index];
+            for (std::uint32_t nibble_index = 0;
+                 nibble_index != 2; ++nibble_index) {
+                const auto nibble = static_cast<std::int32_t>(
+                    nibble_index == 0 ? packed & 0x0f : packed >> 4);
+                auto decoded = static_cast<std::int32_t>(
+                    static_cast<std::int16_t>(nibble << 12));
+                decoded >>= shift;
+                decoded +=
+                    (history1 * Coeff0[filter] +
+                     history2 * Coeff1[filter]) >>
+                    6;
+                decoded = std::clamp(
+                    decoded,
+                    static_cast<std::int32_t>(
+                        std::numeric_limits<std::int16_t>::min()),
+                    static_cast<std::int32_t>(
+                        std::numeric_limits<std::int16_t>::max()));
+                samples.push_back(static_cast<std::int16_t>(decoded));
+                history2 = history1;
+                history1 = decoded;
+            }
+        }
+        if (flags == 6) {
+            loop_end = static_cast<std::int32_t>(samples.size());
+        } else if (flags == 1 || flags == 7) {
+            ended = true;
+        }
+    }
+    if (loop_start >= 0 && loop_end <= loop_start) {
+        loop_end = static_cast<std::int32_t>(samples.size());
+    }
+    return !samples.empty();
+}
+
+bool ClearNgs2GuestBuffer(
+    const std::uint64_t address, const std::uint64_t byte_count) {
+    static constexpr std::array<std::uint8_t, 4096> Zeroes{};
+    for (std::uint64_t offset = 0; offset < byte_count;) {
+        const auto chunk = static_cast<std::size_t>(
+            std::min<std::uint64_t>(
+                Zeroes.size(), byte_count - offset));
+        if (!TryWriteGuestBytes(
+                address + offset, Zeroes.data(), chunk)) {
+            return false;
+        }
+        offset += chunk;
+    }
+    return true;
+}
+
+bool TryReadGameMakerTransform(
+    const AgcDiagnosticDraw& draw,
+    const std::uint64_t descriptor_table_address,
+    std::array<float, 32>& transform,
+    std::uint64_t& transform_address) {
+    const auto is_projection_view =
+        [](const std::array<float, 32>& candidate) {
+            if (!std::ranges::all_of(
+                    candidate,
+                    [](const float value) {
+                        return std::isfinite(value);
+                    })) {
+                return false;
+            }
+            // GameMaker supplies a conventional column-major perspective
+            // projection followed by a view matrix. Validate the contract,
+            // not title-specific values.
+            return candidate[0] > 0.01f &&
+                candidate[0] < 100.0f &&
+                candidate[5] > 0.01f &&
+                candidate[5] < 100.0f &&
+                std::abs(candidate[11] + 1.0f) < 0.02f &&
+                std::abs(candidate[15]) < 0.02f &&
+                std::abs(candidate[31] - 1.0f) < 0.02f &&
+                std::abs(candidate[16]) < 100.0f &&
+                std::abs(candidate[21]) < 100.0f &&
+                std::abs(candidate[30]) > 0.01f;
+        };
+    const auto try_address =
+        [&](const std::uint64_t address) {
+            if (address == 0u ||
+                !TryReadGuestBytes(
+                    address, transform.data(),
+                    sizeof(transform)) ||
+                !is_projection_view(transform)) {
+                return false;
+            }
+            transform_address = address;
+            return true;
+        };
+
+    std::vector<std::uint64_t> roots;
+    const auto append_address =
+        [&](const std::uint64_t address) {
+            if (address != 0u &&
+                !std::ranges::contains(roots, address)) {
+                roots.push_back(address);
+            }
+        };
+    append_address(descriptor_table_address);
+    const auto append_user_data =
+        [&](const auto& user_data) {
+            for (std::size_t word = 0;
+                 word + 1u < user_data.size(); ++word) {
+                append_address(
+                    static_cast<std::uint64_t>(user_data[word]) |
+                    (static_cast<std::uint64_t>(
+                         user_data[word + 1u] & 0xffffu) << 32u));
+            }
+        };
+    append_user_data(draw.sh_export_user_data);
+    append_user_data(draw.sh_gs_user_data);
+    append_user_data(draw.sh_es_user_data);
+    append_user_data(draw.sh_vs_user_data);
+
+    for (const auto root : roots) {
+        if (try_address(root)) {
+            return true;
+        }
+        std::array<std::uint32_t, 128> table{};
+        if (!TryReadGuestBytes(
+                root, table.data(), sizeof(table))) {
+            continue;
+        }
+        for (std::size_t word = 0;
+             word + 1u < table.size(); ++word) {
+            const auto address =
+                static_cast<std::uint64_t>(table[word]) |
+                (static_cast<std::uint64_t>(
+                     table[word + 1u] & 0xffffu) << 32u);
+            if (try_address(address)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void ApplyNgs2VoiceParameters(
+    const std::uint64_t voice_handle,
+    const std::uint64_t parameter_list) {
+    if (parameter_list == 0) {
+        return;
+    }
+    auto parameter = parameter_list;
+    for (std::uint32_t guard = 0; guard != 32; ++guard) {
+        std::uint32_t size{};
+        std::uint32_t id{};
+        if (!TryReadGuestBytes(parameter, &size, sizeof(size)) ||
+            !TryReadGuestBytes(parameter + 4, &id, sizeof(id))) {
+            return;
+        }
+        if (id == UINT32_C(0x10000001)) {
+            std::uint64_t data_address{};
+            if (TryReadGuestBytes(
+                    parameter + 8, &data_address,
+                    sizeof(data_address)) &&
+                data_address > 0x10000) {
+                {
+                    const std::lock_guard lock{g_ngs2_mutex};
+                    const auto voice = g_ngs2_voices.find(voice_handle);
+                    if (voice == g_ngs2_voices.end()) {
+                        return;
+                    }
+                    if (voice->second.source_address == data_address &&
+                        !voice->second.pcm.empty()) {
+                        data_address = 0;
+                    }
+                }
+                if (data_address != 0) {
+                    std::vector<std::int16_t> samples;
+                    std::uint32_t sample_rate{};
+                    std::int32_t loop_start{};
+                    std::int32_t loop_end{};
+                    if (TryDecodeNgs2Vag(
+                            data_address, samples, sample_rate,
+                            loop_start, loop_end)) {
+                        const std::lock_guard lock{g_ngs2_mutex};
+                        if (auto voice =
+                                g_ngs2_voices.find(voice_handle);
+                            voice != g_ngs2_voices.end()) {
+                            voice->second.pcm = std::move(samples);
+                            voice->second.source_address = data_address;
+                            voice->second.source_rate = sample_rate;
+                            voice->second.position = 0;
+                            voice->second.playing = true;
+                            voice->second.loop_start = loop_start;
+                            voice->second.loop_end =
+                                loop_end > 0
+                                    ? loop_end
+                                    : static_cast<std::int32_t>(
+                                          voice->second.pcm.size());
+                        }
+                    }
+                }
+            }
+        } else if (id == UINT32_C(0x20010001)) {
+            std::uint32_t level_bits{};
+            if (TryReadGuestBytes(
+                    parameter + 12, &level_bits,
+                    sizeof(level_bits))) {
+                float level{};
+                std::memcpy(&level, &level_bits, sizeof(level));
+                if (std::isfinite(level) && level >= 0.0f &&
+                    level <= 8.0f) {
+                    const std::lock_guard lock{g_ngs2_mutex};
+                    if (auto voice =
+                            g_ngs2_voices.find(voice_handle);
+                        voice != g_ngs2_voices.end()) {
+                        voice->second.gain = level;
+                    }
+                }
+            }
+        }
+        if (size < 8 || size > 0x1000) {
+            return;
+        }
+        parameter += (static_cast<std::uint64_t>(size) + 7) & ~7ull;
+    }
+}
+
+bool TryHandleNgs2(
+    const std::string& symbol,
+    const Lsx4::Translation::HleBridgeRequest& request,
+    std::uint64_t& result) {
+    constexpr auto InvalidArgument = UINT32_C(0x80020003);
+    constexpr auto MemoryFault = UINT32_C(0x80020101);
+    constexpr auto InvalidOutAddress = UINT32_C(0x804a0053);
+    constexpr auto InvalidSystemHandle = UINT32_C(0x804a0230);
+    constexpr auto InvalidRackHandle = UINT32_C(0x804a0261);
+    constexpr auto InvalidVoiceHandle = UINT32_C(0x804a0300);
+
+    if (symbol == "mPYgU4oYpuY" || symbol == "koBbCMvOKWw") {
+        const auto output = request.integer_arguments[2];
+        if (output == 0) {
+            result = OrbisError(InvalidOutAddress);
+            return true;
+        }
+        std::uint64_t handle{};
+        if (!TryCreateNgs2Handle(1, 0, handle) ||
+            !TryWriteGuestBytes(output, &handle, sizeof(handle))) {
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            g_ngs2_systems.emplace(handle, Ngs2SystemState{});
+        }
+        result = 0;
+        return true;
+    }
+    if (symbol == "u-WrYDaJA3k") {
+        const auto handle = request.integer_arguments[0];
+        std::vector<std::uint64_t> racks;
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            if (g_ngs2_systems.erase(handle) == 0) {
+                result = OrbisError(InvalidSystemHandle);
+                return true;
+            }
+            for (const auto& [rack_handle, rack] : g_ngs2_racks) {
+                if (rack.system_handle == handle) {
+                    racks.push_back(rack_handle);
+                }
+            }
+            for (const auto rack : racks) {
+                RemoveNgs2RackLocked(rack);
+            }
+        }
+        FreeLibcHeap(handle);
+        result = 0;
+        return true;
+    }
+    if (symbol == "U546k6orxQo" || symbol == "cLV4aiT9JpA") {
+        const auto system = request.integer_arguments[0];
+        const auto rack_id =
+            static_cast<std::uint32_t>(request.integer_arguments[1]);
+        const auto output = request.integer_arguments[4];
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            if (!g_ngs2_systems.contains(system)) {
+                result = OrbisError(InvalidSystemHandle);
+                return true;
+            }
+        }
+        if (output == 0) {
+            result = OrbisError(InvalidOutAddress);
+            return true;
+        }
+        std::uint64_t handle{};
+        if (!TryCreateNgs2Handle(2, system, handle) ||
+            !TryWriteGuestBytes(output, &handle, sizeof(handle))) {
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            g_ngs2_racks.emplace(
+                handle, Ngs2RackState{system, rack_id});
+        }
+        result = 0;
+        return true;
+    }
+    if (symbol == "lCqD7oycmIM") {
+        const auto handle = request.integer_arguments[0];
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            if (!g_ngs2_racks.contains(handle)) {
+                result = OrbisError(InvalidRackHandle);
+                return true;
+            }
+            RemoveNgs2RackLocked(handle);
+        }
+        FreeLibcHeap(handle);
+        result = 0;
+        return true;
+    }
+    if (symbol == "MwmHz8pAdAo") {
+        const auto rack_handle = request.integer_arguments[0];
+        const auto voice_index =
+            static_cast<std::uint32_t>(request.integer_arguments[1]);
+        const auto output = request.integer_arguments[2];
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            if (!g_ngs2_racks.contains(rack_handle)) {
+                result = OrbisError(InvalidRackHandle);
+                return true;
+            }
+            for (const auto& [handle, voice] : g_ngs2_voices) {
+                if (voice.rack_handle == rack_handle &&
+                    voice.voice_index == voice_index) {
+                    result = TryWriteGuestBytes(
+                                 output, &handle, sizeof(handle))
+                        ? 0
+                        : OrbisError(MemoryFault);
+                    return true;
+                }
+            }
+        }
+        if (output == 0) {
+            result = OrbisError(InvalidOutAddress);
+            return true;
+        }
+        std::uint64_t handle{};
+        if (!TryCreateNgs2Handle(4, rack_handle, handle) ||
+            !TryWriteGuestBytes(output, &handle, sizeof(handle))) {
+            result = OrbisError(MemoryFault);
+            return true;
+        }
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            g_ngs2_voices.emplace(
+                handle,
+                Ngs2VoiceState{
+                    .rack_handle = rack_handle,
+                    .voice_index = voice_index,
+                });
+        }
+        result = 0;
+        return true;
+    }
+    if (symbol == "uu94irFOGpA" || symbol == "AbYvTOZ8Pts") {
+        const auto voice_handle = request.integer_arguments[0];
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            if (!g_ngs2_voices.contains(voice_handle)) {
+                result = OrbisError(InvalidVoiceHandle);
+                return true;
+            }
+        }
+        ApplyNgs2VoiceParameters(
+            voice_handle, request.integer_arguments[1]);
+        result = 0;
+        return true;
+    }
+    if (symbol == "i0VnXM-C9fc") {
+        const auto system_handle = request.integer_arguments[0];
+        const auto buffer_info = request.integer_arguments[1];
+        const auto buffer_count =
+            static_cast<std::uint32_t>(request.integer_arguments[2]);
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            if (!g_ngs2_systems.contains(system_handle)) {
+                result = OrbisError(InvalidSystemHandle);
+                return true;
+            }
+        }
+        if (buffer_count != 0 && buffer_info == 0) {
+            result = OrbisError(InvalidArgument);
+            return true;
+        }
+        for (std::uint32_t index = 0; index != buffer_count; ++index) {
+            const auto entry = buffer_info +
+                static_cast<std::uint64_t>(index) * 0x18;
+            std::uint64_t address{};
+            std::uint64_t byte_count{};
+            std::uint32_t channels{2};
+            if (!TryReadGuestBytes(entry, &address, sizeof(address)) ||
+                !TryReadGuestBytes(
+                    entry + 8, &byte_count, sizeof(byte_count)) ||
+                !TryReadGuestBytes(
+                    entry + 20, &channels, sizeof(channels))) {
+                result = OrbisError(MemoryFault);
+                return true;
+            }
+            if (address == 0 || byte_count == 0) {
+                continue;
+            }
+            if (byte_count > 16 * 1024 * 1024ull ||
+                !ClearNgs2GuestBuffer(address, byte_count)) {
+                result = OrbisError(MemoryFault);
+                return true;
+            }
+            if (channels == 0 || channels > 8) {
+                channels = 2;
+            }
+            std::uint32_t grain{256};
+            {
+                const std::lock_guard lock{g_ngs2_mutex};
+                grain = g_ngs2_systems.at(system_handle).grain_samples;
+            }
+            const auto frames = static_cast<std::size_t>(
+                std::min<std::uint64_t>(
+                    grain, byte_count /
+                               (channels * sizeof(float))));
+            if (frames == 0) {
+                continue;
+            }
+            thread_local std::vector<float> mix;
+            mix.assign(frames * channels, 0.0f);
+            bool mixed{};
+            {
+                const std::lock_guard lock{g_ngs2_mutex};
+                for (auto& [voice_handle, voice] : g_ngs2_voices) {
+                    const auto rack =
+                        g_ngs2_racks.find(voice.rack_handle);
+                    if (!voice.playing || voice.pcm.empty() ||
+                        rack == g_ngs2_racks.end() ||
+                        rack->second.system_handle != system_handle) {
+                        continue;
+                    }
+                    const auto limit =
+                        voice.loop_end > 0 &&
+                                static_cast<std::size_t>(
+                                    voice.loop_end) <= voice.pcm.size()
+                            ? voice.loop_end
+                            : static_cast<std::int32_t>(
+                                  voice.pcm.size());
+                    const auto step =
+                        static_cast<double>(voice.source_rate) / 48000.0;
+                    auto position = voice.position;
+                    const auto gain = voice.gain / 32768.0f;
+                    for (std::size_t frame = 0; frame != frames; ++frame) {
+                        auto sample_index =
+                            static_cast<std::int32_t>(position);
+                        if (sample_index >= limit) {
+                            if (voice.loop_start >= 0 &&
+                                voice.loop_start < limit) {
+                                position = voice.loop_start;
+                                sample_index = voice.loop_start;
+                            } else {
+                                voice.playing = false;
+                                break;
+                            }
+                        }
+                        if (sample_index < 0 ||
+                            static_cast<std::size_t>(sample_index) >=
+                                voice.pcm.size()) {
+                            voice.playing = false;
+                            break;
+                        }
+                        const auto sample =
+                            voice.pcm[sample_index] * gain;
+                        const auto destination = frame * channels;
+                        mix[destination] += sample;
+                        if (channels > 1) {
+                            mix[destination + 1] += sample;
+                        }
+                        position += step;
+                    }
+                    voice.position = position;
+                    mixed = true;
+                }
+            }
+            if (mixed) {
+                for (auto& sample : mix) {
+                    sample = std::clamp(sample, -1.0f, 1.0f);
+                }
+                if (!TryWriteGuestBytes(
+                        address, mix.data(),
+                        mix.size() * sizeof(float))) {
+                    result = OrbisError(MemoryFault);
+                    return true;
+                }
+            }
+        }
+        result = 0;
+        return true;
+    }
+    if (symbol == "pgFAiLR5qT4" || symbol == "0eFLVCfWVds") {
+        const auto output = request.integer_arguments[
+            symbol == "pgFAiLR5qT4" ? 1 : 2];
+        if (output == 0) {
+            result = OrbisError(InvalidOutAddress);
+            return true;
+        }
+        std::array<std::uint8_t, 0x18> info{};
+        const std::uint64_t size = 0x10000;
+        const std::uint64_t alignment = 0x100;
+        std::memcpy(info.data(), &size, sizeof(size));
+        std::memcpy(info.data() + 8, &alignment, sizeof(alignment));
+        result = TryWriteGuestBytes(output, info.data(), info.size())
+            ? 0
+            : OrbisError(MemoryFault);
+        return true;
+    }
+    if (symbol == "l4Q2dWEH6UM") {
+        const auto handle = request.integer_arguments[0];
+        const auto grain =
+            static_cast<std::uint32_t>(request.integer_arguments[1]);
+        const std::lock_guard lock{g_ngs2_mutex};
+        if (auto system = g_ngs2_systems.find(handle);
+            system != g_ngs2_systems.end()) {
+            if (grain != 0 && grain <= 8192) {
+                system->second.grain_samples = grain;
+            }
+            result = 0;
+        } else {
+            result = OrbisError(InvalidSystemHandle);
+        }
+        return true;
+    }
+    if (symbol == "-tbc2SxQD60" || symbol == "gThZqM5PYlQ" ||
+        symbol == "JXRC5n0RQls") {
+        const std::lock_guard lock{g_ngs2_mutex};
+        result = g_ngs2_systems.contains(request.integer_arguments[0])
+            ? 0
+            : OrbisError(InvalidSystemHandle);
+        return true;
+    }
+    if (symbol == "-TOuuAQ-buE") {
+        const auto handle = request.integer_arguments[0];
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            if (!g_ngs2_voices.contains(handle)) {
+                result = OrbisError(InvalidVoiceHandle);
+                return true;
+            }
+        }
+        const auto address = request.integer_arguments[1];
+        const auto size = std::min<std::uint64_t>(
+            request.integer_arguments[2], 0x400);
+        result = address == 0 || size == 0 ||
+                         ClearNgs2GuestBuffer(address, size)
+            ? 0
+            : OrbisError(MemoryFault);
+        return true;
+    }
+    if (symbol == "rEh728kXk3w") {
+        const auto handle = request.integer_arguments[0];
+        {
+            const std::lock_guard lock{g_ngs2_mutex};
+            if (!g_ngs2_voices.contains(handle)) {
+                result = OrbisError(InvalidVoiceHandle);
+                return true;
+            }
+        }
+        const std::uint64_t flags{};
+        const auto address = request.integer_arguments[1];
+        result = address == 0 ||
+                         TryWriteGuestBytes(
+                             address, &flags, sizeof(flags))
+            ? 0
+            : OrbisError(MemoryFault);
+        return true;
+    }
+    if (symbol == "xa8oL9dmXkM" || symbol == "1WsleK-MTkE" ||
+        symbol == "0lbbayqDNoE" || symbol == "7Lcfo8SmpsU") {
+        result = 0;
+        return true;
+    }
+    return false;
+}
+
 bool TryInvokeBuiltinHle(
     const Lsx4::Translation::HleBridgeRequest& request,
     std::uint64_t& result) {
@@ -10094,6 +17857,153 @@ bool TryInvokeBuiltinHle(
         return true;
     }
     const auto symbol = HleSymbol(request.function);
+    if (symbol == "j3YMu1MVNNo") {
+        g_runtime.guest_login_event_delivered.store(
+            false, std::memory_order_release);
+        result = 0;
+        return true;
+    }
+    if (symbol == "CdWp0oHWGr0") {
+        constexpr std::int32_t PrimaryUser = 0x10000000;
+        result = request.integer_arguments[0] != 0 &&
+                TryWriteGuestValue(
+                    request.integer_arguments[0], PrimaryUser)
+            ? 0
+            : OrbisError(UINT32_C(0x80960005));
+        return true;
+    }
+    if (symbol == "fPhymKNvK-A") {
+        constexpr std::array<std::int32_t, 4> Users{
+            0x10000000, -1, -1, -1};
+        result = request.integer_arguments[0] != 0 &&
+                TryWriteGuestBytes(
+                    request.integer_arguments[0],
+                    Users.data(), sizeof(Users))
+            ? 0
+            : OrbisError(UINT32_C(0x80960005));
+        return true;
+    }
+    if (symbol == "yH17Q6NWtVg") {
+        const auto event = request.integer_arguments[0];
+        if (event == 0) {
+            result = OrbisError(UINT32_C(0x80960005));
+            return true;
+        }
+        if (g_runtime.guest_login_event_delivered.exchange(
+                true, std::memory_order_acq_rel)) {
+            result = OrbisError(UINT32_C(0x80960007));
+            return true;
+        }
+        constexpr std::array<std::int32_t, 2> LoginEvent{
+            0, 0x10000000};
+        result = TryWriteGuestBytes(
+                     event, LoginEvent.data(), sizeof(LoginEvent))
+            ? 0
+            : OrbisError(UINT32_C(0x80020101));
+        return true;
+    }
+    if (symbol == "eQH7nWPcAgc") {
+        constexpr std::uint32_t SignedIn = 1;
+        result = request.integer_arguments[1] != 0 &&
+                TryWriteGuestValue(
+                    request.integer_arguments[1], SignedIn)
+            ? 0
+            : OrbisError(UINT32_C(0x80020003));
+        return true;
+    }
+    if (symbol == "iQw3iQPhvUQ") {
+        result = 0;
+        return true;
+    }
+    if (symbol == "uBPlr0lbuiI") {
+        constexpr std::int32_t Disconnected = 0;
+        result = request.integer_arguments[0] != 0 &&
+                TryWriteGuestValue(
+                    request.integer_arguments[0], Disconnected)
+            ? 0
+            : OrbisError(UINT32_C(0x80412102));
+        return true;
+    }
+    if (symbol == "3RQ5aQfnstU") {
+        const std::uint8_t skip_notice_screen{};
+        result = request.integer_arguments[0] != 0 &&
+                TryWriteGuestValue(
+                    request.integer_arguments[0],
+                    skip_notice_screen)
+            ? 0
+            : OrbisError(UINT32_C(0x80020003));
+        return true;
+    }
+    if (symbol == "lQOCF84lvzw") {
+        // Match the offline PS4 contract. Reporting success without an
+        // HTTP response leaves the title's response factory uninitialized
+        // and it later calls a null interface method.
+        result = OrbisError(UINT32_C(0x80553407));
+        return true;
+    }
+    if (symbol == "HwP3aM+c85c") {
+        const std::uint64_t empty_length{};
+        if (request.integer_arguments[2] != 0) {
+            (void)TryWriteGuestValue(
+                request.integer_arguments[2], empty_length);
+        }
+        result = OrbisError(UINT32_C(0x80553407));
+        return true;
+    }
+    if (symbol == "sk54bi6FtYM" ||
+        symbol == "3EI-OSJ65Xc" ||
+        symbol == "egOOvrnF6mI" ||
+        symbol == "vvzWO-DvG1s") {
+        result = 0;
+        return true;
+    }
+    if (symbol == "aesyjrHVWy4") {
+        const auto left = request.integer_arguments[0];
+        const auto right = request.integer_arguments[1];
+        const auto limit = request.integer_arguments[2];
+        if (limit == 0 || left == right) {
+            result = 0;
+            return true;
+        }
+        if (left == 0 || right == 0) {
+            const std::int64_t compare =
+                left == 0 ? -1 : 1;
+            result = static_cast<std::uint64_t>(compare);
+            return true;
+        }
+        const auto bounded_limit =
+            std::min<std::uint64_t>(
+                limit, UINT64_C(16) * 1024u * 1024u);
+        for (std::uint64_t index = 0;
+             index < bounded_limit; ++index) {
+            std::uint8_t left_byte{};
+            std::uint8_t right_byte{};
+            if (!TryReadGuestBytes(
+                    left + index, &left_byte, 1) ||
+                !TryReadGuestBytes(
+                    right + index, &right_byte, 1)) {
+                result = 0;
+                return true;
+            }
+            if (left_byte != right_byte) {
+                const auto compare =
+                    static_cast<std::int64_t>(
+                        static_cast<std::int32_t>(left_byte) -
+                        static_cast<std::int32_t>(right_byte));
+                result = static_cast<std::uint64_t>(compare);
+                return true;
+            }
+            if (left_byte == 0) {
+                result = 0;
+                return true;
+            }
+        }
+        result = 0;
+        return true;
+    }
+    if (TryHandleNgs2(symbol, request, result)) {
+        return true;
+    }
     constexpr std::int32_t MsgDialogStatusNone = 0;
     constexpr std::int32_t MsgDialogStatusInitialized = 1;
     constexpr std::int32_t MsgDialogStatusRunning = 2;
@@ -10110,6 +18020,48 @@ bool TryInvokeBuiltinHle(
         UINT32_C(0x80b8000d);
     constexpr std::uint32_t MemoryFault =
         UINT32_C(0x80020101);
+    if (symbol == "Xjoosiw+XPI") {
+        static std::atomic<std::uint64_t> uuid_counter{1};
+        const auto destination = request.integer_arguments[0];
+        std::array<std::uint8_t, 16> uuid{};
+        const auto sequence =
+            uuid_counter.fetch_add(1, std::memory_order_relaxed);
+        const auto ticks = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        std::memcpy(uuid.data(), &ticks, sizeof(ticks));
+        std::memcpy(
+            uuid.data() + sizeof(ticks), &sequence, sizeof(sequence));
+        uuid[6] = static_cast<std::uint8_t>(
+            (uuid[6] & 0x0fu) | 0x40u);
+        uuid[8] = static_cast<std::uint8_t>(
+            (uuid[8] & 0x3fu) | 0x80u);
+        result =
+            destination != 0 &&
+                    TryWriteGuestBytes(
+                        destination, uuid.data(), uuid.size())
+                ? 0
+                : OrbisError(MemoryFault);
+        return true;
+    }
+    if (symbol == "dgJBaeJnGpo" ||
+        symbol == "hdpVEUDFW3s" ||
+        symbol == "3JCe3lCbQ8A") {
+        const std::lock_guard lock{g_runtime.mutex};
+        auto* next_handle = symbol == "dgJBaeJnGpo"
+            ? &g_runtime.next_net_pool_handle
+            : (symbol == "hdpVEUDFW3s"
+                   ? &g_runtime.next_ssl_handle
+                   : &g_runtime.next_http2_handle);
+        result = static_cast<std::uint64_t>((*next_handle)++);
+        return true;
+    }
+    if (symbol == "T72hz6ffq08") {
+        // Release the host core for a guest yield. Returning immediately
+        // turns idle guest worker loops into mobile-CPU busy loops.
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        result = 0;
+        return true;
+    }
     if (symbol == "lDqxaY1UbEo") {
         auto expected = MsgDialogStatusNone;
         (void)g_runtime.msg_dialog_status.compare_exchange_strong(
@@ -10405,6 +18357,14 @@ bool TryInvokeBuiltinHle(
     if (symbol == "uMei1W9uyNo" ||
         symbol == "XKRegsFpEpk") {
         result = request.integer_arguments[0];
+#ifdef __ANDROID__
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5-EXIT",
+            "process exit symbol=%s value=0x%llx stack=0x%llx",
+            symbol.c_str(),
+            static_cast<unsigned long long>(result),
+            static_cast<unsigned long long>(request.guest_stack));
+#endif
         (void)Lsx4::Translation::CompleteCurrentGuestExecution(result);
         return true;
     }
@@ -10582,8 +18542,41 @@ bool TryInvokeBuiltinHle(
             request.integer_arguments[0],
             request.integer_arguments[1], result);
     }
+    if (symbol == "1G3lF1Gg1k8") {
+        return TryGuestKernelOpen(request, result);
+    }
+    if (symbol == "UK2Tl2DWUns") {
+        return TryGuestKernelClose(
+            static_cast<std::int32_t>(
+                request.integer_arguments[0]),
+            result);
+    }
+    if (symbol == "kBwCPsYX-m4") {
+        return TryGuestKernelFstat(
+            static_cast<std::int32_t>(
+                request.integer_arguments[0]),
+            request.integer_arguments[1], result);
+    }
+    if (symbol == "Cg4srZ6TKbU") {
+        return TryGuestKernelRead(
+            static_cast<std::int32_t>(
+                request.integer_arguments[0]),
+            request.integer_arguments[1],
+            request.integer_arguments[2], result);
+    }
+    if (symbol == "4wSze92BhLI") {
+        return TryGuestKernelWrite(
+            static_cast<std::int32_t>(
+                request.integer_arguments[0]),
+            request.integer_arguments[1],
+            request.integer_arguments[2], result);
+    }
     if (symbol == "WT-5NKy42fw") {
         return TryResolveAprFilepathsToIds(
+            request, result);
+    }
+    if (symbol == "gEpBkcwxUjw") {
+        return TryResolveAprFilepathsToIdsAndSizes(
             request, result);
     }
     if (symbol == "ApkYaHb8Sek") {
@@ -10594,6 +18587,65 @@ bool TryInvokeBuiltinHle(
     }
     if (symbol == "mQ16-QdKv7k") {
         return TryReadAprFile(request, result);
+    }
+    if (symbol == "8aI7R7WaOlc") {
+        return TryConstructAprCommandBuffer(
+            request, false, result);
+    }
+    if (symbol == "a8uLzYY--tM") {
+        return TryConstructAprCommandBuffer(
+            request, true, result);
+    }
+    if (symbol == "Qs1xtplKo0U") {
+        return TryDestroyAprCommandBuffer(
+            request.integer_arguments[0], true, result);
+    }
+    if (symbol == "GuchCTefuZw") {
+        return TryDestroyAprCommandBuffer(
+            request.integer_arguments[0], false, result);
+    }
+    if (symbol == "N-FSPA4S3nI") {
+        return TrySetAprCommandBuffer(request, result);
+    }
+    if (symbol == "ULvXMDz56po") {
+        return TryClearAprCommandBuffer(
+            request.integer_arguments[0], result);
+    }
+    if (symbol == "sJXyWHjP-F8") {
+        return TryAppendAprCompletionWrite(request, result);
+    }
+    if (symbol == "j0+3uJMxYJY") {
+        return TryAppendAprCompletionWrite(request, result);
+    }
+    if (symbol == "H896Pt-yB4I" ||
+        symbol == "o67gODLFpls") {
+        return TryAppendAprCompletionEvent(request, result);
+    }
+    if (symbol == "vWU-odnS+fU") {
+        result = AprReadFileRecordSize;
+        return true;
+    }
+    if (symbol == "sSAUCCU1dv4" ||
+        symbol == "Zi3dBUjgyXI") {
+        result = AprKernelEventQueueRecordSize;
+        return true;
+    }
+    if (symbol == "C+IEj+BsAFM" ||
+        symbol == "4fgtGfXDrFc") {
+        result = AprWriteAddressRecordSize;
+        return true;
+    }
+    if (symbol == "tZDDEo2tE5k") {
+        return TryGetAprCommandBufferProperty(
+            request.integer_arguments[0], 0, result);
+    }
+    if (symbol == "GnxKOHEawhk") {
+        return TryGetAprCommandBufferProperty(
+            request.integer_arguments[0], 1, result);
+    }
+    if (symbol == "gzndltBEzWc") {
+        return TryGetAprCommandBufferProperty(
+            request.integer_arguments[0], 2, result);
     }
     if (symbol == "ASoW5WE-UPo") {
         return TrySubmitAprCommandBuffer(request, result);
@@ -10689,7 +18741,11 @@ bool TryInvokeBuiltinHle(
             std::this_thread::sleep_for(
                 std::chrono::microseconds(microseconds));
         } else {
-            std::this_thread::yield();
+            // Android's sched_yield keeps large guest worker pools runnable
+            // and can starve the render thread. A short timed park preserves
+            // zero-delay semantics while releasing a core to the main guest.
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(50));
         }
         result = 0;
         return true;
@@ -10718,7 +18774,8 @@ bool TryInvokeBuiltinHle(
                 std::chrono::nanoseconds(requested[1]);
             std::this_thread::sleep_for(seconds + nanoseconds);
         } else {
-            std::this_thread::yield();
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(50));
         }
         if (remain_address != 0) {
             const std::array<std::int64_t, 2> remaining{};
@@ -10727,6 +18784,27 @@ bool TryInvokeBuiltinHle(
                 sizeof(remaining));
         }
         result = 0;
+        return true;
+    }
+    if (symbol == "1j3S3n-tTW4") {
+#if defined(__aarch64__)
+        std::uint64_t frequency{};
+        asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+        result = frequency;
+#else
+        result = UINT64_C(1000000000);
+#endif
+        return true;
+    }
+    if (symbol == "-2IRUCO--PM") {
+#if defined(__aarch64__)
+        std::uint64_t counter{};
+        asm volatile("mrs %0, cntvct_el0" : "=r"(counter));
+        result = counter;
+#else
+        result = static_cast<std::uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
         return true;
     }
     if (symbol == "4J2sUJmuHZQ") {
@@ -11082,6 +19160,29 @@ bool TryInvokeBuiltinHle(
         result = CurrentGuestPthreadHandle();
         return true;
     }
+    if (symbol == "1tKyG7RlMJo") {
+        const auto thread = request.integer_arguments[0];
+        const auto priority_output = request.integer_arguments[1];
+        if (thread == 0) {
+            result = OrbisError(UINT32_C(0x80020003));
+            return true;
+        }
+        constexpr std::int32_t DefaultGuestPriority = 700;
+        result =
+            priority_output != 0 &&
+                    TryWriteGuestBytes(
+                        priority_output, &DefaultGuestPriority,
+                        sizeof(DefaultGuestPriority))
+                ? 0
+                : OrbisError(UINT32_C(0x80020016));
+        return true;
+    }
+    if (symbol == "W0Hpm2X0uPE") {
+        result = request.integer_arguments[0] != 0
+            ? 0
+            : OrbisError(UINT32_C(0x80020003));
+        return true;
+    }
     if (TryGuestPthreadAttributeOperation(
             symbol, request, result)) {
         return true;
@@ -11129,6 +19230,20 @@ bool TryInvokeBuiltinHle(
         symbol == "2MOy+rUfuhQ") {
         return TryGuestConditionVariableOperation(
             symbol, request, result);
+    }
+    if (symbol == "hVYD7Ou2pCQ" ||
+        symbol == "7+OJIpko9RY" ||
+        symbol == "asjUJJ+aa8s" ||
+        symbol == "JeNX5F-NzQU" ||
+        symbol == "uq2Y5BFz0PE" ||
+        symbol == "JzyT91ucGDc" ||
+        symbol == "a0LLrZWac0M" ||
+        symbol == "PFT2S-tJ7Uk" ||
+        symbol == "p+zLIOg27zU" ||
+        symbol == "B0ZX2hx9DMw" ||
+        symbol == "avfGJ94g36Q" ||
+        symbol == "ZqhZFuzKT6U") {
+        return TryHandleGuestFiber(symbol, request, result);
     }
     if (symbol == "BpFoboUJoZU" ||
         symbol == "8mql9OcQnd4" ||
@@ -11461,7 +19576,9 @@ bool TryInvokeBuiltinHle(
         return true;
     }
     if (symbol == "YndgXqQVV7c" ||
-        symbol == "q1cHNfGycLI") {
+        symbol == "q1cHNfGycLI" ||
+        symbol == "5Wf4q349s+Q" ||
+        symbol == "QjwkT2Ycmew") {
         std::array<std::uint8_t, 0x78> data{};
         const auto buttons =
             g_ps5_pad_buttons.load(std::memory_order_relaxed);
@@ -11480,6 +19597,24 @@ bool TryInvokeBuiltinHle(
                 static_cast<unsigned long long>(
                     request.integer_arguments[1]));
         }
+        static std::array<std::uint8_t, 6> last_logged_axes{
+            128, 128, 128, 128, 0, 0};
+        std::array<std::uint8_t, 6> sampled_axes{};
+        for (std::size_t axis = 0; axis < sampled_axes.size();
+             ++axis) {
+            sampled_axes[axis] =
+                g_ps5_pad_axes[axis].load(
+                    std::memory_order_relaxed);
+        }
+        if (sampled_axes != last_logged_axes) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5",
+                "pad guest axes=%u,%u,%u,%u,%u,%u",
+                sampled_axes[0], sampled_axes[1],
+                sampled_axes[2], sampled_axes[3],
+                sampled_axes[4], sampled_axes[5]);
+            last_logged_axes = sampled_axes;
+        }
 #endif
         std::memcpy(data.data(), &buttons, sizeof(buttons));
         for (std::size_t axis = 0; axis < 6; ++axis) {
@@ -11492,8 +19627,6 @@ bool TryInvokeBuiltinHle(
             data.data() + 0x18, &OrientationW,
             sizeof(OrientationW));
         data[0x4c] = 1;
-        data[0x40] = 1;
-        data[0x48] = 2;
         const auto timestamp =
             g_ps5_pad_timestamp.load(std::memory_order_relaxed);
         std::memcpy(
@@ -11505,7 +19638,11 @@ bool TryInvokeBuiltinHle(
                 data.data(), data.size())) {
             result = OrbisError(UINT32_C(0x80020016));
         } else {
-            result = symbol == "q1cHNfGycLI" ? 1 : 0;
+            result =
+                symbol == "q1cHNfGycLI" ||
+                symbol == "QjwkT2Ycmew"
+                ? 1
+                : 0;
         }
         return true;
     }
@@ -11531,6 +19668,227 @@ bool TryInvokeBuiltinHle(
         g_runtime.guest_video_out_ports.emplace(
             handle, GuestVideoOutPort{});
         result = static_cast<std::uint64_t>(handle);
+        return true;
+    }
+    if (symbol == "utPrVdxio-8") {
+        constexpr auto InvalidAddress = UINT32_C(0x80290002);
+        constexpr auto InvalidHandle = UINT32_C(0x8029000b);
+        const auto handle = static_cast<std::int32_t>(
+            request.integer_arguments[0]);
+        const auto output = request.integer_arguments[1];
+        if (output == 0) {
+            result = OrbisError(InvalidAddress);
+            return true;
+        }
+        std::array<std::uint8_t, 0x30> status{};
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            const auto port =
+                g_runtime.guest_video_out_ports.find(handle);
+            if (port == g_runtime.guest_video_out_ports.end()) {
+                result = OrbisError(InvalidHandle);
+                return true;
+            }
+            const std::int32_t resolution_class =
+                port->second.width >= 3840 ||
+                        port->second.height >= 2160
+                    ? 2
+                    : 1;
+            constexpr std::int32_t DynamicRange = 1;
+            constexpr std::uint64_t RefreshRate59_94Hz = 3;
+            std::memcpy(
+                status.data() + 0x00, &resolution_class,
+                sizeof(resolution_class));
+            std::memcpy(
+                status.data() + 0x04, &DynamicRange,
+                sizeof(DynamicRange));
+            std::memcpy(
+                status.data() + 0x08, &RefreshRate59_94Hz,
+                sizeof(RefreshRate59_94Hz));
+        }
+        result = TryWriteGuestBytes(
+                     output, status.data(), status.size())
+            ? 0
+            : OrbisError(UINT32_C(0x80020101));
+        return true;
+    }
+    if (symbol == "j6RaAUlaLv0") {
+        constexpr auto InvalidHandle = UINT32_C(0x8029000b);
+        const auto handle = static_cast<std::int32_t>(
+            request.integer_arguments[0]);
+        auto now = std::chrono::steady_clock::now();
+        auto target = now;
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            const auto port =
+                g_runtime.guest_video_out_ports.find(handle);
+            if (port == g_runtime.guest_video_out_ports.end()) {
+                result = OrbisError(InvalidHandle);
+                return true;
+            }
+            constexpr auto Period =
+                std::chrono::microseconds(16667);
+            target = port->second.last_vblank + Period;
+            if (target <= now || target > now + Period) {
+                target = now;
+            }
+            port->second.last_vblank = target;
+        }
+        if (target > now) {
+            std::this_thread::sleep_until(target);
+        }
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            const auto port =
+                g_runtime.guest_video_out_ports.find(handle);
+            if (port != g_runtime.guest_video_out_ports.end()) {
+                ++port->second.vblank_count;
+            }
+        }
+        result = 0;
+        return true;
+    }
+    if (symbol == "1FZBKy8HeNU") {
+        constexpr auto InvalidAddress = UINT32_C(0x80290002);
+        constexpr auto InvalidHandle = UINT32_C(0x8029000b);
+        const auto handle = static_cast<std::int32_t>(
+            request.integer_arguments[0]);
+        const auto output = request.integer_arguments[1];
+        if (output == 0) {
+            result = OrbisError(InvalidAddress);
+            return true;
+        }
+        std::array<std::uint8_t, 0x28> status{};
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            const auto port =
+                g_runtime.guest_video_out_ports.find(handle);
+            if (port == g_runtime.guest_video_out_ports.end()) {
+                result = OrbisError(InvalidHandle);
+                return true;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed_us =
+                std::chrono::duration_cast<
+                    std::chrono::microseconds>(
+                    now - port->second.opened_at)
+                    .count();
+            const auto elapsed_count =
+                static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(elapsed_us, 0) * 60 /
+                    1000000);
+            port->second.vblank_count = std::max(
+                port->second.vblank_count, elapsed_count);
+            const auto count = port->second.vblank_count;
+            const auto process_counter = static_cast<std::uint64_t>(
+                now.time_since_epoch().count());
+            const auto elapsed =
+                static_cast<std::uint64_t>(
+                    std::max<std::int64_t>(elapsed_us, 0));
+            std::memcpy(
+                status.data() + 0x00, &count, sizeof(count));
+            std::memcpy(
+                status.data() + 0x08, &elapsed,
+                sizeof(elapsed));
+            std::memcpy(
+                status.data() + 0x18, &process_counter,
+                sizeof(process_counter));
+        }
+        result = TryWriteGuestBytes(
+                     output, status.data(), status.size())
+            ? 0
+            : OrbisError(UINT32_C(0x80020101));
+        return true;
+    }
+    if (symbol == "SbU3dwp80lQ") {
+        constexpr auto InvalidAddress = UINT32_C(0x80290002);
+        constexpr auto InvalidHandle = UINT32_C(0x8029000b);
+        const auto handle = static_cast<std::int32_t>(
+            request.integer_arguments[0]);
+        const auto output = request.integer_arguments[1];
+        if (output == 0) {
+            result = OrbisError(InvalidAddress);
+            return true;
+        }
+        std::array<std::uint8_t, 0x80> status{};
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            const auto port =
+                g_runtime.guest_video_out_ports.find(handle);
+            if (port == g_runtime.guest_video_out_ports.end()) {
+                result = OrbisError(InvalidHandle);
+                return true;
+            }
+            std::memcpy(
+                status.data() + 0x00, &port->second.flip_count,
+                sizeof(port->second.flip_count));
+            std::memcpy(
+                status.data() + 0x08,
+                &port->second.last_flip_process_time,
+                sizeof(port->second.last_flip_process_time));
+            std::memcpy(
+                status.data() + 0x18,
+                &port->second.last_flip_argument,
+                sizeof(port->second.last_flip_argument));
+            std::memcpy(
+                status.data() + 0x28,
+                &port->second.last_flip_process_counter,
+                sizeof(port->second.last_flip_process_counter));
+            std::memcpy(
+                status.data() + 0x38,
+                &port->second.current_buffer,
+                sizeof(port->second.current_buffer));
+            std::memcpy(
+                status.data() + 0x40,
+                &port->second.last_flip_submit_counter,
+                sizeof(port->second.last_flip_submit_counter));
+        }
+        result = TryWriteGuestBytes(
+                     output, status.data(), status.size())
+            ? 0
+            : OrbisError(UINT32_C(0x80020101));
+        return true;
+    }
+    if (symbol == "zgXifHT9ErY" ||
+        symbol == "MTxxrOCeSig") {
+        constexpr auto InvalidHandle = UINT32_C(0x8029000b);
+        const auto handle = static_cast<std::int32_t>(
+            request.integer_arguments[0]);
+        const std::lock_guard lock{g_runtime.mutex};
+        if (!g_runtime.guest_video_out_ports.contains(handle)) {
+            result = OrbisError(InvalidHandle);
+            return true;
+        }
+        result = 0;
+        return true;
+    }
+    if (symbol == "N5KDtkIjjJ4") {
+        constexpr auto InvalidValue = UINT32_C(0x80290001);
+        constexpr auto InvalidHandle = UINT32_C(0x8029000b);
+        const auto handle = static_cast<std::int32_t>(
+            request.integer_arguments[0]);
+        const auto group_index = static_cast<std::int32_t>(
+            request.integer_arguments[1]);
+        if (group_index < 0) {
+            result = OrbisError(InvalidValue);
+            return true;
+        }
+        const std::lock_guard lock{g_runtime.mutex};
+        const auto port =
+            g_runtime.guest_video_out_ports.find(handle);
+        if (port == g_runtime.guest_video_out_ports.end()) {
+            result = OrbisError(InvalidHandle);
+            return true;
+        }
+        for (std::size_t index = 0;
+             index < port->second.buffer_addresses.size(); ++index) {
+            if (port->second.buffer_group_indices[index] ==
+                group_index) {
+                port->second.buffer_addresses[index] = 0;
+                port->second.buffer_group_indices[index] = -1;
+            }
+        }
+        result = 0;
         return true;
     }
     if (symbol == "Xru92wHJRmg") {
@@ -11608,7 +19966,7 @@ bool TryInvokeBuiltinHle(
                 result = OrbisError(InvalidHandle);
                 return true;
             }
-            if (buffer_index < -1 || buffer_index >= 16 ||
+            if (buffer_index < -2 || buffer_index >= 16 ||
                 (buffer_index >= 0 &&
                  port->second.buffer_addresses[
                      static_cast<std::size_t>(buffer_index)] == 0)) {
@@ -11742,9 +20100,11 @@ bool TryInvokeBuiltinHle(
         auto& state = port->second;
         for (std::int32_t buffer = 0;
              buffer < buffer_count; ++buffer) {
-            state.buffer_addresses[
-                static_cast<std::size_t>(start_index + buffer)] =
+            const auto slot =
+                static_cast<std::size_t>(start_index + buffer);
+            state.buffer_addresses[slot] =
                 addresses[static_cast<std::size_t>(buffer)];
+            state.buffer_group_indices[slot] = set_index;
         }
         std::memcpy(
             &state.tiling_mode,
@@ -12158,11 +20518,64 @@ bool TryInvokeBuiltinHle(
     if (symbol == "GIIW2J37e70") {
         return TryAgcSetIndexSize(request, result);
     }
+    if (symbol == "8N2tmT3jmC8") {
+        return TryAgcSetIndexCount(request, result);
+    }
+    if (symbol == "mljzuGDZRQ4") {
+        result = 7u * sizeof(std::uint32_t);
+        return true;
+    }
+    if (symbol == "tSBxhAPyytQ") {
+        return TryAgcSetNumInstances(request, result);
+    }
     if (symbol == "l4fM9K-Lyks") {
         return TryAgcSetIndexBuffer(request, result);
     }
     if (symbol == "B+aG9DUnTKA") {
         return TryAgcDrawIndexOffset(request, result);
+    }
+    if (symbol == "k3GhuSNmBLU") {
+        return TryAgcCbDispatch(request, result);
+    }
+    if (symbol == "UZbQjYAwwXM") {
+        return TryAgcCbSetShRegistersDirect(request, result);
+    }
+    if (symbol == "JrtiDtKeS38") {
+        return TryAgcAcbResetQueue(request, result);
+    }
+    if (symbol == "cFazmnXpJOE") {
+        return TryAgcAcbEventWrite(request, result);
+    }
+    if (symbol == "KT-hTp-Ch14") {
+        return TryAgcAcbAcquireMem(request, result);
+    }
+    if (symbol == "htn36gPnBk4") {
+        return TryAgcAcbWaitRegMem(request, result);
+    }
+    if (symbol == "j3EtxFkSIhQ") {
+        return TryAgcAcbDispatchIndirect(request, result);
+    }
+    if (symbol == "eZ4+17OQz4Q" ||
+        symbol == "i1jyy49AjXU") {
+        return TryAgcWriteData(request, result);
+    }
+    if (symbol == "Yw0jKSqop+E") {
+        return TryAgcDcbDrawIndexAuto(request, result);
+    }
+    if (symbol == "RmaJwLtc8rY") {
+        return TryAgcDcbSetBaseIndirectArgs(request, result);
+    }
+    if (symbol == "CtB+A9-VxO0") {
+        return TryAgcDcbDispatchIndirect(request, result);
+    }
+    if (symbol == "H7uZqCoNuWk") {
+        return TryAgcDcbPopMarker(request, result);
+    }
+    if (symbol == "vuSXe69VILM") {
+        return TryAgcDcbGetLodStats(request, result);
+    }
+    if (symbol == "gSRnr79F8tQ") {
+        return TryAgcDriverSubmitAcb(request, result);
     }
     if (symbol == "UglJIZjGssM") {
         return TryAgcDriverSubmitDcb(request, result);
@@ -12306,6 +20719,14 @@ bool TryInvokeBuiltinHle(
         symbol == "FJrT5LuUBAU" ||
         symbol == "6Z83sYWFlA8") {
         result = request.integer_arguments[0];
+#ifdef __ANDROID__
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5-EXIT",
+            "thread exit symbol=%s value=0x%llx stack=0x%llx",
+            symbol.c_str(),
+            static_cast<unsigned long long>(result),
+            static_cast<unsigned long long>(request.guest_stack));
+#endif
         (void)Lsx4::Translation::CompleteCurrentGuestExecution(result);
         return true;
     }
@@ -12313,8 +20734,32 @@ bool TryInvokeBuiltinHle(
         result = Ps5DirectMemorySize;
         return true;
     }
+    if (symbol == "aNz11fnnzi4") {
+        const auto output_size = request.integer_arguments[0];
+        constexpr std::uint64_t AvailableFlexibleMemory =
+            UINT64_C(512) * 1024 * 1024;
+        result =
+            output_size != 0 &&
+                    TryWriteGuestU64(
+                        output_size, AvailableFlexibleMemory)
+                ? 0
+                : OrbisError(UINT32_C(0x80020003));
+        return true;
+    }
+    if (symbol == "7oxv3PPCumo") {
+        return TryReserveVirtualRange(request, result);
+    }
+    if (symbol == "IWIBBdTHit4") {
+        return TryMapFlexibleMemory(request, result);
+    }
+    if (symbol == "mL8NDH86iQI") {
+        return TryMapFlexibleMemory(request, result);
+    }
     if (symbol == "rTXw65xmLIA") {
         return TryAllocateDirectMemory(request, result);
+    }
+    if (symbol == "C0f7TJcbfac") {
+        return TryAvailableDirectMemorySize(request, result);
     }
     if (symbol == "B+vc2AO2Zrc") {
         auto translated = request;
@@ -12332,6 +20777,9 @@ bool TryInvokeBuiltinHle(
     }
     if (symbol == "L-Q3LEjIbgA") {
         return TryMapDirectMemory(request, result);
+    }
+    if (symbol == "2SKEx6bSq-4") {
+        return TryKernelBatchMap(request, result);
     }
     return false;
 }
@@ -12424,9 +20872,9 @@ std::uint64_t InvokeAndroidFallbackHle(
                         call->integer_arguments[5]),
                     static_cast<unsigned long long>(
                         call->guest_stack));
+                }
             }
         }
-    }
 #endif
     return 0;
 }
@@ -12463,6 +20911,7 @@ extern "C" int executor_lsx4_ps5_runtime_attach_surface(
     if (previous != nullptr) {
         ANativeWindow_release(previous);
     }
+    TryPresentGameSplashToAndroid();
     return LSX4_PS5_EXECUTE_OK;
 #else
     (void)native_window;
@@ -12491,6 +20940,8 @@ extern "C" int executor_lsx4_ps5_runtime_detach_surface() {
 extern "C" int executor_lsx4_ps5_runtime_initialize_android(
     const char* const root_directory,
     const char* const user_id) {
+    static std::mutex initialize_mutex;
+    const std::lock_guard initialize_lock{initialize_mutex};
     if (root_directory == nullptr || root_directory[0] == '\0') {
         return LSX4_PS5_EXECUTE_INVALID_ARGUMENT;
     }
@@ -12500,7 +20951,14 @@ extern "C" int executor_lsx4_ps5_runtime_initialize_android(
         user_id != nullptr && user_id[0] != '\0'
         ? user_id
         : "android";
-    const auto status = executor_lsx4_ps5_runtime_initialize(&config);
+    bool already_initialized{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        already_initialized = g_runtime.initialized;
+    }
+    const auto status = already_initialized
+        ? LSX4_PS5_EXECUTE_OK
+        : executor_lsx4_ps5_runtime_initialize(&config);
     if (status != LSX4_PS5_EXECUTE_OK) {
         return status;
     }
@@ -12599,7 +21057,97 @@ extern "C" int executor_lsx4_ps5_runtime_set_pad_axis(
                     std::chrono::steady_clock::now() -
                     g_ps5_process_start).count()),
             std::memory_order_relaxed);
+#ifdef __ANDROID__
+        static std::atomic<std::uint32_t> axis_logs{};
+        if (axis_logs.fetch_add(
+                1u, std::memory_order_relaxed) < 64u) {
+            __android_log_print(
+                ANDROID_LOG_INFO, "LSX4-PS5",
+                "pad host axis=%d value=%d previous=%u",
+                axis, value, previous);
+        }
+#endif
     }
+    return LSX4_PS5_EXECUTE_OK;
+}
+
+extern "C" int executor_lsx4_ps5_runtime_hud_stats(
+    std::uint64_t* const values, const std::size_t value_count) {
+    constexpr std::size_t ValueCount = 21u;
+    if (values == nullptr || value_count < ValueCount) {
+        return -1;
+    }
+    const auto cpu = Lsx4::Translation::ReadTranslationCounters();
+    std::uint64_t draw_count{};
+    std::uint64_t submit_count{};
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        draw_count = g_runtime.agc_draw_count;
+        submit_count = g_runtime.agc_submit_count;
+    }
+    values[0] = cpu.decoded_regions;
+    values[1] = cpu.native_regions;
+    values[2] = cpu.semantic_regions;
+    values[3] = cpu.unsupported_regions;
+    values[4] = cpu.memory_cache_hits;
+    values[5] = draw_count;
+    values[6] = draw_count;
+    values[7] = 0u;
+    values[8] = submit_count;
+    values[9] = submit_count;
+#ifdef __ANDROID__
+    values[10] = Lsx4::Ps5Desktop::GetVulkanPresentCount();
+#else
+    values[10] = 0u;
+#endif
+    values[11] = cpu.stored_ir_enabled;
+    values[12] = cpu.stored_ir_loaded;
+    values[13] = cpu.stored_ir_hits;
+    values[14] = cpu.stored_native_hits;
+    values[15] = cpu.stored_native_captured;
+    values[16] = cpu.stored_ir_written;
+    values[17] = cpu.stored_native_written;
+    values[18] = 0u;
+    values[19] = 0u;
+    values[20] = 0u;
+    return static_cast<int>(ValueCount);
+}
+
+extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
+    const int option, const int enabled) {
+    constexpr int TieredJit = 4;
+    constexpr int JitTraceCompilation = 5;
+    static std::atomic<bool> tiered_jit{false};
+    static std::atomic<bool> trace_compilation{false};
+    const bool active = enabled != 0;
+    switch (option) {
+    case 1:
+    case 2:
+    case 3:
+        return LSX4_PS5_EXECUTE_OK;
+    case TieredJit:
+        tiered_jit.store(active, std::memory_order_release);
+        break;
+    case JitTraceCompilation:
+        trace_compilation.store(active, std::memory_order_release);
+        if (active) {
+            tiered_jit.store(true, std::memory_order_release);
+        }
+        break;
+    default:
+        return LSX4_PS5_EXECUTE_INVALID_ARGUMENT;
+    }
+    Executor::Jit::ConfigureTieredJit(
+        tiered_jit.load(std::memory_order_acquire),
+        trace_compilation.load(std::memory_order_acquire));
+#ifdef __ANDROID__
+    __android_log_print(
+        ANDROID_LOG_INFO, "LSX4-PS5",
+        "managed JIT option=%d enabled=%d tiered=%d trace=%d",
+        option, active ? 1 : 0,
+        Executor::Jit::TieredJitEnabled() ? 1 : 0,
+        Executor::Jit::JitTraceCompilationEnabled() ? 1 : 0);
+#endif
     return LSX4_PS5_EXECUTE_OK;
 }
 
@@ -12611,7 +21159,6 @@ extern "C" int executor_lsx4_ps5_runtime_initialize(
         config->guest_address_limit <= 0x10000) {
         return LSX4_PS5_EXECUTE_INVALID_ARGUMENT;
     }
-
     executor_lsx4_ps5_runtime_reset();
     g_ps5_pad_buttons.store(0, std::memory_order_relaxed);
     g_ps5_pad_timestamp.store(0, std::memory_order_relaxed);
@@ -12651,22 +21198,6 @@ extern "C" int executor_lsx4_ps5_runtime_initialize(
         }
     }
 
-    const std::string title =
-        std::string{"ps5-"} +
-        (config->title_id != nullptr ? config->title_id : "unknown");
-    try {
-        Lsx4::Translation::ConfigureArtifactStore(
-            config->artifact_directory != nullptr
-                ? config->artifact_directory
-                : "",
-            title, config->executable_identity,
-            config->artifact_directory != nullptr &&
-                config->artifact_directory[0] != '\0');
-    } catch (...) {
-        executor_lsx4_ps5_runtime_reset();
-        SetRuntimeStatus("PS5 runtime artifact-store initialization failed");
-        return LSX4_PS5_EXECUTE_INTERNAL_ERROR;
-    }
     InstallPs5DiagnosticFaultHandlers();
     return 0;
 }
@@ -12737,12 +21268,14 @@ extern "C" int executor_lsx4_ps5_runtime_execute(
         }
     }
 
+#ifndef __ANDROID__
     const auto compatibility =
         Lsx4::Ps5Desktop::InspectBackendCompatibility();
     if (!compatibility.ready) {
         result->status = LSX4_PS5_EXECUTE_BACKEND_NOT_READY;
         return result->status;
     }
+#endif
 
     Lsx4::Translation::EntryRequest request{};
     std::copy_n(entry->arguments, entry->argument_count,
@@ -12766,10 +21299,27 @@ extern "C" int executor_lsx4_ps5_runtime_execute(
     try {
         result->value =
             Lsx4::Translation::ExecuteGuest(entry->address, request);
+#ifdef __ANDROID__
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5-EXIT",
+            "execute returned thread=%llu entry=0x%llx value=0x%llx",
+            static_cast<unsigned long long>(execution_thread_handle),
+            static_cast<unsigned long long>(entry->address),
+            static_cast<unsigned long long>(result->value));
+#endif
     } catch (const std::exception& exception) {
         g_current_guest_thread_handle = previous_thread_handle;
         g_current_guest_fs_base = previous_fs_base;
         result->status = LSX4_PS5_EXECUTE_INTERNAL_ERROR;
+#ifdef __ANDROID__
+        __android_log_print(
+            ANDROID_LOG_ERROR, "LSX4-PS5-EXIT",
+            "execute exception thread=%llu entry=0x%llx detail=%s",
+            static_cast<unsigned long long>(execution_thread_handle),
+            static_cast<unsigned long long>(entry->address),
+            exception.what());
+        executor_jit_dump_thread_states("ps5-execute-exception");
+#endif
         SetRuntimeStatus(
             std::string{"PS5 guest execution exception: "} +
             exception.what());
@@ -12778,6 +21328,15 @@ extern "C" int executor_lsx4_ps5_runtime_execute(
         g_current_guest_thread_handle = previous_thread_handle;
         g_current_guest_fs_base = previous_fs_base;
         result->status = LSX4_PS5_EXECUTE_INTERNAL_ERROR;
+#ifdef __ANDROID__
+        __android_log_print(
+            ANDROID_LOG_ERROR, "LSX4-PS5-EXIT",
+            "execute unknown exception thread=%llu entry=0x%llx",
+            static_cast<unsigned long long>(execution_thread_handle),
+            static_cast<unsigned long long>(entry->address));
+        executor_jit_dump_thread_states(
+            "ps5-execute-unknown-exception");
+#endif
         SetRuntimeStatus("PS5 guest execution raised a host exception");
         return result->status;
     }
@@ -13077,6 +21636,43 @@ extern "C" int executor_lsx4_ps5_runtime_load_game(
         g_runtime.save_data_directory =
             (game_directory / ".lsx4-savedata")
                 .lexically_normal();
+#ifdef __ANDROID__
+        g_runtime.game_splash_active = false;
+        g_runtime.game_splash_presented = false;
+#endif
+        constexpr std::size_t ExpectedLargeTitleFiles =
+            64u * 1024u;
+        g_runtime.apr_files.reserve(ExpectedLargeTitleFiles);
+        g_runtime.apr_file_ids_by_path.reserve(
+            ExpectedLargeTitleFiles);
+        g_runtime.resolved_guest_paths.reserve(
+            ExpectedLargeTitleFiles);
+        g_runtime.resolved_guest_file_sizes.reserve(
+            ExpectedLargeTitleFiles);
+    }
+#ifdef __ANDROID__
+    TryPresentGameSplashToAndroid();
+#endif
+    std::unordered_map<std::string, std::uint64_t>
+        indexed_guest_file_sizes;
+    const auto file_size_manifest =
+        game_directory / ".lsx4-file-sizes.bin";
+    if (LoadGuestFileSizeIndex(
+            file_size_manifest, indexed_guest_file_sizes)) {
+        const auto indexed_count =
+            indexed_guest_file_sizes.size();
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            g_runtime.indexed_guest_file_sizes =
+                std::move(indexed_guest_file_sizes);
+        }
+#ifdef __ANDROID__
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5-APR",
+            "file-size-index entries=%zu path=%s",
+            indexed_count,
+            file_size_manifest.string().c_str());
+#endif
     }
 
     struct ModuleCandidate {
@@ -13319,17 +21915,27 @@ extern "C" int executor_lsx4_ps5_runtime_unload_eboot(
         g_runtime.guest_semaphores.clear();
         g_runtime.guest_condition_variables.clear();
         g_runtime.guest_event_flags.clear();
+        g_event_flag_generation.fetch_add(
+            1, std::memory_order_acq_rel);
         g_runtime.guest_video_out_ports.clear();
         g_runtime.guest_event_queues.clear();
         g_runtime.apr_files.clear();
+        g_runtime.apr_file_ids_by_path.clear();
         g_runtime.apr_submissions.clear();
+        g_runtime.apr_completion_writes.clear();
+        g_runtime.apr_command_buffers.clear();
+        g_runtime.apr_completion_events.clear();
         g_runtime.resolved_guest_paths.clear();
+        g_runtime.resolved_guest_file_sizes.clear();
+        g_runtime.indexed_guest_file_sizes.clear();
         g_runtime.next_event_flag_handle = 1;
         g_runtime.next_apr_file_id = 1;
         g_runtime.next_apr_submission_id = 1;
         g_runtime.apr_read_count = 0;
         g_runtime.guest_vblank_thread_started = false;
         g_runtime.diagnostic_second_event_queue_created.store(
+            false, std::memory_order_release);
+        g_runtime.guest_login_event_delivered.store(
             false, std::memory_order_release);
         for (auto& [handle, port] :
              g_runtime.guest_audio_out_ports) {
@@ -13342,6 +21948,9 @@ extern "C" int executor_lsx4_ps5_runtime_unload_eboot(
         g_runtime.next_pthread_attribute_handle = 1;
         g_runtime.next_video_out_handle = 1;
         g_runtime.next_audio_out_handle = 1;
+        g_runtime.next_net_pool_handle = 1;
+        g_runtime.next_ssl_handle = 1;
+        g_runtime.next_http2_handle = 1;
         g_runtime.next_event_queue_handle = 1;
         g_runtime.agc_flip_count = 0;
         g_runtime.agc_dumped_frames = 0;
@@ -13359,6 +21968,8 @@ extern "C" int executor_lsx4_ps5_runtime_unload_eboot(
         g_runtime.agc_index_buffer_address = 0;
         g_runtime.agc_index_buffer_count = 0;
         g_runtime.agc_index_size = 0;
+        g_runtime.agc_instance_count = 1;
+        g_runtime.agc_dispatch_indirect_args_base = 0;
         g_runtime.agc_invalid_flip_count = 0;
         g_runtime.agc_next_flip = {};
         g_runtime.agc_cpu_next_render = {};
@@ -13428,13 +22039,21 @@ extern "C" int executor_lsx4_ps5_runtime_start_module(
         return result->status;
     }
     Lsx4Ps5GuestThreadContext thread_context{};
-    const auto create_status =
-        executor_lsx4_ps5_runtime_create_thread_context(
-            owner_handle, &thread_context);
-    if (create_status != 0) {
-        result->status = create_status;
-        SetRuntimeStatus("PS5 module TCB initialization failed");
-        return create_status;
+    const bool borrowed_thread_context =
+        g_current_guest_fs_base != 0;
+    if (borrowed_thread_context) {
+        thread_context.handle = g_current_guest_thread_handle;
+        thread_context.program_handle = owner_handle;
+        thread_context.fs_base = g_current_guest_fs_base;
+    } else {
+        const auto create_status =
+            executor_lsx4_ps5_runtime_create_thread_context(
+                owner_handle, &thread_context);
+        if (create_status != 0) {
+            result->status = create_status;
+            SetRuntimeStatus("PS5 module TCB initialization failed");
+            return create_status;
+        }
     }
 
     int execute_status = LSX4_PS5_EXECUTE_OK;
@@ -13450,8 +22069,10 @@ extern "C" int executor_lsx4_ps5_runtime_start_module(
             break;
         }
     }
-    (void)executor_lsx4_ps5_runtime_destroy_thread_context(
-        thread_context.handle);
+    if (!borrowed_thread_context) {
+        (void)executor_lsx4_ps5_runtime_destroy_thread_context(
+            thread_context.handle);
+    }
     if (execute_status != LSX4_PS5_EXECUTE_OK) {
         return execute_status;
     }
@@ -13670,12 +22291,21 @@ extern "C" int executor_lsx4_ps5_runtime_launch_eboot(
         }
         request.fs_base = automatic_thread.fs_base;
     }
+    const auto previous_startup_thread_handle = std::exchange(
+        g_current_guest_thread_handle,
+        needs_thread_context ? automatic_thread.handle
+                             : g_current_guest_thread_handle);
+    const auto previous_startup_fs_base = std::exchange(
+        g_current_guest_fs_base, request.fs_base);
     for (const auto module_handle : startup_modules) {
         Lsx4Ps5GuestResult module_result{};
         const auto start_status =
             executor_lsx4_ps5_runtime_start_module(
                 module_handle, &module_result);
         if (start_status != LSX4_PS5_EXECUTE_OK) {
+            g_current_guest_thread_handle =
+                previous_startup_thread_handle;
+            g_current_guest_fs_base = previous_startup_fs_base;
             *result = module_result;
             if (needs_thread_context) {
                 (void)executor_lsx4_ps5_runtime_destroy_thread_context(
@@ -13684,6 +22314,8 @@ extern "C" int executor_lsx4_ps5_runtime_launch_eboot(
             return start_status;
         }
     }
+    g_current_guest_thread_handle = previous_startup_thread_handle;
+    g_current_guest_fs_base = previous_startup_fs_base;
     if (!initializers_started) {
         for (const auto initializer : initializers) {
             Lsx4Ps5GuestEntry initializer_request{};
@@ -13767,6 +22399,7 @@ extern "C" int executor_lsx4_ps5_runtime_destroy_thread_context(
 }
 
 extern "C" void executor_lsx4_ps5_runtime_reset() {
+    bool had_runtime_session{};
     std::vector<std::thread> guest_host_threads;
     std::vector<std::shared_ptr<GuestSemaphore>> guest_semaphores;
     std::vector<std::shared_ptr<GuestConditionVariable>>
@@ -13775,6 +22408,8 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
         guest_event_flags;
     {
         const std::lock_guard lock{g_runtime.mutex};
+        had_runtime_session =
+            g_runtime.initialized || !g_runtime.programs.empty();
         g_runtime.shutdown_requested.store(
             true, std::memory_order_release);
         g_runtime.initialized = false;
@@ -13830,6 +22465,7 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
         libc_heap_allocations;
     std::vector<GuestStdioFile> stdio_files;
     std::vector<GuestStdioHandlePage> stdio_handle_pages;
+    std::vector<GuestKernelFile> kernel_files;
     std::uint8_t* hle_slab{};
     std::uint8_t* hle_data{};
 #ifdef __ANDROID__
@@ -13847,8 +22483,13 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
         stdio_files = std::move(g_runtime.stdio_files);
         stdio_handle_pages =
             std::move(g_runtime.stdio_handle_pages);
+        kernel_files = std::move(g_runtime.kernel_files);
         g_runtime.app0_directory.clear();
         g_runtime.save_data_directory.clear();
+#ifdef __ANDROID__
+        g_runtime.game_splash_active = false;
+        g_runtime.game_splash_presented = false;
+#endif
         g_runtime.agc_register_defaults = 0;
         g_runtime.agc_internal_register_defaults = 0;
         g_runtime.msg_dialog_status.store(
@@ -13865,17 +22506,28 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
         g_runtime.guest_semaphores.clear();
         g_runtime.guest_condition_variables.clear();
         g_runtime.guest_event_flags.clear();
+        g_event_flag_generation.fetch_add(
+            1, std::memory_order_acq_rel);
         g_runtime.guest_video_out_ports.clear();
         g_runtime.guest_event_queues.clear();
         g_runtime.apr_files.clear();
+        g_runtime.apr_file_ids_by_path.clear();
         g_runtime.apr_submissions.clear();
+        g_runtime.apr_completion_writes.clear();
+        g_runtime.apr_command_buffers.clear();
+        g_runtime.apr_completion_events.clear();
         g_runtime.resolved_guest_paths.clear();
+        g_runtime.resolved_guest_file_sizes.clear();
+        g_runtime.indexed_guest_file_sizes.clear();
         g_runtime.next_event_flag_handle = 1;
+        g_runtime.next_kernel_file_handle = 3;
         g_runtime.next_apr_file_id = 1;
         g_runtime.next_apr_submission_id = 1;
         g_runtime.apr_read_count = 0;
         g_runtime.guest_vblank_thread_started = false;
         g_runtime.diagnostic_second_event_queue_created.store(
+            false, std::memory_order_release);
+        g_runtime.guest_login_event_delivered.store(
             false, std::memory_order_release);
         for (auto& [handle, port] :
              g_runtime.guest_audio_out_ports) {
@@ -13899,12 +22551,17 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
         g_runtime.direct_allocations.clear();
         g_runtime.next_direct_offset = 0;
         g_runtime.next_direct_map_hint = Ps5DirectMapHint;
+        g_runtime.next_flexible_map_hint = Ps5FlexibleMapHint;
         g_runtime.next_libc_heap_hint = Ps5LibcHeapHint;
         hle_slab = std::exchange(g_runtime.hle_slab, nullptr);
         hle_data = std::exchange(g_runtime.hle_data, nullptr);
+        g_runtime.next_mutex_object_offset =
+            Ps5MutexObjectPoolOffset;
         g_runtime.hle_slab_used = 0;
         ++g_runtime.hle_slab_slot;
         g_runtime.hle_bindings.clear();
+        g_hle_binding_generation.fetch_add(
+            1, std::memory_order_release);
         g_runtime.next_program_handle = 1;
         g_runtime.next_thread_handle = 1;
         g_runtime.next_pthread_attribute_handle = 1;
@@ -13918,12 +22575,15 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
         g_runtime.agc_dumped_draw_states = 0;
         g_runtime.agc_draw_count = 0;
         g_runtime.agc_dumped_textures = 0;
+        g_runtime.agc_submit_count = 0;
         g_runtime.agc_cx_registers.clear();
         g_runtime.agc_sh_registers.clear();
         g_runtime.agc_uc_registers.clear();
         g_runtime.agc_index_buffer_address = 0;
         g_runtime.agc_index_buffer_count = 0;
         g_runtime.agc_index_size = 0;
+        g_runtime.agc_instance_count = 1;
+        g_runtime.agc_dispatch_indirect_args_base = 0;
         g_runtime.agc_next_flip = {};
         g_runtime.agc_cpu_next_render = {};
         ++g_runtime.agc_cpu_texture_cache_epoch;
@@ -13956,6 +22616,11 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
     for (const auto& page : stdio_handle_pages) {
         munmap(page.allocation, page.mapped_size);
     }
+    for (const auto& file : kernel_files) {
+        if (file.stream != nullptr) {
+            std::fclose(file.stream);
+        }
+    }
     for (const auto& [address, allocation] : libc_heap_allocations) {
         munmap(allocation.allocation, allocation.mapped_size);
     }
@@ -13965,7 +22630,9 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
     if (hle_data != nullptr) {
         munmap(hle_data, Ps5HleDataSize);
     }
-    ResetPs5TranslationSession();
+    if (had_runtime_session) {
+        ResetPs5TranslationSession();
+    }
     const std::lock_guard lock{g_runtime.mutex};
     g_runtime.mappings.Clear();
     g_runtime.status = "PS5 runtime is not initialized";
@@ -14043,7 +22710,7 @@ extern "C" int executor_jit_classify_hle_thunk(
     {
         const std::lock_guard lock{g_runtime.mutex};
         if (g_runtime.hle_bindings.contains(thunk)) {
-            return 1;
+            return 2;
         }
     }
     const auto callbacks = SnapshotCallbacks();
@@ -14063,14 +22730,31 @@ extern "C" int executor_jit_resolve_hle_thunk(
         return 0;
     }
     *native_function = 0;
+    struct ResolutionCache {
+        std::uint64_t generation{};
+        std::unordered_map<std::uint64_t, std::uint64_t> bindings;
+    };
+    thread_local ResolutionCache cache;
+    const auto generation =
+        g_hle_binding_generation.load(std::memory_order_acquire);
+    if (cache.generation != generation) {
+        cache.bindings.clear();
+        cache.generation = generation;
+    }
+    if (const auto cached = cache.bindings.find(thunk);
+        cached != cache.bindings.end()) {
+        *native_function = cached->second;
+        return 2;
+    }
     {
         const std::lock_guard lock{g_runtime.mutex};
         if (const auto found = g_runtime.hle_bindings.find(thunk);
             found != g_runtime.hle_bindings.end()) {
-            *native_function = found->second.native_function;
-            if (*native_function != 0) {
-                return 1;
-            }
+            *native_function = found->second.native_function != 0
+                ? found->second.native_function
+                : thunk;
+            cache.bindings.emplace(thunk, *native_function);
+            return 2;
         }
     }
     const auto callbacks = SnapshotCallbacks();
@@ -14081,12 +22765,30 @@ extern "C" int executor_jit_resolve_hle_thunk(
 
 extern "C" int executor_jit_lookup_hle_thunk(
     const std::uint64_t thunk, std::uint64_t* const native_function) {
-    return executor_jit_resolve_hle_thunk(thunk, native_function);
+    if (native_function == nullptr) {
+        return 0;
+    }
+    *native_function = 0;
+    {
+        const std::lock_guard lock{g_runtime.mutex};
+        if (const auto found = g_runtime.hle_bindings.find(thunk);
+            found != g_runtime.hle_bindings.end()) {
+            if (found->second.native_function == 0) {
+                return 0;
+            }
+            *native_function = found->second.native_function;
+            return 2;
+        }
+    }
+    const auto callbacks = SnapshotCallbacks();
+    return callbacks.resolve_hle != nullptr
+        ? callbacks.resolve_hle(callbacks.context, thunk, native_function)
+        : 0;
 }
 
 extern "C" int executor_jit_lookup_leaf_hle_thunk(
     const std::uint64_t thunk, std::uint64_t* const native_function) {
-    return executor_jit_resolve_hle_thunk(thunk, native_function);
+    return executor_jit_lookup_hle_thunk(thunk, native_function);
 }
 
 std::uint64_t ExecutorJitResolvedLeafHleCallback(
@@ -14192,6 +22894,9 @@ namespace Lsx4::Translation {
 
 std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request) {
     const auto callbacks = SnapshotCallbacks();
+    std::uint64_t builtin_result{};
+    const auto handled =
+        TryInvokeBuiltinHle(request, builtin_result);
     Lsx4Ps5HleCall call{
         .function = request.function,
         .guest_stack = request.guest_stack,
@@ -14200,7 +22905,7 @@ std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request) {
     std::ranges::copy(request.floating_arguments, call.floating_arguments);
     std::uint64_t callback_result{};
     try {
-        if (callbacks.invoke_hle != nullptr) {
+        if (!handled && callbacks.invoke_hle != nullptr) {
             callback_result =
                 callbacks.invoke_hle(callbacks.context, &call);
         }
@@ -14208,9 +22913,6 @@ std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request) {
         SetRuntimeStatus("PS5 HLE callback raised a host exception");
         return 0;
     }
-    std::uint64_t builtin_result{};
-    const auto handled =
-        TryInvokeBuiltinHle(request, builtin_result);
     const auto result =
         handled ? builtin_result : callback_result;
     if (Ps5TraceHleEnabled()) {

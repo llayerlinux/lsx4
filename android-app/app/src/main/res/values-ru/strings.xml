@@ -66,4 +66,8 @@
     <string name="optimization_coarse_fragment_2x2_hint">Выполняет один fragment shader на группу пикселей 2×2. Может сильно снизить нагрузку GPU в тяжёлых сценах, но уменьшает мелкую детализацию и способно нарушить отдельные эффекты. После изменения перезапустите игру.</string>
     <string name="optimization_disable_vk_robustness">Отключить проверки Vulkan robustness</string>
     <string name="optimization_disable_vk_robustness_hint">Убирает защиту границ GPU-буферов и изображений. Может ускорить игры с тяжёлыми шейдерами, но ошибочный доступ способен повредить графику или вызвать сбой драйвера. После изменения перезапустите игру.</string>
+    <string name="optimization_tiered_jit">Многоуровневый JIT</string>
+    <string name="optimization_tiered_jit_hint">Профилирует горячие переходы гостевого кода, сохраняя текущий JIT как базовый уровень и мгновенный откат. После изменения перезапустите игру.</string>
+    <string name="optimization_jit_trace_compilation">Компиляция JIT-трасс</string>
+    <string name="optimization_jit_trace_compilation_hint">Компилирует стабильные горячие прямые пути как оптимизированные трассы Tier 2. Требует многоуровневый JIT; небезопасные и изменившиеся пути остаются на базовом JIT. После изменения перезапустите игру.</string>
 </resources>

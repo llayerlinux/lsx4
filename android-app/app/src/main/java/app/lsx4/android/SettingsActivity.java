@@ -61,6 +61,8 @@ public final class SettingsActivity extends Activity {
     public static final String K_ARM_GPU_FAST_PATH = "managed_arm_gpu_fast_path";
     public static final String K_COARSE_FRAGMENT_2X2 = "managed_coarse_fragment_2x2";
     public static final String K_DISABLE_VK_ROBUSTNESS = "managed_disable_vk_robustness";
+    public static final String K_TIERED_JIT = "managed_tiered_jit";
+    public static final String K_JIT_TRACE_COMPILATION = "managed_jit_trace_compilation";
     private static final String K_LEGACY_PERSISTENT_JIT_CACHE =
             "jit_persistent_jit_cache";
     public static final String K_DISABLE_DYNAMIC_SHADOWS = "disable_dynamic_shadows";
@@ -524,6 +526,36 @@ public final class SettingsActivity extends Activity {
                 getString(R.string.optimization_disable_vk_robustness_hint));
         robustnessWarning.setPadding(dp(8), dp(10), dp(8), 0);
         root.addView(robustnessWarning);
+
+        CheckBox tieredJit = preferenceCheck(
+                R.string.optimization_tiered_jit, K_TIERED_JIT, false);
+        root.addView(tieredJit);
+        TextView tieredJitWarning = hint(
+                getString(R.string.optimization_tiered_jit_hint));
+        tieredJitWarning.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(tieredJitWarning);
+
+        CheckBox traceCompilation = preferenceCheck(
+                R.string.optimization_jit_trace_compilation,
+                K_JIT_TRACE_COMPILATION, false);
+        root.addView(traceCompilation);
+        tieredJit.setOnCheckedChangeListener((button, checked) -> {
+            prefs(this).edit().putBoolean(K_TIERED_JIT, checked).apply();
+            if (!checked && traceCompilation.isChecked()) {
+                traceCompilation.setChecked(false);
+            }
+        });
+        traceCompilation.setOnCheckedChangeListener((button, checked) -> {
+            prefs(this).edit().putBoolean(
+                    K_JIT_TRACE_COMPILATION, checked).apply();
+            if (checked && !tieredJit.isChecked()) {
+                tieredJit.setChecked(true);
+            }
+        });
+        TextView traceJitWarning = hint(
+                getString(R.string.optimization_jit_trace_compilation_hint));
+        traceJitWarning.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(traceJitWarning);
     }
 
     private void buildOther(LinearLayout root) {
