@@ -6157,8 +6157,22 @@ bool TryAgcTextureSourceProbe(
                 sample.data(), byte_count)) {
             return false;
         }
-        for (std::size_t index = 0; index < byte_count; ++index) {
-            signature ^= sample[index];
+        std::size_t index{};
+        for (; index + sizeof(std::uint64_t) <= byte_count;
+             index += sizeof(std::uint64_t)) {
+            std::uint64_t word{};
+            std::memcpy(
+                &word, sample.data() + index, sizeof(word));
+            signature ^= word;
+            signature *= UINT64_C(1099511628211);
+            signature ^= signature >> 32u;
+        }
+        std::uint64_t tail{};
+        if (index < byte_count) {
+            std::memcpy(
+                &tail, sample.data() + index,
+                byte_count - index);
+            signature ^= tail;
             signature *= UINT64_C(1099511628211);
         }
         signature ^= offset;
