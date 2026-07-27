@@ -160,9 +160,11 @@ DirectVectorPlan PlanDirectVectorKernel(
 std::optional<LanePermutationPlan> PlanLanePermutation(
     const LsxDecodedOp& instruction) noexcept {
     const auto opcode = static_cast<X86Mnemonic>(instruction.mnemonic);
-    const std::uint8_t element_bytes = opcode == X86_MNEMONIC_VPERMILPD ? 8u
-                                       : opcode == X86_MNEMONIC_VPERMILPS ? 4u
-                                                                         : 0u;
+    const bool full_vector = opcode == X86_MNEMONIC_VPERMPS;
+    const std::uint8_t element_bytes =
+        opcode == X86_MNEMONIC_VPERMILPD ? 8u
+        : opcode == X86_MNEMONIC_VPERMILPS || full_vector ? 4u
+                                                          : 0u;
     if (element_bytes == 0 || instruction.operand_count != 3 ||
         !IsVectorRegister(instruction.operands[0])) {
         return std::nullopt;
@@ -170,29 +172,36 @@ std::optional<LanePermutationPlan> PlanLanePermutation(
     const auto vector_or_memory = [](const LsxOperandRecord& operand) {
         return IsVectorRegister(operand) || operand.type == X86_OPERAND_TYPE_MEMORY;
     };
-    const auto& source = instruction.operands[1];
+    const std::uint8_t source_operand = full_vector ? 2u : 1u;
+    const std::uint8_t control_operand = full_vector ? 1u : 2u;
+    const auto& source = instruction.operands[source_operand];
     if (!vector_or_memory(source)) {
         return std::nullopt;
     }
 
     const auto& control = instruction.operands[2];
     LanePermutationPlan plan{
-        .source_operand = 1,
-        .control_operand = 2,
+        .source_operand = source_operand,
+        .control_operand = control_operand,
         .element_bytes = element_bytes,
         .vector_bytes = instruction.operands[0].size / 8u,
+        .full_vector = full_vector,
     };
     if ((plan.vector_bytes != 16 && plan.vector_bytes != 32) ||
         source.size != instruction.operands[0].size) {
         return std::nullopt;
     }
-    if (control.type == X86_OPERAND_TYPE_IMMEDIATE) {
-        plan.immediate = static_cast<std::uint8_t>(control.imm.value.u);
+    const auto& actual_control =
+        instruction.operands[control_operand];
+    if (!full_vector &&
+        actual_control.type == X86_OPERAND_TYPE_IMMEDIATE) {
+        plan.immediate =
+            static_cast<std::uint8_t>(actual_control.imm.value.u);
         plan.control_source = LaneControlSource::Immediate;
         return plan;
     }
-    if (!vector_or_memory(control) ||
-        control.size != instruction.operands[0].size) {
+    if (!vector_or_memory(actual_control) ||
+        actual_control.size != instruction.operands[0].size) {
         return std::nullopt;
     }
     plan.control_source = LaneControlSource::VectorValue;

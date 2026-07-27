@@ -17,6 +17,10 @@
 
 namespace Executor::Jit {
 
+void ConfigureTieredJit(bool enabled, bool trace_compilation_enabled) noexcept;
+[[nodiscard]] bool TieredJitEnabled() noexcept;
+[[nodiscard]] bool JitTraceCompilationEnabled() noexcept;
+
 enum class LsxGpr : std::uint8_t {
     Rax,
     Rcx,

@@ -41,6 +41,7 @@ struct LanePermutationPlan {
     std::uint8_t element_bytes{};
     std::uint32_t vector_bytes{};
     LaneControlSource control_source{LaneControlSource::Immediate};
+    bool full_vector{};
 };
 
 [[nodiscard]] std::optional<LanePermutationPlan> PlanLanePermutation(

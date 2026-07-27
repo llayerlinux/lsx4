@@ -367,14 +367,34 @@ if(LSX4_ENABLE_PS5_DESKTOP_PATH)
     lsx4_define_ps5_desktop_profile()
     lsx4_assert_ps5_desktop_ownership(${LSX4_PS5_DESKTOP_SOURCES})
 
+    set(LSX4_KYTY_GEN5_DIR
+        "${CMAKE_CURRENT_SOURCE_DIR}/../_tmp_kytyps5_analysis"
+        CACHE PATH "Kyty source tree used by the isolated PS5 Gen5 shader translator")
+    if(EXISTS "${LSX4_KYTY_GEN5_DIR}/src/graphics/shader/recompiler/ShaderRecompiler.cpp")
+        file(GLOB LSX4_GEN5_RECOMPILER_SOURCES CONFIGURE_DEPENDS
+            "${LSX4_KYTY_GEN5_DIR}/src/graphics/shader/recompiler/*.cpp"
+            "${LSX4_KYTY_GEN5_DIR}/src/graphics/shader/recompiler/shaderIR/*.cpp"
+            "${LSX4_KYTY_GEN5_DIR}/src/graphics/shader/recompiler/spirvEmitter/*.cpp")
+        list(APPEND LSX4_GEN5_RECOMPILER_SOURCES
+            "${LSX4_KYTY_GEN5_DIR}/src/graphics/guest_gpu/gpu_format.cpp")
+    else()
+        message(FATAL_ERROR
+            "The isolated PS5 Gen5 translator source tree is missing: ${LSX4_KYTY_GEN5_DIR}")
+    endif()
+
     add_library(lsx4_executor_ps5_android SHARED
         ${LSX4_PS5_DESKTOP_SOURCES}
         ${LSX4_JIT_COMMON_SOURCES}
+        ${LSX4_GEN5_RECOMPILER_SOURCES}
         "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/x86_decoder.cpp"
         src/executor/ps5_desktop/backend_contract.cpp
         src/executor/ps5_desktop/bc7decomp.cpp
+        src/executor/ps5_desktop/gen5_compute_recompiler.cpp
         src/executor/ps5_desktop/vulkan_presenter.cpp
         src/executor/ps5_desktop/runtime_api.cpp)
+    target_include_directories(lsx4_executor_ps5_android BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/ps5_desktop/kyty_compat"
+        "${LSX4_KYTY_GEN5_DIR}/src")
     target_include_directories(lsx4_executor_ps5_android PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${LSX4_ARM_DESKTOP_SOURCE_DIR}")
@@ -534,6 +554,7 @@ if(TARGET lsx4_executor_ps5_android)
         fmt::fmt
         tsl::robin_map
         nlohmann_json::nlohmann_json
+        PNG::PNG
         Vulkan::Headers
         xxHash::xxhash
         lsx_iced_decoder)

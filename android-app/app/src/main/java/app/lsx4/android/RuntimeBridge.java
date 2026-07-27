@@ -6,6 +6,8 @@ public final class RuntimeBridge {
     public static final int MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH = 1;
     public static final int MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2 = 2;
     public static final int MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS = 3;
+    public static final int MANAGED_OPTIMIZATION_TIERED_JIT = 4;
+    public static final int MANAGED_OPTIMIZATION_JIT_TRACE_COMPILATION = 5;
 
     static {
         System.loadLibrary("lsx_runtime_bridge");

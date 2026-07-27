@@ -4056,8 +4056,8 @@ public class MainActivity extends Activity {
                     ? RuntimeBridge.loadPs5(runtimeFile.getAbsolutePath())
                     : RuntimeBridge.load(runtimeFile.getAbsolutePath()));
             runtimeLoaded = true;
+            applyManagedOptimizations();
             if (!ps5Runtime) {
-                applyManagedOptimizations();
                 RuntimeBridge.setAudioEnabled(SettingsActivity.prefs(this).getBoolean(
                         SettingsActivity.K_AUDIO, true));
                 replayExternalGamepadState();
@@ -4089,6 +4089,13 @@ public class MainActivity extends Activity {
                 SettingsActivity.K_COARSE_FRAGMENT_2X2, false);
         boolean disableVkRobustness = preferences.getBoolean(
                 SettingsActivity.K_DISABLE_VK_ROBUSTNESS, false);
+        boolean tieredJit = preferences.getBoolean(
+                SettingsActivity.K_TIERED_JIT, false);
+        boolean jitTraceCompilation = preferences.getBoolean(
+                SettingsActivity.K_JIT_TRACE_COMPILATION, false);
+        if (jitTraceCompilation) {
+            tieredJit = true;
+        }
         int armResult = RuntimeBridge.setManagedOptimization(
                 RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH, armGpuFastPath);
         int coarseResult = RuntimeBridge.setManagedOptimization(
@@ -4096,10 +4103,18 @@ public class MainActivity extends Activity {
         int robustnessResult = RuntimeBridge.setManagedOptimization(
                 RuntimeBridge.MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS,
                 disableVkRobustness);
+        int tieredJitResult = RuntimeBridge.setManagedOptimization(
+                RuntimeBridge.MANAGED_OPTIMIZATION_TIERED_JIT, tieredJit);
+        int traceJitResult = RuntimeBridge.setManagedOptimization(
+                RuntimeBridge.MANAGED_OPTIMIZATION_JIT_TRACE_COMPILATION,
+                jitTraceCompilation);
         Log.i(TAG, "EXECUTOR_MANAGED_OPTIMIZATION armGpuFastPath=" + armGpuFastPath
                 + " coarseFragment2x2=" + coarseFragment2x2
                 + " disableVkRobustness=" + disableVkRobustness
-                + " results=" + armResult + "/" + coarseResult + "/" + robustnessResult);
+                + " tieredJit=" + tieredJit
+                + " traceJit=" + jitTraceCompilation
+                + " results=" + armResult + "/" + coarseResult + "/" + robustnessResult
+                + "/" + tieredJitResult + "/" + traceJitResult);
     }
 
     private void initializeRuntime() {

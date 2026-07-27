@@ -174,6 +174,10 @@ extern "C" int executor_lsx4_ps5_runtime_set_pad_button(
     std::uint32_t button_mask, int pressed);
 extern "C" int executor_lsx4_ps5_runtime_set_pad_axis(
     int axis, int value);
+extern "C" int executor_lsx4_ps5_runtime_hud_stats(
+    std::uint64_t* values, std::size_t value_count);
+extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
+    int option, int enabled);
 extern "C" int executor_lsx4_ps5_runtime_initialize(
     const Lsx4Ps5RuntimeConfig* config);
 extern "C" int executor_lsx4_ps5_runtime_set_callbacks(

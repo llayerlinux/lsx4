@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <cstdint>
 #include <mutex>
@@ -42,6 +43,7 @@ using runtime_hud_stats_fn = int (*)(std::uint64_t*, std::size_t);
 std::mutex g_mutex;
 void* g_runtime = nullptr;
 void* g_ps5_runtime = nullptr;
+std::string g_ps5_runtime_path;
 str_fn g_ps5_abi = nullptr;
 str_fn g_ps5_status = nullptr;
 init_fn g_ps5_initialize = nullptr;
@@ -65,6 +67,8 @@ present_frame_dump_fn g_present_frame_dump = nullptr;
 str_fn g_status = nullptr;
 str_fn g_jit_status = nullptr;
 runtime_hud_stats_fn g_runtime_hud_stats = nullptr;
+runtime_hud_stats_fn g_ps5_runtime_hud_stats = nullptr;
+std::atomic<bool> g_active_ps5_runtime{false};
 str_fn g_jit_selftest = nullptr;
 path_fn g_scan_game = nullptr;
 path_fn g_launch_game = nullptr;
@@ -95,6 +99,7 @@ pad_touch_fn g_set_touchpad = nullptr;
 noarg_int_fn g_audio_init = nullptr;
 int_fn g_set_audio_enabled = nullptr;
 option_fn g_set_managed_optimization = nullptr;
+option_fn g_ps5_set_managed_optimization = nullptr;
 noarg_int_fn g_audio_probe_tone = nullptr;
 str_fn g_audio_status = nullptr;
 
@@ -212,6 +217,12 @@ T resolve_ps5_required(JNIEnv* env, const char* name)
         return nullptr;
     }
     return reinterpret_cast<T>(symbol);
+}
+
+template <typename T>
+T resolve_ps5_optional(const char* name)
+{
+    return reinterpret_cast<T>(dlsym(g_ps5_runtime, name));
 }
 
 const char* call_or_empty(str_fn fn)
@@ -501,6 +512,7 @@ Java_app_lsx4_android_RuntimeBridge_load(JNIEnv* env, jclass, jstring path)
     {
         return nullptr;
     }
+    g_active_ps5_runtime.store(false, std::memory_order_release);
 
     __android_log_print(ANDROID_LOG_INFO, "LSX4",
                         "[EXECUTOR_UI_BUILD_MARKER] id=ui-bridge-live-cusa-marker-r1 "
@@ -521,15 +533,22 @@ Java_app_lsx4_android_RuntimeBridge_loadPs5(JNIEnv* env, jclass, jstring path)
     }
 
     std::lock_guard<std::mutex> lock(g_mutex);
+    std::string loaded_path = raw_path;
+    env->ReleaseStringUTFChars(path, raw_path);
+    if (g_ps5_runtime && g_ps5_runtime_path == loaded_path)
+    {
+        g_active_ps5_runtime.store(true, std::memory_order_release);
+        return to_jstring(
+            env, "PS5 runtime already loaded: " + loaded_path);
+    }
     if (g_ps5_runtime)
     {
         dlclose(g_ps5_runtime);
         g_ps5_runtime = nullptr;
+        g_ps5_runtime_path.clear();
     }
 
-    g_ps5_runtime = dlopen(raw_path, RTLD_NOW | RTLD_LOCAL);
-    std::string loaded_path = raw_path;
-    env->ReleaseStringUTFChars(path, raw_path);
+    g_ps5_runtime = dlopen(loaded_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!g_ps5_runtime)
     {
         std::string error = "PS5 dlopen failed: ";
@@ -556,10 +575,16 @@ Java_app_lsx4_android_RuntimeBridge_loadPs5(JNIEnv* env, jclass, jstring path)
         env, "executor_lsx4_ps5_runtime_set_pad_button");
     g_ps5_set_pad_axis = resolve_ps5_required<pad_axis_fn>(
         env, "executor_lsx4_ps5_runtime_set_pad_axis");
+    g_ps5_runtime_hud_stats = resolve_ps5_optional<runtime_hud_stats_fn>(
+        "executor_lsx4_ps5_runtime_hud_stats");
+    g_ps5_set_managed_optimization = resolve_ps5_optional<option_fn>(
+        "executor_lsx4_ps5_runtime_set_managed_optimization");
     if (env->ExceptionCheck())
     {
         return nullptr;
     }
+    g_ps5_runtime_path = loaded_path;
+    g_active_ps5_runtime.store(true, std::memory_order_release);
 
     __android_log_print(ANDROID_LOG_INFO, "LSX4",
                         "Loaded isolated PS5 runtime: %s",
@@ -1102,9 +1127,10 @@ extern "C" JNIEXPORT jint JNICALL
 Java_app_lsx4_android_RuntimeBridge_setManagedOptimization(JNIEnv*, jclass, jint option,
                                                            jboolean enabled)
 {
-    return g_set_managed_optimization
-               ? g_set_managed_optimization(static_cast<int>(option), enabled ? 1 : 0)
-               : -2;
+    option_fn setter = g_active_ps5_runtime.load(std::memory_order_acquire)
+        ? g_ps5_set_managed_optimization
+        : g_set_managed_optimization;
+    return setter ? setter(static_cast<int>(option), enabled ? 1 : 0) : -2;
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -1218,8 +1244,12 @@ Java_app_lsx4_android_RuntimeBridge_runtimeHudStats(JNIEnv* env, jclass)
 {
     constexpr std::size_t kValueCapacity = 21;
     std::uint64_t values[kValueCapacity]{};
+    const auto hud_stats =
+        g_active_ps5_runtime.load(std::memory_order_acquire)
+            ? g_ps5_runtime_hud_stats
+            : g_runtime_hud_stats;
     const int returned_count =
-        g_runtime_hud_stats ? g_runtime_hud_stats(values, kValueCapacity) : 0;
+        hud_stats ? hud_stats(values, kValueCapacity) : 0;
     if (returned_count <= 0 || returned_count > static_cast<int>(kValueCapacity))
     {
         return env->NewLongArray(0);

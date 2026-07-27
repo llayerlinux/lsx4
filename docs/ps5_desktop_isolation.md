@@ -1,5 +1,8 @@
 # PS5 desktop isolation
 
+The current device-test checkpoint and exact continuation procedure are in
+[`PS5_RUNTIME_HANDOFF.md`](../PS5_RUNTIME_HANDOFF.md).
+
 ## Decision
 
 The PS5 desktop implementation is owned by Funnel ARM under

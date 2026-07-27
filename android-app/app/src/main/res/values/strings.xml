@@ -146,4 +146,8 @@
     <string name="optimization_coarse_fragment_2x2_hint">Runs one fragment shader invocation for each 2×2 pixel group. This can strongly reduce GPU load in pixel-heavy scenes, but lowers fine detail and may break some effects. Restart the game after changing it.</string>
     <string name="optimization_disable_vk_robustness">Disable Vulkan robustness checks</string>
     <string name="optimization_disable_vk_robustness_hint">Removes GPU buffer and image bounds protection. This may speed up shader-heavy games, but invalid accesses can corrupt graphics or crash the driver. Restart the game after changing it.</string>
+    <string name="optimization_tiered_jit">Tiered JIT</string>
+    <string name="optimization_tiered_jit_hint">Profiles hot guest control-flow edges while preserving the current JIT as the baseline and immediate fallback. Restart the game after changing it.</string>
+    <string name="optimization_jit_trace_compilation">JIT trace compilation</string>
+    <string name="optimization_jit_trace_compilation_hint">Compiles stable hot direct paths as optimized Tier 2 traces. Requires Tiered JIT; unsafe or changed paths remain on the baseline JIT. Restart the game after changing it.</string>
 </resources>

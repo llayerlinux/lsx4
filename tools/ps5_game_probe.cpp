@@ -222,6 +222,21 @@ int main(const int argc, char** const argv) {
         dlclose(library);
         return 7;
     }
+    for (const auto& binding : g_bindings) {
+        const auto slab_offset = binding.thunk & UINT64_C(0xfffff);
+        if (slab_offset == UINT64_C(0xae00) ||
+            slab_offset == UINT64_C(0xb600) ||
+            slab_offset == UINT64_C(0xb700) ||
+            slab_offset == UINT64_C(0x24800) ||
+            slab_offset == UINT64_C(0x3a200)) {
+            std::fprintf(
+                stderr,
+                "PS5_PROBE_BIND_TARGET offset=0x%llx thunk=0x%llx nid=%s\n",
+                static_cast<unsigned long long>(slab_offset),
+                static_cast<unsigned long long>(binding.thunk),
+                binding.symbol.c_str());
+        }
+    }
     std::array<char, 16384> text{};
     if (probe_report(
             executable.handle, &report, text.data(), text.size()) != 0) {

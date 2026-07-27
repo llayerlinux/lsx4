@@ -56,7 +56,11 @@ constexpr std::uint32_t kKnownNativeFlags =
     kJitNativeFlagInsertPsDirectV17 |
     kJitNativeFlagDirectRetV18 |
     kJitNativeFlagHotStateDirectV19 |
-    kJitNativeFlagHotAtomicPermuteV20;
+    kJitNativeFlagHotAtomicPermuteV20 |
+    kJitNativeFlagCmpxchgCacheSyncV21 |
+    kJitNativeFlagXchgCacheSyncV22 |
+    kJitNativeFlagPs5PauseYieldV23 |
+    kJitNativeFlagPs5AtomicRestoreV24;
 constexpr std::uint32_t kAarch64PointerMaterializationBytes = 4 * sizeof(std::uint32_t);
 
 constexpr std::uint16_t kBlockFlagCanJitInitial = 1u << 0;
