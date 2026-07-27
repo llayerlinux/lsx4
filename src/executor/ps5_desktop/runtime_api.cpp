@@ -761,21 +761,24 @@ constexpr std::array Ps5DiagnosticFaultSignals{
     SIGSEGV, SIGBUS, SIGILL};
 
 bool Ps5DiagnosticFaultProbeEnabled() {
-    if (std::getenv("EXECUTOR_DIAG_JIT_RIP_PROBE") != nullptr) {
-        return true;
-    }
+    static const bool enabled = [] {
+        if (std::getenv("EXECUTOR_DIAG_JIT_RIP_PROBE") != nullptr) {
+            return true;
+        }
 #ifdef __ANDROID__
-    return access(
-               "/data/user/0/app.lsx4.android/files/lsx4-home/"
-               "diag-jit-rip-probe",
-               F_OK) == 0 ||
-           access(
-               "/data/data/app.lsx4.android/files/lsx4-home/"
-               "diag-jit-rip-probe",
-               F_OK) == 0;
+        return access(
+                   "/data/user/0/app.lsx4.android/files/lsx4-home/"
+                   "diag-jit-rip-probe",
+                   F_OK) == 0 ||
+               access(
+                   "/data/data/app.lsx4.android/files/lsx4-home/"
+                   "diag-jit-rip-probe",
+                   F_OK) == 0;
 #else
-    return false;
+        return false;
 #endif
+    }();
+    return enabled;
 }
 
 void Ps5DiagnosticFaultHandler(
@@ -1021,6 +1024,7 @@ struct GuestAccessCacheEntry {
 thread_local std::array<GuestAccessCacheEntry, 32>
     g_guest_access_cache{};
 thread_local std::size_t g_guest_access_cache_cursor{};
+thread_local GuestAccessCacheEntry g_guest_access_cache_last{};
 
 bool Ps5TraceHleEnabled() {
     static const bool enabled = [] {
@@ -1046,17 +1050,25 @@ bool HasCachedAccess(const std::uint64_t address,
         return false;
     }
     const auto generation = g_runtime.mappings.Generation();
-    return std::ranges::any_of(
-        g_guest_access_cache,
-        [&](const GuestAccessCacheEntry& cached) {
-            return cached.generation != 0 &&
-                   cached.generation == generation &&
-                   (cached.protection & access) == access &&
-                   address >= cached.address &&
-                   byte_count <= cached.byte_count &&
-                   address - cached.address <=
-                       cached.byte_count - byte_count;
-        });
+    const auto contains = [&](const GuestAccessCacheEntry& cached) {
+        return cached.generation != 0 &&
+               cached.generation == generation &&
+               (cached.protection & access) == access &&
+               address >= cached.address &&
+               byte_count <= cached.byte_count &&
+               address - cached.address <=
+                   cached.byte_count - byte_count;
+    };
+    if (contains(g_guest_access_cache_last)) {
+        return true;
+    }
+    for (const auto& cached : g_guest_access_cache) {
+        if (contains(cached)) {
+            g_guest_access_cache_last = cached;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool CopyGuestBytes(const std::uint64_t address, void* const destination,
@@ -1076,14 +1088,16 @@ bool CopyGuestBytes(const std::uint64_t address, void* const destination,
     if (mapping == nullptr) {
         return false;
     }
-    g_guest_access_cache[
-        g_guest_access_cache_cursor++ %
-        g_guest_access_cache.size()] = {
+    const GuestAccessCacheEntry cached{
         .generation = generation,
         .address = mapping->address,
         .byte_count = mapping->byte_count,
         .protection = mapping->protection,
     };
+    g_guest_access_cache[
+        g_guest_access_cache_cursor++ %
+        g_guest_access_cache.size()] = cached;
+    g_guest_access_cache_last = cached;
     std::memcpy(destination, source, byte_count);
     return true;
 }
@@ -16431,7 +16445,7 @@ bool TryCreateGuestPthread(
     return true;
 }
 
-std::string HleSymbol(const std::uint64_t thunk) {
+std::string_view HleSymbol(const std::uint64_t thunk) {
     struct ThreadCache {
         std::uint64_t generation{};
         std::unordered_map<std::uint64_t, std::string> symbols;
@@ -16452,8 +16466,9 @@ std::string HleSymbol(const std::uint64_t thunk) {
     auto symbol = found != g_runtime.hle_bindings.end()
         ? found->second.symbol
         : std::string{};
-    cache.symbols.emplace(thunk, symbol);
-    return symbol;
+    const auto [cached, _] =
+        cache.symbols.emplace(thunk, std::move(symbol));
+    return cached->second;
 }
 
 std::uint64_t OrbisError(const std::uint32_t value) noexcept {
@@ -17485,7 +17500,7 @@ void ApplyNgs2VoiceParameters(
 }
 
 bool TryHandleNgs2(
-    const std::string& symbol,
+    const std::string_view symbol,
     const Lsx4::Translation::HleBridgeRequest& request,
     std::uint64_t& result) {
     constexpr auto InvalidArgument = UINT32_C(0x80020003);
@@ -17857,6 +17872,18 @@ bool TryInvokeBuiltinHle(
         return true;
     }
     const auto symbol = HleSymbol(request.function);
+    // These are the dominant per-draw AGC calls. Keep them ahead of the
+    // general compatibility dispatcher so every draw doesn't scan hundreds
+    // of unrelated NIDs before reaching the AGC block near its tail.
+    if (symbol == "V++UgBtQhn0") {
+        return TryAgcGetDataPacketPayload(request, result);
+    }
+    if (symbol == "UglJIZjGssM") {
+        return TryAgcDriverSubmitDcb(request, result);
+    }
+    if (symbol == "HV4j+E0MBHE") {
+        return TryAgcCreateInterpolantMapping(request, result);
+    }
     if (symbol == "j3YMu1MVNNo") {
         g_runtime.guest_login_event_delivered.store(
             false, std::memory_order_release);
@@ -18340,7 +18367,8 @@ bool TryInvokeBuiltinHle(
             alignof(std::max_align_t), result,
             request.guest_stack);
 #ifdef __ANDROID__
-        if (request.integer_arguments[0] == UINT64_C(0x800)) {
+        if (request.integer_arguments[0] == UINT64_C(0x800) &&
+            Ps5DiagnosticFaultProbeEnabled()) {
             LogDreamingForeachState("malloc-0x800-return", result);
         }
 #endif
@@ -18361,7 +18389,7 @@ bool TryInvokeBuiltinHle(
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4-PS5-EXIT",
             "process exit symbol=%s value=0x%llx stack=0x%llx",
-            symbol.c_str(),
+            symbol.data(),
             static_cast<unsigned long long>(result),
             static_cast<unsigned long long>(request.guest_stack));
 #endif
@@ -19593,7 +19621,7 @@ bool TryInvokeBuiltinHle(
                 ANDROID_LOG_INFO, "LSX4-PS5",
                 "pad guest sample symbol=%s buttons=0x%08x "
                 "previous=0x%08x data=0x%llx",
-                symbol.c_str(), buttons, previous_buttons,
+                symbol.data(), buttons, previous_buttons,
                 static_cast<unsigned long long>(
                     request.integer_arguments[1]));
         }
@@ -20723,7 +20751,7 @@ bool TryInvokeBuiltinHle(
         __android_log_print(
             ANDROID_LOG_INFO, "LSX4-PS5-EXIT",
             "thread exit symbol=%s value=0x%llx stack=0x%llx",
-            symbol.c_str(),
+            symbol.data(),
             static_cast<unsigned long long>(result),
             static_cast<unsigned long long>(request.guest_stack));
 #endif
@@ -20812,7 +20840,7 @@ std::uint64_t InvokeAndroidFallbackHle(
     void*, const Lsx4Ps5HleCall* const call) {
 #ifdef __ANDROID__
     if (call != nullptr) {
-        const auto symbol = HleSymbol(call->function);
+        const std::string symbol{HleSymbol(call->function)};
         static std::mutex trace_mutex;
         static std::unordered_map<std::string, std::uint64_t>
             trace_counts;
@@ -22656,14 +22684,9 @@ extern "C" bool ExecutorJitReadGuestBytes(
     if (destination == nullptr) {
         return false;
     }
-    {
-        const std::lock_guard lock{g_runtime.mutex};
-        if (!HasAccessLocked(address, size, LSX4_PS5_GUEST_READ)) {
-            return false;
-        }
-    }
-    std::memcpy(destination, reinterpret_cast<const void*>(address), size);
-    return true;
+    return CopyGuestBytes(
+        address, destination, reinterpret_cast<const void*>(address),
+        size, LSX4_PS5_GUEST_READ);
 }
 
 extern "C" bool ExecutorJitReadGuestBytesStable(
@@ -22678,14 +22701,9 @@ extern "C" bool ExecutorJitWriteGuestBytes(
     if (source == nullptr) {
         return false;
     }
-    {
-        const std::lock_guard lock{g_runtime.mutex};
-        if (!HasAccessLocked(address, size, LSX4_PS5_GUEST_WRITE)) {
-            return false;
-        }
-    }
-    std::memcpy(reinterpret_cast<void*>(address), source, size);
-    return true;
+    return CopyGuestBytes(
+        address, reinterpret_cast<void*>(address), source,
+        size, LSX4_PS5_GUEST_WRITE);
 }
 
 extern "C" void executor_lsx4_android_register_guest_readable_range(
@@ -22921,7 +22939,7 @@ std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request) {
             stderr,
             "PS5_HLE_RESULT symbol=%s thunk=0x%llx handled=%d "
             "result=0x%llx args=%llx,%llx,%llx,%llx,%llx,%llx\n",
-            symbol.empty() ? "<unbound>" : symbol.c_str(),
+            symbol.empty() ? "<unbound>" : symbol.data(),
             static_cast<unsigned long long>(request.function),
             handled ? 1 : 0,
             static_cast<unsigned long long>(result),
@@ -22934,9 +22952,11 @@ std::uint64_t InvokeRuntimeHle(const HleBridgeRequest& request) {
         std::fflush(stderr);
     }
 #ifdef __ANDROID__
-    WatchDreamingForeachState(
-        HleSymbol(request.function), result,
-        request.guest_stack);
+    if (Ps5DiagnosticFaultProbeEnabled()) {
+        WatchDreamingForeachState(
+            HleSymbol(request.function), result,
+            request.guest_stack);
+    }
 #endif
     return result;
 }
