@@ -18011,6 +18011,24 @@ bool TryInvokeBuiltinHle(
         (void)Lsx4::Translation::CompleteCurrentGuestExecution(0);
         return true;
     }
+    struct NegativeDispatchCache {
+        std::uint64_t generation{};
+        std::array<std::uint64_t, 256> thunks{};
+    };
+    thread_local NegativeDispatchCache negative_cache;
+    const auto binding_generation =
+        g_hle_binding_generation.load(std::memory_order_acquire);
+    if (negative_cache.generation != binding_generation) {
+        negative_cache.thunks.fill(0);
+        negative_cache.generation = binding_generation;
+    }
+    const auto negative_cache_index =
+        ((request.function >> 8u) ^ (request.function >> 20u)) &
+        (negative_cache.thunks.size() - 1u);
+    if (negative_cache.thunks[negative_cache_index] ==
+        request.function) {
+        return false;
+    }
     const auto symbol = HleSymbol(request.function);
     // These are the dominant per-draw AGC calls. Keep them ahead of the
     // general compatibility dispatcher so every draw doesn't scan hundreds
@@ -20949,6 +20967,7 @@ bool TryInvokeBuiltinHle(
     if (symbol == "2SKEx6bSq-4") {
         return TryKernelBatchMap(request, result);
     }
+    negative_cache.thunks[negative_cache_index] = request.function;
     return false;
 }
 
