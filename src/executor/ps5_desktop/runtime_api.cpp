@@ -1025,6 +1025,8 @@ thread_local std::array<GuestAccessCacheEntry, 32>
     g_guest_access_cache{};
 thread_local std::size_t g_guest_access_cache_cursor{};
 thread_local GuestAccessCacheEntry g_guest_access_cache_last{};
+thread_local std::array<GuestAccessCacheEntry, 256>
+    g_guest_access_page_cache{};
 
 bool Ps5TraceHleEnabled() {
     static const bool enabled = [] {
@@ -1042,9 +1044,10 @@ bool GuestAccessCacheEnabled() {
     return enabled;
 }
 
-bool HasCachedAccess(const std::uint64_t address,
-                     const std::uint64_t byte_count,
-                     const std::uint32_t access) {
+[[gnu::always_inline]] inline bool HasFastCachedAccess(
+    const std::uint64_t address, const std::uint64_t byte_count,
+    const std::uint32_t access,
+    std::uint64_t* const generation_out = nullptr) {
     if (!GuestAccessCacheEnabled() ||
         !RangeIsRepresentable(address, byte_count)) {
         return false;
@@ -1059,23 +1062,74 @@ bool HasCachedAccess(const std::uint64_t address,
                address - cached.address <=
                    cached.byte_count - byte_count;
     };
-    if (contains(g_guest_access_cache_last)) {
+    const auto page_cache_index =
+        ((address >> 14u) ^ (address >> 22u)) &
+        (g_guest_access_page_cache.size() - 1u);
+    auto& page_cached =
+        g_guest_access_page_cache[page_cache_index];
+    if (contains(page_cached)) {
+        g_guest_access_cache_last = page_cached;
+        if (generation_out != nullptr) {
+            *generation_out = generation;
+        }
         return true;
     }
+    if (contains(g_guest_access_cache_last)) {
+        page_cached = g_guest_access_cache_last;
+        if (generation_out != nullptr) {
+            *generation_out = generation;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool HasCachedAccess(const std::uint64_t address,
+                     const std::uint64_t byte_count,
+                     const std::uint32_t access,
+                     std::uint64_t* const generation_out = nullptr) {
+    if (HasFastCachedAccess(
+            address, byte_count, access, generation_out)) {
+        return true;
+    }
+    if (!GuestAccessCacheEnabled() ||
+        !RangeIsRepresentable(address, byte_count)) {
+        return false;
+    }
+    const auto generation = g_runtime.mappings.Generation();
+    const auto contains = [&](const GuestAccessCacheEntry& cached) {
+        return cached.generation != 0 &&
+               cached.generation == generation &&
+               (cached.protection & access) == access &&
+               address >= cached.address &&
+               byte_count <= cached.byte_count &&
+               address - cached.address <=
+                   cached.byte_count - byte_count;
+    };
+    const auto page_cache_index =
+        ((address >> 14u) ^ (address >> 22u)) &
+        (g_guest_access_page_cache.size() - 1u);
+    auto& page_cached =
+        g_guest_access_page_cache[page_cache_index];
     for (const auto& cached : g_guest_access_cache) {
         if (contains(cached)) {
             g_guest_access_cache_last = cached;
+            page_cached = cached;
+            if (generation_out != nullptr) {
+                *generation_out = generation;
+            }
             return true;
         }
     }
     return false;
 }
 
-bool CopyGuestBytes(const std::uint64_t address, void* const destination,
-                    const void* const source, const std::size_t byte_count,
-                    const std::uint32_t access) {
-    if (HasCachedAccess(address, byte_count, access)) {
-        std::memcpy(destination, source, byte_count);
+bool CacheGuestAccess(const std::uint64_t address,
+                      const std::uint64_t byte_count,
+                      const std::uint32_t access,
+                      std::uint64_t* const generation_out = nullptr) {
+    if (HasCachedAccess(
+            address, byte_count, access, generation_out)) {
         return true;
     }
     if (!RangeIsRepresentable(address, byte_count)) {
@@ -1098,6 +1152,24 @@ bool CopyGuestBytes(const std::uint64_t address, void* const destination,
         g_guest_access_cache_cursor++ %
         g_guest_access_cache.size()] = cached;
     g_guest_access_cache_last = cached;
+    const auto page_cache_index =
+        ((address >> 14u) ^ (address >> 22u)) &
+        (g_guest_access_page_cache.size() - 1u);
+    g_guest_access_page_cache[page_cache_index] = cached;
+    if (generation_out != nullptr) {
+        *generation_out = generation;
+    }
+    return true;
+}
+
+bool CopyGuestBytes(const std::uint64_t address, void* const destination,
+                    const void* const source, const std::size_t byte_count,
+                    const std::uint32_t access) {
+    if (!HasFastCachedAccess(
+            address, byte_count, access) &&
+        !CacheGuestAccess(address, byte_count, access)) {
+        return false;
+    }
     std::memcpy(destination, source, byte_count);
     return true;
 }
@@ -2116,11 +2188,61 @@ bool TryWriteGuestBytes(
         LSX4_PS5_GUEST_WRITE);
 }
 
+struct ActiveGuestReadSpan {
+    std::uint64_t generation{};
+    std::uint64_t address{};
+    std::uint64_t byte_count{};
+};
+
+thread_local ActiveGuestReadSpan g_active_guest_read_span{};
+
+class ScopedGuestReadSpan {
+public:
+    ScopedGuestReadSpan(const std::uint64_t address,
+                        const std::uint64_t byte_count)
+        : previous_{g_active_guest_read_span} {
+        std::uint64_t generation{};
+        if (GuestAccessCacheEnabled() &&
+            CacheGuestAccess(
+                address, byte_count, LSX4_PS5_GUEST_READ,
+                &generation)) {
+            g_active_guest_read_span = {
+                .generation = generation,
+                .address = address,
+                .byte_count = byte_count,
+            };
+        } else {
+            g_active_guest_read_span = {};
+        }
+    }
+
+    ~ScopedGuestReadSpan() {
+        g_active_guest_read_span = previous_;
+    }
+
+    ScopedGuestReadSpan(const ScopedGuestReadSpan&) = delete;
+    ScopedGuestReadSpan& operator=(const ScopedGuestReadSpan&) = delete;
+
+private:
+    ActiveGuestReadSpan previous_{};
+};
+
 bool TryReadGuestBytes(
     const std::uint64_t address, void* const destination,
     const std::size_t byte_count) {
     if (destination == nullptr || byte_count == 0) {
         return byte_count == 0;
+    }
+    const auto& span = g_active_guest_read_span;
+    if (span.generation != 0 &&
+        span.generation == g_runtime.mappings.Generation() &&
+        address >= span.address &&
+        byte_count <= span.byte_count &&
+        address - span.address <= span.byte_count - byte_count) {
+        std::memcpy(
+            destination, reinterpret_cast<const void*>(address),
+            byte_count);
+        return true;
     }
     return CopyGuestBytes(
         address, destination, reinterpret_cast<const void*>(address),
@@ -10786,6 +10908,10 @@ bool TryAgcDriverSubmitDcb(
         result = OrbisError(UINT32_C(0x80020003));
         return true;
     }
+    const ScopedGuestReadSpan command_span{
+        command_address,
+        static_cast<std::uint64_t>(dword_count) *
+            sizeof(std::uint32_t)};
 
     bool should_dump_dcb{};
     {
