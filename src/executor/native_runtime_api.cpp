@@ -22112,6 +22112,27 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                   "[EXECUTOR_EOP_WAIT_BATCHING_V2] source=sentinel path=%s enabled=1",
                   eop_wait_batching_v2_sentinel.string().c_str());
     }
+    const auto fast_bulk_guest_write_sentinel =
+        std::filesystem::path(g_root) / "run-fast-bulk-guest-write";
+    if (std::filesystem::exists(fast_bulk_guest_write_sentinel)) {
+        setenv("EXECUTOR_FAST_BULK_GUEST_WRITE", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_FAST_BULK_GUEST_WRITE] source=sentinel path=%s enabled=1",
+                  fast_bulk_guest_write_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_FAST_BULK_GUEST_WRITE");
+    }
+    const auto suballocate_bda_buffers_sentinel =
+        std::filesystem::path(g_root) / "run-suballocate-bda-buffers";
+    if (std::filesystem::exists(suballocate_bda_buffers_sentinel)) {
+        setenv("EXECUTOR_SUBALLOCATE_BDA_BUFFERS", "1", 1);
+        NativeLog(ANDROID_LOG_INFO,
+                  "[EXECUTOR_BDA_BUFFER_ALLOCATOR] source=sentinel path=%s "
+                  "mode=vma_suballocation",
+                  suballocate_bda_buffers_sentinel.string().c_str());
+    } else {
+        unsetenv("EXECUTOR_SUBALLOCATE_BDA_BUFFERS");
+    }
     for (int lvl = 1; lvl <= 4; ++lvl) {
         const auto bisect_sentinel =
             std::filesystem::path(g_root) / ("run-bisect-draw-" + std::to_string(lvl));

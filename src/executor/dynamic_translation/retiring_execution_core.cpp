@@ -7197,9 +7197,11 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         Arm64BlockEntry direct = nullptr;
         Arm64BlockEntry resident = nullptr;
         bool chain_abi = false;
+        const auto* const tiered_guards =
+            plan.guards.empty() ? nullptr : &plan.guards;
         Arm64BlockEntry external = native_depot_.EmitNativeControlFlowBlock(
             plan.combined, primary, &direct, secondary, nullptr, nullptr,
-            &chain_abi, &resident, &plan.guards);
+            &chain_abi, &resident, tiered_guards);
         const auto compile_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - compile_started)
