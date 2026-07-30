@@ -38,7 +38,13 @@
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+#include "video_core/mobile_gpu_optimization.h"
+#include "video_core/readback_optimization.h"
+#include "video_core/vulkan_driver_optimization.h"
+#endif
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -962,55 +968,9 @@ void NativeLog(const int, const char*, ...) {}
 #endif
 
 void PreferPerformanceCpusForPrimaryGuest() {
-#ifdef __ANDROID__
-    cpu_set_t allowed;
-    CPU_ZERO(&allowed);
-    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
-        NativeLog(ANDROID_LOG_WARN,
-                  "[EXECUTOR_PRIMARY_CPU] affinity_read_failed errno=%d", errno);
-        return;
-    }
-
-    std::uint64_t fastest_frequency = 0;
-    int allowed_count = 0;
-    std::array<std::uint64_t, CPU_SETSIZE> frequencies{};
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-        if (!CPU_ISSET(cpu, &allowed)) {
-            continue;
-        }
-        ++allowed_count;
-        std::ifstream frequency_file(
-            "/sys/devices/system/cpu/cpu" + std::to_string(cpu) +
-            "/cpufreq/cpuinfo_max_freq");
-        frequency_file >> frequencies[static_cast<std::size_t>(cpu)];
-        fastest_frequency =
-            std::max(fastest_frequency, frequencies[static_cast<std::size_t>(cpu)]);
-    }
-    if (allowed_count < 2 || fastest_frequency == 0) {
-        return;
-    }
-
-    cpu_set_t preferred;
-    CPU_ZERO(&preferred);
-    int preferred_count = 0;
-    const std::uint64_t performance_floor = fastest_frequency * 7 / 10;
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-        if (CPU_ISSET(cpu, &allowed) &&
-            frequencies[static_cast<std::size_t>(cpu)] >= performance_floor) {
-            CPU_SET(cpu, &preferred);
-            ++preferred_count;
-        }
-    }
-    if (preferred_count < 2) {
-        preferred = allowed;
-        preferred_count = allowed_count;
-    }
-    const int result = sched_setaffinity(0, sizeof(preferred), &preferred);
-    NativeLog(result == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_WARN,
-              "[EXECUTOR_PRIMARY_CPU] performanceCpus=%d maxKHz=%llu allowed=%d result=%d "
-              "errno=%d",
-              preferred_count, static_cast<unsigned long long>(fastest_frequency),
-              allowed_count, result, result == 0 ? 0 : errno);
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    (void)Common::ApplyCurrentThreadAffinity(
+        Common::ThreadAffinityClass::LatencyPerformance);
 #endif
 }
 
@@ -1115,7 +1075,7 @@ void ConfigureAndroidRuntimeUserPathsAndBaseConfig() {
 #ifdef __ANDROID__
 bool IsSupportedAndroidFixedSurfaceSize(const int width, const int height) {
     return (width == 320 && height == 180) || (width == 480 && height == 270) ||
-           (width == 640 && height == 360) || (width == 960 && height == 540) ||
+           (width == 640 && height == 360) || (width == 960 && height == 544) ||
            (width == 1280 && height == 720) || (width == 1920 && height == 1080) ||
            (width == 2880 && height == 1620);
 }
@@ -21657,6 +21617,9 @@ extern "C" const char* executor_lsx4_runtime_system_info() {
 
 extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char*) {
     std::lock_guard lock(g_lock);
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    Common::InitializeAndroidThreadAffinity();
+#endif
     NativeLog(ANDROID_LOG_INFO,
                   "[EXECUTOR_NATIVE_BUILD_MARKER] id=%s "
               "date=\"%s\" time=\"%s\" file=%s",
@@ -22939,6 +22902,14 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
     constexpr int DisableVkRobustness = 3;
     constexpr int TieredJit = 4;
     constexpr int JitTraceCompilation = 5;
+    constexpr int LimitAnisotropy2x = 6;
+    constexpr int ReadbackBatching = 7;
+    constexpr int VulkanDriverCalls = 8;
+    constexpr int AsyncPipeline = 9;
+    constexpr int AdaptiveMobileGpu = 10;
+    constexpr int AudioSimd = 11;
+    constexpr int ForceAnisotropy1x = 12;
+    constexpr int FastGuestMemory = 13;
     static std::atomic<bool> tiered_jit{false};
     static std::atomic<bool> trace_compilation{false};
     const bool active = enabled != 0;
@@ -22971,16 +22942,84 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
             tiered_jit.load(std::memory_order_acquire), active);
         option_name = "jit_trace_compilation";
         break;
+    case LimitAnisotropy2x:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        if (active || Config::managedMaxAnisotropy() == 2u) {
+            Config::setManagedMaxAnisotropy(active ? 2u : 0u);
+        }
+#endif
+        option_name = "limit_anisotropy_2x";
+        break;
+    case ForceAnisotropy1x:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        if (active || Config::managedMaxAnisotropy() == 1u) {
+            Config::setManagedMaxAnisotropy(active ? 1u : 0u);
+        }
+#endif
+        option_name = "force_anisotropy_1x";
+        break;
+    case ReadbackBatching:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        Config::setManagedReadbackBatching(active);
+        VideoCore::ResetReadbackOptimizationStats();
+#endif
+        option_name = "readback_batching";
+        break;
+    case VulkanDriverCalls:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        VideoCore::SetManagedVulkanDriverOptimization(active);
+        VideoCore::ResetVulkanDriverOptimizationStats();
+#endif
+        option_name = "vulkan_driver_calls";
+        break;
+    case AsyncPipeline:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        Config::setManagedAsyncPipelineCompilation(active);
+        Vulkan::ResetAsyncPipelineCompileStats();
+#endif
+        option_name = "async_pipeline";
+        break;
+    case AdaptiveMobileGpu:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        VideoCore::SetManagedMobileGpuOptimization(active);
+        VideoCore::ResetMobileGpuOptimizationStats();
+#endif
+        option_name = "adaptive_mobile_gpu";
+        break;
+    case AudioSimd:
+#if !defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+        Libraries::AudioOut::SetManagedAudioSimdEnabled(active);
+        Libraries::AudioOut::ResetAudioOptimizationStats();
+#endif
+        option_name = "audio_simd";
+        break;
+    case FastGuestMemory:
+        Executor::Jit::ConfigureFastGuestMemory(active);
+        option_name = "fast_guest_memory";
+        break;
     default:
         return -1;
     }
     NativeLog(ANDROID_LOG_INFO,
               "[EXECUTOR_MANAGED_OPTIMIZATION] option=%s enabled=%d directMemory=%d "
-              "vkDiagnostics=%d coarseFragment=%d disableRobustness=%d",
+              "vkDiagnostics=%d coarseFragment=%d disableRobustness=%d "
+              "readbackBatch=%d driverCalls=%d asyncPipeline=%d mobileGpu=%d "
+              "audioSimd=%d fastGuestMemory=%d",
               option_name, active ? 1 : 0, Config::directMemoryAccess() ? 1 : 0,
               Config::managedGpuFastPath() ? 0 : 1,
               Config::managedCoarseFragmentShading() ? 1 : 0,
-              Config::managedDisableVkRobustness() ? 1 : 0);
+              Config::managedDisableVkRobustness() ? 1 : 0,
+#if defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+              0, 0, 0, 0, 0,
+              Executor::Jit::FastGuestMemoryEnabled() ? 1 : 0);
+#else
+              Config::managedReadbackBatching() ? 1 : 0,
+              VideoCore::IsManagedVulkanDriverOptimization() ? 1 : 0,
+              Config::managedAsyncPipelineCompilation() ? 1 : 0,
+              VideoCore::IsManagedMobileGpuOptimization() ? 1 : 0,
+              Libraries::AudioOut::IsManagedAudioSimdEnabled() ? 1 : 0,
+              Executor::Jit::FastGuestMemoryEnabled() ? 1 : 0);
+#endif
     return 0;
 }
 
@@ -23306,13 +23345,33 @@ extern "C" int executor_jit_guest_range_selftest() {
 
 extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
                                                    std::size_t value_count) {
-    constexpr std::size_t kValueCount = 21;
+    constexpr std::size_t kValueCount = 92;
     if (values == nullptr || value_count < kValueCount) {
         return -1;
     }
 
     const auto cpu = Lsx4::Translation::ReadTranslationCounters();
     const auto gpu = Libraries::GnmDriver::ExecutorGetGnmHudStats();
+    static std::atomic<std::uint64_t> gpr_cache_telemetry_samples{0};
+    const std::uint64_t telemetry_sample =
+        gpr_cache_telemetry_samples.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((telemetry_sample % 120u) == 0) {
+        NativeLog(
+            ANDROID_LOG_INFO,
+            "[EXECUTOR_JIT_GPR_CACHE] blocks=%llu registers=%llu "
+            "estimatedLoadsStoresAvoided=%llu shapeRejections=%llu "
+            "simdBlocks=%llu simdHalves=%llu "
+            "simdEstimatedLoadsStoresAvoided=%llu",
+            static_cast<unsigned long long>(cpu.gpr_cached_blocks),
+            static_cast<unsigned long long>(cpu.gpr_cached_registers),
+            static_cast<unsigned long long>(
+                cpu.gpr_estimated_loads_stores_avoided),
+            static_cast<unsigned long long>(cpu.gpr_cache_shape_rejections),
+            static_cast<unsigned long long>(cpu.simd_cached_blocks),
+            static_cast<unsigned long long>(cpu.simd_cached_halves),
+            static_cast<unsigned long long>(
+                cpu.simd_estimated_loads_stores_avoided));
+    }
     values[0] = cpu.decoded_regions;
     values[1] = cpu.native_regions;
     values[2] = cpu.semantic_regions;
@@ -23334,6 +23393,88 @@ extern "C" int executor_lsx4_runtime_hud_stats(std::uint64_t* values,
     values[18] = Config::managedGpuFastPath() ? 1 : 0;
     values[19] = Config::managedCoarseFragmentShading() ? 1 : 0;
     values[20] = Config::managedDisableVkRobustness() ? 1 : 0;
+#if defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    std::fill(values + 21, values + 80, 0);
+#else
+    const auto readback = VideoCore::GetReadbackOptimizationStats();
+    const auto driver = VideoCore::GetVulkanDriverOptimizationStats();
+    const auto pipeline = Vulkan::GetAsyncPipelineCompileStats();
+    const auto mobile = VideoCore::GetMobileGpuOptimizationStats();
+    const auto audio = Libraries::AudioOut::GetAudioOptimizationStats();
+    values[21] = Config::managedReadbackBatching() ? 1 : 0;
+    values[22] = VideoCore::IsManagedVulkanDriverOptimization() ? 1 : 0;
+    values[23] = Config::managedAsyncPipelineCompilation() ? 1 : 0;
+    values[24] = VideoCore::IsManagedMobileGpuOptimization() ? 1 : 0;
+    values[25] = Libraries::AudioOut::IsManagedAudioSimdEnabled() ? 1 : 0;
+    values[26] = Config::managedMaxAnisotropy();
+    values[27] = Executor::Jit::TieredJitEnabled() ? 1 : 0;
+    values[28] = Executor::Jit::JitTraceCompilationEnabled() ? 1 : 0;
+    values[29] = readback.snapshots;
+    values[30] = readback.ranges;
+    values[31] = readback.copy_commands;
+    values[32] = readback.copy_regions;
+    values[33] = readback.timeline_waits;
+    values[34] = readback.fallbacks;
+    values[35] = readback.sidecar_labels;
+    values[36] = readback.sidecar_waits;
+    values[37] = driver.pipeline_bind_attempts;
+    values[38] = driver.pipeline_binds_elided;
+    values[39] = driver.descriptor_bind_attempts;
+    values[40] = driver.descriptor_binds_elided;
+    values[41] = driver.push_constant_attempts;
+    values[42] = driver.push_constants_elided;
+    values[43] = driver.barriers_elided + driver.render_scope_reuses;
+    values[44] = driver.transfer_requests > driver.transfer_copy_calls
+                     ? driver.transfer_requests - driver.transfer_copy_calls
+                     : 0;
+    values[45] = pipeline.graphics_misses + pipeline.compute_misses;
+    values[46] = pipeline.fast_queued;
+    values[47] = pipeline.optimized_queued;
+    values[48] = pipeline.fast_completed;
+    values[49] = pipeline.optimized_completed;
+    values[50] = pipeline.published;
+    values[51] = pipeline.optimized_replacements;
+    values[52] = pipeline.build_failures + pipeline.queue_drops;
+    values[53] = mobile.effective_scale_percent;
+    values[54] = mobile.max_gpu_backlog;
+    values[55] = mobile.coarse_rate_draws;
+    values[56] = mobile.fsr_frames;
+    values[57] = mobile.exact_surface_reuses;
+    values[58] = mobile.exact_surface_reuse_bytes;
+    values[59] = mobile.residency_gc_evictions;
+    values[60] = audio.conversion_calls;
+    values[61] = audio.simd_frames;
+    values[62] = audio.scalar_frames;
+    values[63] = audio.xruns + audio.write_errors + audio.partial_writes;
+    values[64] = mobile.physical_drs_available;
+    values[65] = mobile.physical_scaled_draws;
+    values[66] = mobile.physical_scale_fallbacks;
+    values[67] = mobile.physical_resolve_blits;
+    values[68] = mobile.physical_pixels_saved;
+    values[69] = mobile.source_smaller_than_output_frames;
+    values[70] = mobile.scale_down_events;
+    values[71] = mobile.scale_up_events;
+    values[72] = driver.queue_submits;
+    values[73] = driver.queue_submit_logical_packets;
+    values[74] = driver.queue_submit_command_buffers;
+    values[75] = driver.queue_submit_calls_saved;
+    values[76] = driver.queue_submit_forced_boundaries;
+    values[77] = driver.dynamic_state_full_replays;
+    values[78] = driver.barrier_batches;
+    values[79] = driver.transfer_copy_calls;
+#endif
+    values[80] = cpu.tier0_compiled;
+    values[81] = cpu.tier0_active;
+    values[82] = cpu.tier1_queued;
+    values[83] = cpu.tier1_compiled;
+    values[84] = cpu.tier1_active;
+    values[85] = cpu.tier1_promotions;
+    values[86] = cpu.tier1_deopts;
+    values[87] = cpu.tier1_rejected;
+    values[88] = cpu.tier1_safe_handoffs;
+    values[89] = cpu.tier1_loop_osr_handoffs;
+    values[90] = cpu.tier1_compile_time_us;
+    values[91] = cpu.tier1_generated_bytes;
     return static_cast<int>(kValueCount);
 }
 

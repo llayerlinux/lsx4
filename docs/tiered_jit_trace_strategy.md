@@ -1,46 +1,58 @@
 # Optional tiered JIT and trace compilation
 
-Status: implemented as an optional, default-off runtime feature.
+Status: implemented as an optional, fail-closed runtime feature.
 
-Implemented in the shared dynamic-translation source and therefore built
-independently into both PS4 and isolated PS5 runtimes. Device validation on
-Xiaomi with Dreaming Sarah covered OFF and ON menu/gameplay paths. Bloodborne
-(`CUSA03173`) exposed an unsafe conditional side exit: a newly published
-guarded trace chose the wrong successor, entered a null-base memory access
-and stopped the guest thread while audio continued. Conditional guarded
-traces therefore remain fail-closed; Tier 2 currently publishes only
-unconditional/fallthrough multi-block traces and preserves Tier 1 as the
-fallback. Trace formation now validates a successor against the sampled
-dominant target rather than incorrectly requiring the physical fallthrough
-address, so non-contiguous direct-jump traces can actually be promoted.
+The implementation lives in the shared dynamic-translation source and is
+therefore compiled independently into both the PS4 and isolated PS5
+runtimes. Its current contracts are:
 
-Latest Xiaomi device validation (both checkboxes enabled):
+- Tier 0 is the immediate, legacy-compatible basic-block native compiler.
+  Unsupported operations still use its generated semantic bridge.
+- Tier 1 is a distinct hotness-driven background recompile of an individual
+  native block. It has its own queue/state/identity and raises the local-loop
+  safepoint interval from 1024 to 16384 iterations after promotion.
+- Tier 2 is one low-priority background worker which compiles hot
+  multi-block paths and closed loops.
+- Stable conditional paths use explicit guards. A cold guard fully publishes
+  architectural state, records the contrary edge and resumes at the exact
+  Tier-1 guest RIP. Repeated cold exits atomically withdraw that trace and
+  republish its preserved Tier-1 entry.
+- Backward and self edges can promote the target loop header. The resulting
+  trace enters through the ordinary published header (OSR), and its local
+  loop reaches a composite-witness validation safepoint every 1024
+  iterations.
+- Every member has a retained witness revision and is re-decoded from current
+  guest bytes before T2 compilation. Publication rechecks all revisions and
+  bytes under the normal block/edge locks.
+- Persistent artifacts are rooted by title, executable fingerprint and JIT
+  ABI. They carry decoded IR and relocatable Tier-0 native segments, so the
+  first executable tier remains instant. The title edge PGO drives both the
+  T0-to-T1 queue and T2 formation; it additionally carries an identity digest
+  and is rejected if
+  moved between titles, executable fingerprints or compiler ABIs.
 
-- Bloodborne `CUSA03173`: menu 29–30 FPS; saved gameplay reached and remained
-  responsive at 5–6 FPS; live `guards=0` two-block traces were published;
-  sound produced non-zero samples; no guest exception, signal failure or
-  KGSL kill occurred.
-- Dreaming Sarah `PPSA02929`: menu 59 FPS and gameplay 35 FPS; picture,
-  movement and non-zero audio samples were confirmed; conditional candidates
-  were rejected without disturbing Tier 1.
-
-Installed validation artifacts were
-`e1033bd26c518cbc289e57f9e9ba00ecff4ecef47c3c394b3c4d5b2a3117ea34`
-for PS4 and
-`dc5aff2210f7d9e03026423776ea0689eb92907487e99f357a3d6721bbd76b5a`
-for PS5.
+T0-to-T1 publication rechecks the original witness and guest bytes under the
+normal block lock, then atomically republishes incoming edge targets and
+invalidates dispatcher caches through the witness revision. Code already
+executing safely finishes T0; a loop observes T1 at its next native
+safepoint (OSR handoff). Runtime OFF atomically republishes the retained T0
+entry. Compilation rejection, stale bytes, code-budget overflow and
+diagnostic modes leave T0 published.
 
 ## Objective
 
 Add an optional optimizing tier above the current AArch64 JIT without
 replacing or weakening the current compiler:
 
-- Tier 0: the existing semantic/interpreter bridge.
-- Tier 1: the existing `InitialNative` basic-block compiler.
+- Tier 0: the existing `InitialNative` basic-block compiler, emitted
+  synchronously and preserved byte-for-byte when the option is disabled.
+- Tier 1: a separate background fast-local basic-block recompile and atomic
+  promotion, with retained T0 fallback.
 - Tier 2: hot multi-block traces compiled in the background.
 
-Tier 1 remains the source of truth, the immediate fallback and the only
-active path when the options are disabled.
+Tier 0 remains the source of truth and immediate fallback. Tier 1 is the
+baseline captured by Tier 2 when available; otherwise Tier 2 captures T0.
+Only the legacy T0 path is active when the master option is disabled.
 
 ## Existing contracts to preserve
 
@@ -84,9 +96,10 @@ loads/stores and eliminate dead flag work across block boundaries.
 Expose two restart-required checkboxes, both off by default:
 
 1. `Tiered JIT`
-   - enables low-overhead hot-edge profiling and the background promotion
-     worker;
-   - Tier 0 and Tier 1 behavior is otherwise unchanged.
+   - enables low-overhead hot-edge profiling, the T0-to-T1 local promotion
+     queue and the shared background compiler worker;
+   - disabling it drains the worker and demotes active T1/T2 publications to
+     their retained T0 entries.
 2. `JIT trace compilation`
    - enables multi-block Tier 2 compilation;
    - depends on `Tiered JIT`; enabling it implicitly enables the master
@@ -120,12 +133,12 @@ runtime instance.
 
 ## Profiling without slowing the current JIT
 
-When `Tiered JIT` is off, generated Tier 1 code must contain no additional
-hot-path counter or callback.
+When `Tiered JIT` is off, generated Tier 0 code contains no additional
+hot-path counter or callback and follows the legacy publication path.
 
 When it is on:
 
-1. Reuse the existing native-edge safepoint cadence. Tier 1 already reaches a
+1. Reuse the existing native-edge safepoint cadence. Tier 0 already reaches a
    validation path periodically (`kNativeEdgeSchedulePeriod`, currently
    4096 transitions).
 2. At that safepoint, record `(source RIP, destination RIP)` in a per-thread
@@ -260,21 +273,36 @@ optimization behavior.
 - Tier 2 is initially excluded when live checked-native diagnostics or store
   watchpoints are enabled.
 
-## Persistent data
+## Persistent decoded-to-native pipeline
 
-Version 1 should not persist Tier-2 machine code. Persist only a compact
-edge profile in a new, separately versioned file keyed by:
+Tier 1 persists the complete safe pipeline:
+
+```text
+guest bytes -> validated decoded IR -> relocatable native segments
+```
+
+Every record is keyed by title, executable fingerprint, serialized-IR ABI
+and native semantic/build ABI. Loads canonicalize derived IR metadata,
+compare current guest bytes, validate every relocation and fall back to fresh
+decode or native emission on any mismatch. Native records are never invoked
+without their decoded witness.
+
+Tier 2 persists a compact edge profile in a separately versioned file keyed
+by:
 
 ```text
 title + executable fingerprint + JIT semantic ABI + trace-profile ABI
 ```
 
-On the next launch, the profile may seed background compilation only after
-all constituent Tier 1 blocks have been decoded and validated.
+On the next launch, imported edges are aged and cannot authorize a guard
+until fresh live samples confirm the same dominant successor. Background
+compilation still re-decodes and validates every constituent Tier-1 block.
 
-Native trace persistence can be considered later with a separate artifact
-kind and ABI. It must not reuse the existing single-block native record
-without explicitly representing all member witnesses and side exits.
+Tier-2 machine code is deliberately not serialized into the Tier-1 record
+format: a trace has multiple witnesses, guard/deopt contexts and publication
+targets. Reusing the single-block native format would weaken rollback and SMC
+invariants. Persistent PGO plus persistent member IR/native code retains the
+startup benefit while T2 is safely rebuilt in the background.
 
 ## Metrics and acceptance gates
 
@@ -286,7 +314,7 @@ queued / compiled / active / retired / rejected traces
 compile time and generated bytes
 average blocks and instructions per trace
 trace entries and internal edges
-side exits and side-exit ratio
+side-exit sites, guard deopts, rollback count and side-exit ratio
 SMC retirements
 Tier-2 code budget
 estimated Tier-1 boundary operations avoided
@@ -304,19 +332,50 @@ Required gates before enabling by default:
 5. PS4 and PS5 A/B runs because the source is shared but each `.so` owns an
    isolated runtime instance.
 
-## Rollout order
+## Implemented rollout
 
-1. UI keys, active-runtime routing and common configuration; defaults off.
-2. Edge profiler and telemetry only.
-3. Background trace planning with publication disabled.
-4. Publish straight-line traces with no calls, indirect edges or memory
-   writes.
-5. Add guarded conditional side exits.
-6. Add internal loops and broader memory operations with precise faults.
-7. Persist profiles; consider native trace persistence only after stability.
+1. [x] UI keys, active-runtime routing and common configuration.
+2. [x] Edge profiler and telemetry.
+3. [x] Bounded low-priority background trace planning.
+4. [x] Straight-line and direct-jump trace publication.
+5. [x] Guarded stable conditional paths with exact cold deopt.
+6. [x] Closed internal loops, loop-header OSR and periodic witness checks.
+7. [x] Identity-bound title PGO and persistent member IR/native artifacts.
 
 At every stage, disabling the options must return immediately to unchanged
 Tier 1 behavior.
+
+## Cross-layer optimization rollout
+
+The managed optimization set is complete as seven independently switchable
+areas:
+
+1. [x] A/B controls, runtime routing, HUD and live counters.
+2. [x] CPU-side readback sidecar, one submit snapshot, coalesced page copies
+   and one timeline wait.
+3. [x] Vulkan state/descriptor deduplication, barrier/render-scope
+   coalescing, command-buffer reuse and submit batching.
+4. [x] T0/T1/T2 JIT, loop OSR, guarded deoptimization, per-title PGO and
+   persistent decoded/IR/native artifacts.
+5. [x] Fast/optimized shader tiers, bounded background pipeline work,
+   per-title disk cache and negative-cache rejection.
+6. [x] Mobile GPU scaling/upscale, anisotropy controls, residency budgeting
+   and optional fragment shading rate.
+7. [x] Batched/SIMD audio mixing with event-driven pacing and underrun
+   guards.
+
+On Android Qualcomm drivers, optimized shader binaries are generated by an
+independent optimized translation and are not hot-swapped into live
+pipelines. Shader binary format version 24 rejects artifacts produced by the
+older Fast-IR mutation path. The foreground pipeline remains synchronous on
+that driver family while persistent/async behavior remains available on
+drivers where live replacement is safe.
+
+The 2026-07-28 Vivo acceptance run reached Bloodborne gameplay at 960x544
+with all seven controls active. The observed HUD sample reported 11 FPS,
+5,967 draws/s, 128 submits/s, 11 presents/s and T1 publication 319/319.
+This is a functional regression gate, not a universal performance claim;
+scene load and device thermal state still dominate raw FPS comparisons.
 
 ## Expected performance
 

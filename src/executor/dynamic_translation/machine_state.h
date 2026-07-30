@@ -38,6 +38,9 @@ struct alignas(32) CpuFrame {
     std::array<std::array<std::uint8_t, 32>, 16> vectors{};
     std::uint64_t fault_context_slot{};
     std::uint64_t active_instruction{};
+    std::uint64_t deferred_flags_lhs{};
+    std::uint64_t deferred_flags_meta{};
+    std::uint64_t deferred_flags_rhs{};
 };
 
 static_assert(std::is_standard_layout_v<CpuFrame>);
@@ -51,7 +54,10 @@ static_assert(offsetof(CpuFrame, simd_control) == 0x0a4);
 static_assert(offsetof(CpuFrame, vectors) == 0x140);
 static_assert(offsetof(CpuFrame, fault_context_slot) == 0x340);
 static_assert(offsetof(CpuFrame, active_instruction) == 0x348);
-static_assert(sizeof(CpuFrame) == 0x360);
+static_assert(offsetof(CpuFrame, deferred_flags_lhs) == 0x350);
+static_assert(offsetof(CpuFrame, deferred_flags_meta) == 0x358);
+static_assert(offsetof(CpuFrame, deferred_flags_rhs) == 0x360);
+static_assert(sizeof(CpuFrame) == 0x380);
 
 inline constexpr std::uint64_t CarryFlag = 1ull << 0;
 inline constexpr std::uint64_t ParityFlag = 1ull << 2;

@@ -4,6 +4,10 @@
 #include "executor/ps5_desktop/runtime_api.h"
 #include "executor/ps5_desktop/gen5_compute_recompiler.h"
 
+#include "common/content_fingerprint.h"
+#include "common/thread.h"
+
+#include "core/libraries/audio/audio_mix.h"
 #include "executor/dynamic_translation/runtime_bridge_api.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
 #include "executor/dynamic_translation/hle_thunk_identity.h"
@@ -12,6 +16,7 @@
 #include "executor/dynamic_translation/stack_windows.h"
 #include "executor/ps5_desktop/backend_contract.h"
 #include "executor/ps5_desktop/bc7decomp.h"
+#include "executor/ps5_desktop/ps5_audio_scheduler.h"
 #include "executor/ps5_desktop/vulkan_presenter.h"
 #include "ps5_desktop/nextgen_loader.h"
 
@@ -51,7 +56,6 @@
 #include <unistd.h>
 
 #ifdef __ANDROID__
-#include <aaudio/AAudio.h>
 #include <android/log.h>
 #include <android/native_window.h>
 #include <png.h>
@@ -400,13 +404,12 @@ struct GuestAudioOutPort {
     std::uint32_t buffer_length{};
     std::uint32_t frequency{};
     std::int32_t format{};
+    std::int32_t port_type{};
     std::uint32_t channels{};
     std::uint32_t bytes_per_sample{};
     float volume{1.0f};
     std::uint64_t output_count{};
-#ifdef __ANDROID__
-    AAudioStream* stream{};
-#endif
+    Lsx4::Ps5Desktop::Ps5AudioPortHandle scheduled_audio;
 };
 
 struct GuestPresenterTexture {
@@ -588,6 +591,12 @@ struct RuntimeState {
         indexed_guest_file_sizes;
     std::filesystem::path app0_directory;
     std::filesystem::path save_data_directory;
+    std::filesystem::path artifact_root_directory;
+    std::string configured_artifact_title;
+    std::uint64_t configured_executable_identity{};
+    std::string active_artifact_title;
+    std::uint64_t active_executable_identity{};
+    bool active_artifact_store_enabled{};
 #ifdef __ANDROID__
     bool game_splash_active{};
     bool game_splash_presented{};
@@ -727,8 +736,84 @@ const auto g_ps5_process_start =
 std::atomic<std::uint64_t> g_ps5_pad_timestamp{};
 std::atomic<std::uint64_t> g_hle_binding_generation{1};
 std::atomic<std::uint64_t> g_event_flag_generation{1};
+std::array<std::atomic_bool, 14> g_ps5_managed_optimizations{};
+std::atomic<std::uint64_t> g_ps5_managed_optimization_epoch{1};
+std::atomic<std::uint64_t> g_ps5_readback_cache_hits{};
+std::atomic<std::uint64_t> g_ps5_readback_cache_misses{};
+std::atomic<std::uint64_t> g_ps5_readback_cache_resets{};
+struct Ps5ReadbackBatchCounters {
+    std::atomic<std::uint64_t> snapshots{};
+    std::atomic<std::uint64_t> ranges{};
+    std::atomic<std::uint64_t> copy_commands{};
+    std::atomic<std::uint64_t> copy_regions{};
+    std::atomic<std::uint64_t> timeline_waits{};
+    std::atomic<std::uint64_t> fallbacks{};
+    std::atomic<std::uint64_t> sidecar_labels{};
+    std::atomic<std::uint64_t> sidecar_waits{};
+};
+Ps5ReadbackBatchCounters g_ps5_readback_batch;
+struct Ps5RetirementLabel {
+    std::uint64_t value{};
+    std::uint64_t retirement_serial{};
+};
+std::mutex g_ps5_retirement_sidecar_mutex;
+std::unordered_map<std::uint64_t, Ps5RetirementLabel>
+    g_ps5_retirement_sidecar;
+std::atomic<std::uint64_t> g_ps5_retirement_serial{1u};
+std::atomic<std::uint64_t> g_ps5_driver_delta_frames{};
+std::atomic<std::uint64_t> g_ps5_driver_full_replays{};
+std::atomic<std::uint64_t> g_ps5_driver_draws_elided{};
 std::array<struct sigaction, 3> g_ps5_previous_fault_actions{};
 bool g_ps5_diagnostic_fault_handlers_installed{};
+
+[[nodiscard]] bool Ps5ManagedOptimizationEnabled(
+    const std::size_t option) noexcept {
+    return option < g_ps5_managed_optimizations.size() &&
+        g_ps5_managed_optimizations[option].load(
+            std::memory_order_acquire);
+}
+
+void ResetPs5ManagedOptimizationStats(const int option) noexcept {
+    if (option == 7) {
+        g_ps5_readback_cache_hits.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_cache_misses.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_cache_resets.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_batch.snapshots.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_batch.ranges.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_batch.copy_commands.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_batch.copy_regions.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_batch.timeline_waits.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_batch.fallbacks.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_batch.sidecar_labels.store(
+            0, std::memory_order_relaxed);
+        g_ps5_readback_batch.sidecar_waits.store(
+            0, std::memory_order_relaxed);
+        {
+            const std::lock_guard lock{
+                g_ps5_retirement_sidecar_mutex};
+            g_ps5_retirement_sidecar.clear();
+        }
+        g_ps5_retirement_serial.fetch_add(
+            1u, std::memory_order_relaxed);
+    } else if (option == 8) {
+        g_ps5_driver_delta_frames.store(
+            0, std::memory_order_relaxed);
+        g_ps5_driver_full_replays.store(
+            0, std::memory_order_relaxed);
+        g_ps5_driver_draws_elided.store(
+            0, std::memory_order_relaxed);
+        Lsx4::Ps5Desktop::ResetVulkanDriverOptimizationStats();
+    }
+}
 
 struct Ngs2SystemState {
     std::uint32_t grain_samples{256};
@@ -2177,15 +2262,23 @@ void FreeLibcHeap(
     std::uint64_t guest_stack = 0);
 std::uint64_t OrbisError(std::uint32_t value) noexcept;
 
+void ObserveActiveSubmitWrite(
+    std::uint64_t address, const void* source,
+    std::size_t byte_count) noexcept;
+
 bool TryWriteGuestBytes(
     const std::uint64_t address, const void* const source,
     const std::size_t byte_count) {
     if (source == nullptr || byte_count == 0) {
         return byte_count == 0;
     }
-    return CopyGuestBytes(
+    const auto copied = CopyGuestBytes(
         address, reinterpret_cast<void*>(address), source, byte_count,
         LSX4_PS5_GUEST_WRITE);
+    if (copied) {
+        ObserveActiveSubmitWrite(address, source, byte_count);
+    }
+    return copied;
 }
 
 struct ActiveGuestReadSpan {
@@ -2195,6 +2288,208 @@ struct ActiveGuestReadSpan {
 };
 
 thread_local ActiveGuestReadSpan g_active_guest_read_span{};
+
+struct ActiveSubmitResourceSnapshot {
+    struct Range {
+        std::uint64_t address{};
+        std::vector<std::uint8_t> bytes;
+    };
+
+    bool Capture(const std::uint64_t address,
+                 const std::size_t byte_count) {
+        if (address == 0u || byte_count == 0u ||
+            address > std::numeric_limits<std::uint64_t>::max() -
+                    byte_count) {
+            return byte_count == 0u;
+        }
+        constexpr std::uint64_t PageBytes = 4096u;
+        const auto request_end = address + byte_count;
+        const auto page_begin = address & ~(PageBytes - 1u);
+        auto page_end = request_end;
+        if (page_end <=
+            std::numeric_limits<std::uint64_t>::max() -
+                (PageBytes - 1u)) {
+            page_end =
+                (page_end + PageBytes - 1u) & ~(PageBytes - 1u);
+        }
+        auto capture_begin = page_begin;
+        auto capture_end = page_end;
+        std::vector<std::uint8_t> captured;
+        const auto capture =
+            [&](const std::uint64_t begin,
+                const std::uint64_t end) {
+                if (end <= begin ||
+                    end - begin >
+                        static_cast<std::uint64_t>(
+                            std::numeric_limits<std::size_t>::max())) {
+                    return false;
+                }
+                try {
+                    captured.resize(
+                        static_cast<std::size_t>(end - begin));
+                } catch (...) {
+                    return false;
+                }
+                return CopyGuestBytes(
+                    begin, captured.data(),
+                    reinterpret_cast<const void*>(begin),
+                    captured.size(), LSX4_PS5_GUEST_READ);
+            };
+        if (!capture(capture_begin, capture_end)) {
+            capture_begin = address;
+            capture_end = request_end;
+            if (!capture(capture_begin, capture_end)) {
+                captured.clear();
+                return false;
+            }
+        }
+
+        // Re-capture the union when pages overlap.  This keeps one coherent
+        // submit snapshot instead of accumulating duplicate resource copies.
+        for (auto iterator = ranges.begin();
+             iterator != ranges.end();) {
+            const auto existing_end =
+                iterator->address + iterator->bytes.size();
+            if (capture_end < iterator->address ||
+                existing_end < capture_begin) {
+                ++iterator;
+                continue;
+            }
+            capture_begin =
+                std::min(capture_begin, iterator->address);
+            capture_end = std::max(capture_end, existing_end);
+            iterator = ranges.erase(iterator);
+        }
+        if (capture_begin != page_begin ||
+            capture_end != page_end) {
+            if (!capture(capture_begin, capture_end)) {
+                return false;
+            }
+        }
+        ranges.push_back({
+            .address = capture_begin,
+            .bytes = std::move(captured),
+        });
+        std::ranges::sort(
+            ranges, {}, &Range::address);
+        g_ps5_readback_batch.ranges.fetch_add(
+            1u, std::memory_order_relaxed);
+        return true;
+    }
+
+    bool Read(const std::uint64_t address,
+              void* const destination,
+              const std::size_t byte_count) {
+        const auto contained =
+            [&](const Range& range) {
+                return address >= range.address &&
+                    address - range.address <= range.bytes.size() &&
+                    byte_count <= range.bytes.size() -
+                        static_cast<std::size_t>(
+                            address - range.address);
+            };
+        auto found = std::ranges::find_if(ranges, contained);
+        if (found == ranges.end()) {
+            if (!Capture(address, byte_count)) {
+                g_ps5_readback_batch.fallbacks.fetch_add(
+                    1u, std::memory_order_relaxed);
+                return false;
+            }
+            found = std::ranges::find_if(ranges, contained);
+            if (found == ranges.end()) {
+                g_ps5_readback_batch.fallbacks.fetch_add(
+                    1u, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        std::memcpy(
+            destination,
+            found->bytes.data() +
+                static_cast<std::size_t>(address - found->address),
+            byte_count);
+        return true;
+    }
+
+    void ObserveWrite(const std::uint64_t address,
+                      const void* const source,
+                      const std::size_t byte_count) noexcept {
+        if (source == nullptr || byte_count == 0u ||
+            address >
+                std::numeric_limits<std::uint64_t>::max() -
+                    byte_count) {
+            return;
+        }
+        const auto write_end = address + byte_count;
+        for (auto& range : ranges) {
+            const auto range_end =
+                range.address + range.bytes.size();
+            const auto begin = std::max(address, range.address);
+            const auto end = std::min(write_end, range_end);
+            if (begin >= end) {
+                continue;
+            }
+            std::memcpy(
+                range.bytes.data() +
+                    static_cast<std::size_t>(
+                        begin - range.address),
+                static_cast<const std::uint8_t*>(source) +
+                    static_cast<std::size_t>(begin - address),
+                static_cast<std::size_t>(end - begin));
+        }
+    }
+
+    std::vector<Range> ranges;
+};
+
+thread_local ActiveSubmitResourceSnapshot*
+    g_active_submit_resource_snapshot{};
+
+class ScopedSubmitResourceSnapshot {
+public:
+    ScopedSubmitResourceSnapshot(
+        const std::uint64_t address,
+        const std::size_t byte_count,
+        const bool enabled)
+        : previous_{g_active_submit_resource_snapshot} {
+        if (!enabled || address == 0u || byte_count == 0u) {
+            return;
+        }
+        g_active_submit_resource_snapshot = &snapshot_;
+        g_ps5_readback_batch.snapshots.fetch_add(
+            1u, std::memory_order_relaxed);
+        try {
+            if (!snapshot_.Capture(address, byte_count)) {
+                g_ps5_readback_batch.fallbacks.fetch_add(
+                    1u, std::memory_order_relaxed);
+            }
+        } catch (...) {
+            g_ps5_readback_batch.fallbacks.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
+    }
+
+    ~ScopedSubmitResourceSnapshot() {
+        g_active_submit_resource_snapshot = previous_;
+    }
+
+    ScopedSubmitResourceSnapshot(
+        const ScopedSubmitResourceSnapshot&) = delete;
+    ScopedSubmitResourceSnapshot& operator=(
+        const ScopedSubmitResourceSnapshot&) = delete;
+
+private:
+    ActiveSubmitResourceSnapshot* previous_{};
+    ActiveSubmitResourceSnapshot snapshot_;
+};
+
+void ObserveActiveSubmitWrite(
+    const std::uint64_t address, const void* const source,
+    const std::size_t byte_count) noexcept {
+    if (g_active_submit_resource_snapshot != nullptr) {
+        g_active_submit_resource_snapshot->ObserveWrite(
+            address, source, byte_count);
+    }
+}
 
 class ScopedGuestReadSpan {
 public:
@@ -2232,6 +2527,12 @@ bool TryReadGuestBytes(
     const std::size_t byte_count) {
     if (destination == nullptr || byte_count == 0) {
         return byte_count == 0;
+    }
+    if (auto* const snapshot =
+            g_active_submit_resource_snapshot;
+        snapshot != nullptr) {
+        return snapshot->Read(
+            address, destination, byte_count);
     }
     const auto& span = g_active_guest_read_span;
     if (span.generation != 0 &&
@@ -8547,6 +8848,8 @@ bool TryCompositeAgcCpuDraw(
                 texture_probe_serial;
         }
         if (cached_texture == texture_cache.end()) {
+            g_ps5_readback_cache_misses.fetch_add(
+                1u, std::memory_order_relaxed);
             AgcCpuDecodedTexture decoded{
                 .address = draw.texture_address,
                 .width = draw.texture_width,
@@ -8570,6 +8873,9 @@ bool TryCompositeAgcCpuDraw(
                 AgcTextureSignature(*decoded.rgba);
             texture_cache.emplace_back(std::move(decoded));
             cached_texture = std::prev(texture_cache.end());
+        } else {
+            g_ps5_readback_cache_hits.fetch_add(
+                1u, std::memory_order_relaxed);
         }
         texture_rgba = cached_texture->rgba;
         texture_signature = cached_texture->signature;
@@ -10926,6 +11232,13 @@ bool TryAgcDriverSubmitDcb(
         command_address,
         static_cast<std::uint64_t>(dword_count) *
             sizeof(std::uint32_t)};
+    const bool managed_readback_batching =
+        Ps5ManagedOptimizationEnabled(7);
+    const ScopedSubmitResourceSnapshot resource_snapshot{
+        command_address,
+        static_cast<std::size_t>(dword_count) *
+            sizeof(std::uint32_t),
+        managed_readback_batching};
 
     bool should_dump_dcb{};
     {
@@ -10990,6 +11303,11 @@ bool TryAgcDriverSubmitDcb(
     };
     std::vector<DeferredReleaseWrite> deferred_release_writes;
     deferred_release_writes.reserve(8u);
+    const auto submit_retirement_serial =
+        g_ps5_retirement_serial.fetch_add(
+            1u, std::memory_order_relaxed);
+    std::unordered_map<std::uint64_t, std::uint64_t>
+        submit_label_sidecar;
     struct DeferredDataWrite {
         bool standard_packet{};
         std::uint32_t destination_selection{};
@@ -10999,6 +11317,15 @@ bool TryAgcDriverSubmitDcb(
     };
     std::vector<DeferredDataWrite> deferred_data_writes;
     deferred_data_writes.reserve(32u);
+    struct DeferredDmaWrite {
+        std::uint64_t destination_address{};
+        std::uint64_t source_address{};
+        std::uint32_t byte_count{};
+        std::uint32_t fill_value{};
+        bool fill{};
+    };
+    std::vector<DeferredDmaWrite> deferred_dma_writes;
+    deferred_dma_writes.reserve(32u);
     std::uint64_t index_buffer_address{};
     std::uint32_t index_buffer_count{};
     std::uint32_t index_size{};
@@ -11097,6 +11424,12 @@ bool TryAgcDriverSubmitDcb(
     if (cpu_texture_cache_epoch != runtime_texture_cache_epoch) {
         cpu_texture_cache.clear();
         cpu_texture_cache_epoch = runtime_texture_cache_epoch;
+    }
+    if (!Ps5ManagedOptimizationEnabled(7) &&
+        !cpu_texture_cache.empty()) {
+        cpu_texture_cache.clear();
+        g_ps5_readback_cache_resets.fetch_add(
+            1u, std::memory_order_relaxed);
     }
     if (gen5_route_epoch != runtime_texture_cache_epoch) {
         gen5_only_shader_pairs.clear();
@@ -11265,6 +11598,14 @@ skip_packet_diagnostic_log:
                         .destination_address = destination_address,
                         .data = data,
                     });
+                    if (managed_readback_batching &&
+                        (data_selection == 1u ||
+                         data_selection == 2u)) {
+                        submit_label_sidecar[destination_address] =
+                            data_selection == 1u
+                            ? static_cast<std::uint32_t>(data)
+                            : data;
+                    }
                 } else {
                     ++release_write_failures;
                 }
@@ -11276,6 +11617,73 @@ skip_packet_diagnostic_log:
         } else if (opcode == AgcItReleaseMem &&
                    length >= 8u) {
             apply_release_mem(true);
+        }
+        if (managed_readback_batching &&
+            opcode == AgcItNop &&
+            (packet_register == AgcRWaitMem32 ||
+             packet_register == AgcRWaitMem64)) {
+            const bool wait64 =
+                packet_register == AgcRWaitMem64;
+            std::array<std::uint32_t, 8> words{};
+            const auto required = wait64 ? 8u : 7u;
+            if (length >= required &&
+                TryReadGuestBytes(
+                    packet_address, words.data(),
+                    required * sizeof(std::uint32_t))) {
+                const auto address =
+                    static_cast<std::uint64_t>(words[1]) |
+                    (static_cast<std::uint64_t>(
+                         words[2] & 0x3ffffu) << 32u);
+                const auto mask =
+                    static_cast<std::uint64_t>(words[3]) |
+                    (wait64
+                         ? static_cast<std::uint64_t>(
+                               words[4]) << 32u
+                         : 0u);
+                const auto reference =
+                    static_cast<std::uint64_t>(
+                        words[wait64 ? 5u : 4u]) |
+                    (wait64
+                         ? static_cast<std::uint64_t>(
+                               words[6]) << 32u
+                         : 0u);
+                const auto function =
+                    words[wait64 ? 7u : 5u] & 0x7u;
+                std::optional<std::uint64_t> sidecar_value;
+                if (const auto label =
+                        submit_label_sidecar.find(address);
+                    label != submit_label_sidecar.end()) {
+                    sidecar_value = label->second;
+                } else {
+                    const std::lock_guard sidecar_lock{
+                        g_ps5_retirement_sidecar_mutex};
+                    if (const auto retired =
+                            g_ps5_retirement_sidecar.find(address);
+                        retired !=
+                            g_ps5_retirement_sidecar.end() &&
+                        retired->second.retirement_serial <
+                            submit_retirement_serial) {
+                        sidecar_value = retired->second.value;
+                    }
+                }
+                if (sidecar_value.has_value()) {
+                    const auto observed =
+                        *sidecar_value & mask;
+                    const auto expected = reference & mask;
+                    const bool satisfied =
+                        function == 0u ||
+                        (function == 1u && observed < expected) ||
+                        (function == 2u && observed <= expected) ||
+                        (function == 3u && observed == expected) ||
+                        (function == 4u && observed != expected) ||
+                        (function == 5u && observed >= expected) ||
+                        (function == 6u && observed > expected);
+                    if (satisfied) {
+                        g_ps5_readback_batch.sidecar_waits.fetch_add(
+                            1u, std::memory_order_relaxed);
+                    }
+                }
+            }
         }
         const bool agc_write_data =
             opcode == AgcItNop &&
@@ -11344,6 +11752,7 @@ skip_packet_diagnostic_log:
             std::uint64_t destination_address{};
             std::uint64_t source_address{};
             bool copied{};
+            bool queued{};
             std::uint32_t byte_count{};
             std::uint32_t source_selection{};
             std::uint32_t destination_selection{};
@@ -11374,8 +11783,25 @@ skip_packet_diagnostic_log:
                     byte_count <= 256u * 1024u * 1024u &&
                     destination_address != 0 &&
                     destination_memory) {
-                    std::vector<std::uint8_t> bytes(byte_count);
-                    if (source_selection == 2u) {
+                    if (managed_readback_batching &&
+                        (source_selection == 2u ||
+                         (source_memory &&
+                          source_address != 0u))) {
+                        deferred_dma_writes.push_back({
+                            .destination_address =
+                                destination_address,
+                            .source_address = source_address,
+                            .byte_count = byte_count,
+                            .fill_value =
+                                static_cast<std::uint32_t>(
+                                    source_address),
+                            .fill = source_selection == 2u,
+                        });
+                        queued = true;
+                    } else {
+                        std::vector<std::uint8_t> bytes(
+                            byte_count);
+                        if (source_selection == 2u) {
                         const auto fill =
                             static_cast<std::uint32_t>(
                                 source_address);
@@ -11389,19 +11815,22 @@ skip_packet_diagnostic_log:
                         copied = TryWriteGuestBytes(
                             destination_address,
                             bytes.data(), bytes.size());
-                    } else if (source_memory &&
-                               source_address != 0 &&
-                               TryReadGuestBytes(
-                                   source_address,
-                                   bytes.data(), bytes.size())) {
-                        copied = TryWriteGuestBytes(
-                            destination_address,
-                            bytes.data(), bytes.size());
+                        } else if (source_memory &&
+                                   source_address != 0 &&
+                                   TryReadGuestBytes(
+                                       source_address,
+                                       bytes.data(), bytes.size())) {
+                            copied = TryWriteGuestBytes(
+                                destination_address,
+                                bytes.data(), bytes.size());
+                        }
                     }
                 }
             }
-            dma_write_count += copied;
-            dma_write_failures += !copied;
+            if (!queued) {
+                dma_write_count += copied;
+                dma_write_failures += !copied;
+            }
 #ifdef __ANDROID__
             static std::atomic<std::uint32_t> standard_dma_logs{};
             if (standard_dma_logs.fetch_add(
@@ -11416,7 +11845,8 @@ skip_packet_diagnostic_log:
                     static_cast<unsigned long long>(
                         source_address),
                     byte_count, source_selection,
-                    destination_selection, copied ? 1 : 0);
+                    destination_selection,
+                    copied || queued ? 1 : 0);
             }
 #endif
         }
@@ -11437,6 +11867,7 @@ skip_packet_diagnostic_log:
             std::uint64_t destination_address{};
             std::uint64_t source_address{};
             bool copied{};
+            bool queued{};
             if (TryReadGuestValue(
                     packet_address + byte_count_offset,
                     byte_count) &&
@@ -11452,7 +11883,6 @@ skip_packet_diagnostic_log:
                 byte_count != 0 &&
                 byte_count <= 256u * 1024u * 1024u &&
                 destination_address != 0) {
-                std::vector<std::uint8_t> bytes(byte_count);
                 const auto source_selection =
                     compact_layout
                         ? selectors & 0xffu
@@ -11463,7 +11893,22 @@ skip_packet_diagnostic_log:
                      destination_address >= 0x10000u &&
                      source_address <=
                          std::numeric_limits<std::uint32_t>::max());
-                if (immediate_fill) {
+                if (managed_readback_batching &&
+                    (immediate_fill || source_address != 0u)) {
+                    deferred_dma_writes.push_back({
+                        .destination_address =
+                            destination_address,
+                        .source_address = source_address,
+                        .byte_count = byte_count,
+                        .fill_value =
+                            static_cast<std::uint32_t>(
+                                source_address),
+                        .fill = immediate_fill,
+                    });
+                    queued = true;
+                } else {
+                    std::vector<std::uint8_t> bytes(byte_count);
+                    if (immediate_fill) {
                     const auto fill =
                         static_cast<std::uint32_t>(
                             source_address);
@@ -11475,17 +11920,20 @@ skip_packet_diagnostic_log:
                     copied = TryWriteGuestBytes(
                         destination_address,
                         bytes.data(), bytes.size());
-                } else if (source_address != 0 &&
-                           TryReadGuestBytes(
-                               source_address,
-                               bytes.data(), bytes.size())) {
-                    copied = TryWriteGuestBytes(
-                        destination_address,
-                        bytes.data(), bytes.size());
+                    } else if (source_address != 0 &&
+                               TryReadGuestBytes(
+                                   source_address,
+                                   bytes.data(), bytes.size())) {
+                        copied = TryWriteGuestBytes(
+                            destination_address,
+                            bytes.data(), bytes.size());
+                    }
                 }
             }
-            dma_write_count += copied;
-            dma_write_failures += !copied;
+            if (!queued) {
+                dma_write_count += copied;
+                dma_write_failures += !copied;
+            }
 #ifdef __ANDROID__
             static std::atomic<std::uint32_t> dma_logs{};
             if (dma_logs.fetch_add(
@@ -11507,7 +11955,8 @@ skip_packet_diagnostic_log:
                         destination_address),
                     static_cast<unsigned long long>(
                         source_address),
-                    byte_count, selectors, copied ? 1 : 0,
+                    byte_count, selectors,
+                    copied || queued ? 1 : 0,
                     static_cast<unsigned long long>(observed),
                     observed_ok ? 1 : 0);
             }
@@ -13530,12 +13979,29 @@ skip_packet_diagnostic_log:
                 if (accumulated->gpu_frame != nullptr) {
                     accumulated->gpu_frame->target_key =
                         draw.render_target_address;
-                    accumulated->gpu_frame->base_batch_id =
-                        accumulated->gpu_frame->batch_id;
-                    accumulated->gpu_frame->first_new_draw =
+                    const auto prior_draws =
                         accumulated->gpu_frame->draws.size();
+                    const bool delta_frame =
+                        Ps5ManagedOptimizationEnabled(8) &&
+                        prior_draws != 0u;
+                    accumulated->gpu_frame->base_batch_id =
+                        delta_frame
+                        ? accumulated->gpu_frame->batch_id
+                        : 0u;
+                    accumulated->gpu_frame->first_new_draw =
+                        delta_frame ? prior_draws : 0u;
                     accumulated->gpu_frame->preserve_target =
-                        !accumulated->gpu_frame->draws.empty();
+                        delta_frame;
+                    if (delta_frame) {
+                        g_ps5_driver_delta_frames.fetch_add(
+                            1u, std::memory_order_relaxed);
+                        g_ps5_driver_draws_elided.fetch_add(
+                            prior_draws,
+                            std::memory_order_relaxed);
+                    } else if (prior_draws != 0u) {
+                        g_ps5_driver_full_replays.fetch_add(
+                            1u, std::memory_order_relaxed);
+                    }
                 }
                 cpu_frame = std::move(accumulated);
                 cpu_frame_target = draw.render_target_address;
@@ -13710,6 +14176,125 @@ skip_packet_diagnostic_log:
     }
     const auto cpu_render_finished =
         std::chrono::steady_clock::now();
+    if (managed_readback_batching &&
+        !deferred_dma_writes.empty()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>
+            requested_ranges;
+        requested_ranges.reserve(deferred_dma_writes.size());
+        for (const auto& write : deferred_dma_writes) {
+            if (write.fill || write.source_address == 0u ||
+                write.byte_count == 0u ||
+                write.source_address >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        write.byte_count) {
+                continue;
+            }
+            requested_ranges.emplace_back(
+                write.source_address,
+                write.source_address + write.byte_count);
+        }
+        std::ranges::sort(requested_ranges);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>
+            snapshots;
+        for (const auto [begin, end] : requested_ranges) {
+            if (!snapshots.empty() &&
+                begin <= snapshots.back().second) {
+                snapshots.back().second =
+                    std::max(snapshots.back().second, end);
+            } else {
+                snapshots.emplace_back(begin, end);
+            }
+        }
+        // Capture every source range into the single submit snapshot before
+        // publishing any DMA destination.  Overlapping guest copies therefore
+        // retain GPU DMA/memmove semantics without a second vector snapshot.
+        for (const auto [begin, end] : snapshots) {
+            if (g_active_submit_resource_snapshot == nullptr ||
+                end <= begin ||
+                end - begin >
+                    static_cast<std::uint64_t>(
+                        std::numeric_limits<std::size_t>::max()) ||
+                !g_active_submit_resource_snapshot->Capture(
+                    begin, static_cast<std::size_t>(end - begin))) {
+                g_ps5_readback_batch.fallbacks.fetch_add(
+                    1u, std::memory_order_relaxed);
+            }
+        }
+        std::vector<std::size_t> transfer_offsets(
+            deferred_dma_writes.size(), SIZE_MAX);
+        std::vector<bool> prepared(
+            deferred_dma_writes.size(), false);
+        std::size_t transfer_size{};
+        for (std::size_t index = 0;
+             index < deferred_dma_writes.size(); ++index) {
+            const auto size = static_cast<std::size_t>(
+                deferred_dma_writes[index].byte_count);
+            if (size > SIZE_MAX - transfer_size) {
+                continue;
+            }
+            transfer_offsets[index] = transfer_size;
+            transfer_size += size;
+        }
+        std::vector<std::uint8_t> transfer_bytes;
+        try {
+            transfer_bytes.resize(transfer_size);
+        } catch (...) {
+            transfer_bytes.clear();
+        }
+        if (transfer_bytes.size() == transfer_size) {
+            for (std::size_t write_index = 0;
+                 write_index < deferred_dma_writes.size();
+                 ++write_index) {
+                const auto& write =
+                    deferred_dma_writes[write_index];
+                if (transfer_offsets[write_index] == SIZE_MAX) {
+                    continue;
+                }
+                auto* const output =
+                    transfer_bytes.data() +
+                    transfer_offsets[write_index];
+                if (write.fill) {
+                    for (std::size_t index = 0;
+                         index < write.byte_count; ++index) {
+                        output[index] =
+                            static_cast<std::uint8_t>(
+                                write.fill_value >>
+                                ((index & 3u) * 8u));
+                    }
+                    prepared[write_index] = true;
+                } else {
+                    prepared[write_index] =
+                        TryReadGuestBytes(
+                            write.source_address, output,
+                            write.byte_count);
+                }
+            }
+        }
+        g_ps5_readback_batch.copy_commands.fetch_add(
+            1u, std::memory_order_relaxed);
+        for (std::size_t write_index = 0;
+             write_index < deferred_dma_writes.size();
+             ++write_index) {
+            const auto& write =
+                deferred_dma_writes[write_index];
+            const bool wrote =
+                prepared[write_index] &&
+                transfer_offsets[write_index] != SIZE_MAX &&
+                TryWriteGuestBytes(
+                    write.destination_address,
+                    transfer_bytes.data() +
+                        transfer_offsets[write_index],
+                    write.byte_count);
+            dma_write_count += wrote;
+            dma_write_failures += !wrote;
+            g_ps5_readback_batch.copy_regions.fetch_add(
+                wrote ? 1u : 0u, std::memory_order_relaxed);
+            if (!wrote) {
+                g_ps5_readback_batch.fallbacks.fetch_add(
+                    1u, std::memory_order_relaxed);
+            }
+        }
+    }
     for (const auto& write : deferred_data_writes) {
         bool wrote = true;
         for (std::size_t index = 0;
@@ -13749,6 +14334,13 @@ skip_packet_diagnostic_log:
             std::chrono::steady_clock::now()
                 .time_since_epoch()
                 .count());
+        const auto published_value =
+            write.data_selection == 1u
+            ? static_cast<std::uint64_t>(
+                  static_cast<std::uint32_t>(write.data))
+            : write.data_selection == 2u
+            ? write.data
+            : timestamp;
         const bool wrote =
             write.data_selection == 1u
             ? TryWriteGuestValue(
@@ -13761,6 +14353,20 @@ skip_packet_diagnostic_log:
                          write.destination_address, timestamp));
         release_write_count += wrote;
         release_write_failures += !wrote;
+        if (managed_readback_batching && wrote) {
+            {
+                const std::lock_guard sidecar_lock{
+                    g_ps5_retirement_sidecar_mutex};
+                g_ps5_retirement_sidecar[
+                    write.destination_address] = {
+                        .value = published_value,
+                        .retirement_serial =
+                            submit_retirement_serial,
+                    };
+            }
+            g_ps5_readback_batch.sidecar_labels.fetch_add(
+                1u, std::memory_order_relaxed);
+        }
 #ifdef __ANDROID__
         static std::atomic<std::uint32_t> release_logs{};
         if (release_logs.fetch_add(
@@ -14083,178 +14689,29 @@ bool TryAgcDriverSubmitAcb(
 
 #ifdef __ANDROID__
 bool OpenGuestAudioOut(GuestAudioOutPort& port) {
-    AAudioStreamBuilder* builder{};
-    auto status = AAudio_createStreamBuilder(&builder);
-    if (status != AAUDIO_OK || builder == nullptr) {
-        std::fprintf(
-            stderr, "PS5_AUDIO_OPEN stage=builder error=%s\n",
-            AAudio_convertResultToText(status));
-        return false;
-    }
-    const auto output_channels = port.channels == 1 ? 1 : 2;
-    AAudioStreamBuilder_setDirection(
-        builder, AAUDIO_DIRECTION_OUTPUT);
-    AAudioStreamBuilder_setPerformanceMode(
-        builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-    AAudioStreamBuilder_setSharingMode(
-        builder, AAUDIO_SHARING_MODE_SHARED);
-    AAudioStreamBuilder_setSampleRate(
-        builder, static_cast<std::int32_t>(port.frequency));
-    AAudioStreamBuilder_setChannelCount(
-        builder, static_cast<std::int32_t>(output_channels));
-    AAudioStreamBuilder_setFormat(
-        builder, AAUDIO_FORMAT_PCM_FLOAT);
-    AAudioStreamBuilder_setBufferCapacityInFrames(
-        builder,
-        static_cast<std::int32_t>(
-            std::max<std::uint32_t>(
-                port.buffer_length * 4u, 512u)));
-    status = AAudioStreamBuilder_openStream(builder, &port.stream);
-    AAudioStreamBuilder_delete(builder);
-    if (status != AAUDIO_OK || port.stream == nullptr) {
-        std::fprintf(
-            stderr, "PS5_AUDIO_OPEN stage=open error=%s\n",
-            AAudio_convertResultToText(status));
-        port.stream = nullptr;
-        return false;
-    }
-    status = AAudioStream_requestStart(port.stream);
-    if (status != AAUDIO_OK) {
-        std::fprintf(
-            stderr, "PS5_AUDIO_OPEN stage=start error=%s\n",
-            AAudio_convertResultToText(status));
-        AAudioStream_close(port.stream);
-        port.stream = nullptr;
-        return false;
-    }
-    std::fprintf(
-        stderr,
-        "PS5_AUDIO_OPEN ok rate=%u frames=%u guest_channels=%u "
-        "output_channels=%u format=%d\n",
-        port.frequency, port.buffer_length, port.channels,
-        output_channels, port.format);
-    return true;
+    port.scheduled_audio =
+        Lsx4::Ps5Desktop::OpenPs5AudioPort({
+            .buffer_frames = port.buffer_length,
+            .sample_rate = port.frequency,
+            .format = port.format,
+            .guest_channels = port.channels,
+            .bytes_per_sample = port.bytes_per_sample,
+            .port_type = port.port_type,
+        });
+    return port.scheduled_audio != nullptr;
 }
 
 void CloseGuestAudioOut(GuestAudioOutPort& port) {
-    if (port.stream == nullptr) {
-        return;
-    }
-    (void)AAudioStream_requestStop(port.stream);
-    (void)AAudioStream_close(port.stream);
-    port.stream = nullptr;
+    Lsx4::Ps5Desktop::ClosePs5AudioPort(
+        port.scheduled_audio);
 }
 
 bool OutputGuestAudio(const GuestAudioOutPort& port,
                       const std::uint64_t source_address,
                       const std::uint64_t output_count) {
-    if (port.stream == nullptr || source_address == 0) {
-        return false;
-    }
-    const auto sample_count =
-        static_cast<std::uint64_t>(port.buffer_length) *
-        port.channels;
-    if (sample_count == 0 ||
-        sample_count >
-            std::numeric_limits<std::size_t>::max() /
-                port.bytes_per_sample) {
-        return false;
-    }
-    const auto source_size =
-        static_cast<std::size_t>(sample_count) *
-        port.bytes_per_sample;
-    std::vector<std::uint8_t> source(source_size);
-    if (!TryReadGuestBytes(
-            source_address, source.data(), source.size())) {
-        std::fprintf(
-            stderr,
-            "PS5_AUDIO_OUTPUT error=guest-read address=0x%llx bytes=%zu\n",
-            static_cast<unsigned long long>(source_address),
-            source.size());
-        return false;
-    }
-
-    const auto output_channels = port.channels == 1 ? 1u : 2u;
-    std::vector<float> output(
-        static_cast<std::size_t>(port.buffer_length) *
-        output_channels);
-    const auto base_format =
-        static_cast<std::uint32_t>(port.format) & 0xffu;
-    const bool is_float =
-        base_format >= 3u && base_format <= 5u ||
-        base_format == 7u;
-    const auto sample = [&](const std::size_t index) {
-        if (is_float) {
-            float value{};
-            std::memcpy(
-                &value,
-                source.data() + index * sizeof(float),
-                sizeof(value));
-            return std::isfinite(value) ? value : 0.0f;
-        }
-        std::int16_t value{};
-        std::memcpy(
-            &value,
-            source.data() + index * sizeof(std::int16_t),
-            sizeof(value));
-        return static_cast<float>(value) / 32768.0f;
-    };
-    float peak{};
-    constexpr float Mix = 0.70710678f;
-    for (std::uint32_t frame = 0;
-         frame < port.buffer_length; ++frame) {
-        const auto source_base =
-            static_cast<std::size_t>(frame) * port.channels;
-        const auto output_base =
-            static_cast<std::size_t>(frame) * output_channels;
-        if (port.channels == 8) {
-            const auto center = sample(source_base + 2u) * Mix;
-            output[output_base] =
-                (sample(source_base) + center +
-                 (sample(source_base + 4u) +
-                  sample(source_base + 6u)) * Mix) *
-                port.volume;
-            output[output_base + 1u] =
-                (sample(source_base + 1u) + center +
-                 (sample(source_base + 5u) +
-                  sample(source_base + 7u)) * Mix) *
-                port.volume;
-        } else {
-            output[output_base] =
-                sample(source_base) * port.volume;
-            if (output_channels == 2) {
-                output[output_base + 1u] =
-                    sample(source_base + 1u) * port.volume;
-            }
-        }
-        for (std::uint32_t channel = 0;
-             channel < output_channels; ++channel) {
-            auto& value = output[output_base + channel];
-            value = std::clamp(value, -1.0f, 1.0f);
-            peak = std::max(peak, std::abs(value));
-        }
-    }
-    const auto written = AAudioStream_write(
-        port.stream, output.data(),
-        static_cast<std::int32_t>(port.buffer_length),
-        INT64_C(20000000));
-    if (output_count <= 8 || output_count % 200u == 0 ||
-        written < 0) {
-        std::fprintf(
-            stderr,
-            "PS5_AUDIO_OUTPUT count=%llu frames=%d/%u "
-            "guest_channels=%u output_channels=%u float=%d "
-            "peak=%.6f status=%s\n",
-            static_cast<unsigned long long>(output_count),
-            written >= 0 ? static_cast<int>(written) : 0,
-            port.buffer_length, port.channels,
-            output_channels, is_float ? 1 : 0, peak,
-            written >= 0
-                ? "ok"
-                : AAudio_convertResultToText(
-                      static_cast<aaudio_result_t>(written)));
-    }
-    return written >= 0;
+    return Lsx4::Ps5Desktop::QueuePs5AudioBuffer(
+        port.scheduled_audio, source_address, port.volume,
+        output_count, &TryReadGuestBytes);
 }
 #endif
 
@@ -16515,6 +16972,8 @@ bool TryCreateGuestPthread(
         g_runtime.guest_host_threads.emplace_back(
             [entry, thread_handle = thread_context.handle,
              thread_name = std::move(thread_name)]() {
+                (void)Common::ApplyCurrentThreadAffinity(
+                    Common::ThreadAffinityClass::GuestCompute);
                 if (Ps5DiagnosticFaultProbeEnabled()) {
                     std::fprintf(
                         stderr,
@@ -20781,6 +21240,8 @@ bool TryInvokeBuiltinHle(
             request.integer_arguments[4]);
         const auto format = static_cast<std::int32_t>(
             request.integer_arguments[5]);
+        const auto port_type = static_cast<std::int32_t>(
+            request.integer_arguments[1]);
         const auto base_format =
             static_cast<std::uint32_t>(format) & 0xffu;
         const auto channels = base_format == 0 || base_format == 3
@@ -20802,6 +21263,7 @@ bool TryInvokeBuiltinHle(
             .buffer_length = buffer_length,
             .frequency = frequency,
             .format = format,
+            .port_type = port_type,
             .channels = channels,
             .bytes_per_sample = bytes_per_sample,
         };
@@ -20976,14 +21438,403 @@ void SetRuntimeStatus(std::string status) {
     g_runtime.status = std::move(status);
 }
 
-void ResetPs5TranslationSession() noexcept {
+std::string NormalizePs5ArtifactTitle(std::string value) {
+    std::transform(
+        value.begin(), value.end(), value.begin(),
+        [](const unsigned char character) {
+            return static_cast<char>(std::toupper(character));
+        });
+    value.erase(
+        std::remove_if(
+            value.begin(), value.end(),
+            [](const unsigned char character) {
+                return !std::isalnum(character) &&
+                    character != '_' && character != '-';
+            }),
+        value.end());
+    return value;
+}
+
+bool IsConsoleTitleId(const std::string_view value) {
+    return value.size() == 9u &&
+        std::ranges::all_of(
+            value.substr(0u, 4u),
+            [](const unsigned char character) {
+                return std::isalpha(character) != 0;
+            }) &&
+        std::ranges::all_of(
+            value.substr(4u),
+            [](const unsigned char character) {
+                return std::isdigit(character) != 0;
+            });
+}
+
+std::string ReadPs5ParamSfoTitle(
+    const std::filesystem::path& game_directory) {
+    constexpr std::size_t MaximumSfoBytes = 1024u * 1024u;
+    const auto path =
+        game_directory / "sce_sys" / "param.sfo";
+    std::error_code error;
+    const auto file_size =
+        std::filesystem::file_size(path, error);
+    if (error || file_size < 20u ||
+        file_size > MaximumSfoBytes) {
+        return {};
+    }
+    std::vector<std::uint8_t> bytes(
+        static_cast<std::size_t>(file_size));
+    std::FILE* const file =
+        std::fopen(path.string().c_str(), "rb");
+    if (file == nullptr) {
+        return {};
+    }
+    const auto read =
+        std::fread(bytes.data(), 1u, bytes.size(), file);
+    std::fclose(file);
+    if (read != bytes.size()) {
+        return {};
+    }
+    const auto read_u16 =
+        [&bytes](const std::size_t offset) {
+            return static_cast<std::uint16_t>(
+                bytes[offset] |
+                (static_cast<std::uint16_t>(
+                     bytes[offset + 1u]) << 8u));
+        };
+    const auto read_u32 =
+        [&bytes](const std::size_t offset) {
+            return static_cast<std::uint32_t>(
+                bytes[offset] |
+                (static_cast<std::uint32_t>(
+                     bytes[offset + 1u]) << 8u) |
+                (static_cast<std::uint32_t>(
+                     bytes[offset + 2u]) << 16u) |
+                (static_cast<std::uint32_t>(
+                     bytes[offset + 3u]) << 24u));
+        };
+    if (read_u32(0u) != UINT32_C(0x46535000)) {
+        return {};
+    }
+    const auto key_table = read_u32(8u);
+    const auto data_table = read_u32(12u);
+    const auto entry_count = read_u32(16u);
+    if (key_table >= bytes.size() ||
+        data_table >= bytes.size() ||
+        entry_count >
+            (bytes.size() - 20u) / 16u) {
+        return {};
+    }
+    for (std::uint32_t index = 0;
+         index < entry_count; ++index) {
+        const auto entry =
+            20u + static_cast<std::size_t>(index) * 16u;
+        const auto key_offset =
+            static_cast<std::size_t>(key_table) +
+            read_u16(entry);
+        const auto data_length = read_u32(entry + 4u);
+        const auto data_offset =
+            static_cast<std::size_t>(data_table) +
+            read_u32(entry + 12u);
+        if (key_offset >= bytes.size() ||
+            data_offset >= bytes.size() ||
+            data_length > bytes.size() - data_offset) {
+            continue;
+        }
+        const auto key_end = std::find(
+            bytes.begin() +
+                static_cast<std::ptrdiff_t>(key_offset),
+            bytes.end(), UINT8_C(0));
+        if (key_end == bytes.end()) {
+            continue;
+        }
+        const std::string_view key{
+            reinterpret_cast<const char*>(
+                bytes.data() + key_offset),
+            static_cast<std::size_t>(
+                key_end -
+                (bytes.begin() +
+                 static_cast<std::ptrdiff_t>(key_offset)))};
+        if (key != "TITLE_ID" || data_length == 0u) {
+            continue;
+        }
+        const auto available =
+            std::min<std::size_t>(
+                data_length,
+                bytes.size() - data_offset);
+        const auto* const begin =
+            reinterpret_cast<const char*>(
+                bytes.data() + data_offset);
+        const auto* const terminator =
+            static_cast<const char*>(
+                std::memchr(begin, '\0', available));
+        const auto length = terminator != nullptr
+            ? static_cast<std::size_t>(terminator - begin)
+            : available;
+        return NormalizePs5ArtifactTitle(
+            std::string{begin, length});
+    }
+    return {};
+}
+
+std::string Ps5ArtifactTitleForExecutable(
+    const std::filesystem::path& executable,
+    const std::string_view configured_title) {
+    const auto game_directory = executable.parent_path();
+    if (auto title =
+            ReadPs5ParamSfoTitle(game_directory);
+        !title.empty()) {
+        return title;
+    }
+    for (const auto& component : game_directory) {
+        auto candidate =
+            NormalizePs5ArtifactTitle(
+                component.string());
+        if (IsConsoleTitleId(candidate)) {
+            return candidate;
+        }
+    }
+    auto fallback =
+        NormalizePs5ArtifactTitle(
+            game_directory.filename().string());
+    if (!fallback.empty() &&
+        fallback != "APP0" &&
+        fallback != "APP") {
+        return fallback;
+    }
+    fallback =
+        NormalizePs5ArtifactTitle(
+            std::string{configured_title});
+    return fallback.empty() ? "PS5_TITLE" : fallback;
+}
+
+std::uint64_t HashPs5Executable(
+    const std::filesystem::path& path) {
+    std::FILE* const file =
+        std::fopen(path.string().c_str(), "rb");
+    if (file == nullptr) {
+        return 0u;
+    }
+    Common::ContentFingerprint64 fingerprint{
+        Common::FingerprintDomain::ExecutableImage};
+    std::vector<std::uint8_t> bytes(1024u * 1024u);
+    bool failed{};
+    while (!std::feof(file)) {
+        const auto count =
+            std::fread(bytes.data(), 1u, bytes.size(), file);
+        if (count != 0u) {
+            fingerprint.Update(
+                std::span<const std::uint8_t>{
+                    bytes.data(), count});
+        }
+        if (count < bytes.size() &&
+            std::ferror(file) != 0) {
+            failed = true;
+            break;
+        }
+    }
+    std::fclose(file);
+    return failed ? 0u : fingerprint.Finish();
+}
+
+std::uint64_t HashPs5ExecutableMemoized(
+    const std::filesystem::path& path,
+    const std::filesystem::path& root,
+    const std::string& title,
+    bool& memo_hit) {
+    memo_hit = false;
+    std::error_code error;
+    const auto file_size =
+        std::filesystem::file_size(path, error);
+    if (error) {
+        return 0u;
+    }
+    const auto write_time =
+        std::filesystem::last_write_time(path, error);
+    if (error) {
+        return 0u;
+    }
+    const auto write_ticks =
+        static_cast<std::uint64_t>(
+            write_time.time_since_epoch().count());
+    const auto memo_directory =
+        root / "cache" / "jit-fingerprints";
+    const auto memo_path =
+        memo_directory / (title + ".txt");
+    if (std::FILE* const memo =
+            std::fopen(
+                memo_path.string().c_str(), "rb");
+        memo != nullptr) {
+        char magic[64]{};
+        unsigned long long stored_size{};
+        unsigned long long stored_ticks{};
+        unsigned long long stored_hash{};
+        const auto fields = std::fscanf(
+            memo, "%63s\n%llu %llu %llx",
+            magic, &stored_size, &stored_ticks,
+            &stored_hash);
+        std::fclose(memo);
+        if (fields == 4 &&
+            std::strcmp(
+                magic,
+                "executor-ps5-fingerprint-v1") == 0 &&
+            stored_size == file_size &&
+            stored_ticks == write_ticks &&
+            stored_hash != 0u) {
+            memo_hit = true;
+            return static_cast<std::uint64_t>(
+                stored_hash);
+        }
+    }
+    const auto hash = HashPs5Executable(path);
+    if (hash == 0u) {
+        return 0u;
+    }
+    std::filesystem::create_directories(
+        memo_directory, error);
+    if (!error) {
+        const auto temporary =
+            memo_path.string() + ".tmp." +
+            std::to_string(
+                static_cast<unsigned long long>(
+                    getpid()));
+        if (std::FILE* const memo =
+                std::fopen(temporary.c_str(), "wb");
+            memo != nullptr) {
+            std::fprintf(
+                memo,
+                "executor-ps5-fingerprint-v1\n"
+                "%llu %llu %016llx\n",
+                static_cast<unsigned long long>(
+                    file_size),
+                static_cast<unsigned long long>(
+                    write_ticks),
+                static_cast<unsigned long long>(hash));
+            const auto close_status = std::fclose(memo);
+            if (close_status == 0) {
+                std::filesystem::rename(
+                    temporary, memo_path, error);
+            }
+            if (close_status != 0 || error) {
+                error.clear();
+                std::filesystem::remove(
+                    temporary, error);
+            }
+        }
+    }
+    return hash;
+}
+
+bool Ps5PersistentCacheMarkerEnabled(
+    const std::filesystem::path& root) {
+    std::error_code error;
+    return !root.empty() &&
+        std::filesystem::is_regular_file(
+            root / "run-jit-persistent-jit-cache",
+            error) &&
+        !error;
+}
+
+void ConfigurePs5TranslationSessionForExecutable(
+    const std::filesystem::path& executable) noexcept {
+    try {
+        std::filesystem::path root;
+        std::string configured_title;
+        std::uint64_t configured_identity{};
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            root = g_runtime.artifact_root_directory;
+            configured_title =
+                g_runtime.configured_artifact_title;
+            configured_identity =
+                g_runtime.configured_executable_identity;
+        }
+        const auto title =
+            Ps5ArtifactTitleForExecutable(
+                executable, configured_title);
+        const bool marker_enabled =
+            Ps5PersistentCacheMarkerEnabled(root);
+        bool memo_hit{};
+        const auto identity =
+            configured_identity != 0u
+            ? configured_identity
+            : marker_enabled
+            ? HashPs5ExecutableMemoized(
+                  executable, root, title, memo_hit)
+            : 0u;
+        const bool enabled =
+            marker_enabled && identity != 0u &&
+            !root.empty() && !title.empty();
+        Lsx4::Translation::ConfigureArtifactStore(
+            enabled ? root.string() : std::string{},
+            title, identity, enabled);
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            g_runtime.active_artifact_title = title;
+            g_runtime.active_executable_identity =
+                identity;
+            g_runtime.active_artifact_store_enabled =
+                enabled;
+        }
+#ifdef __ANDROID__
+        Lsx4::Ps5Desktop::ConfigureVulkanPipelineCacheIdentity(
+            root.string(), title);
+        __android_log_print(
+            ANDROID_LOG_INFO, "LSX4-PS5",
+            "persistent-cache enabled=%d marker=%d "
+            "title=%s identity=0x%llx memo=%s root=%s",
+            enabled ? 1 : 0,
+            marker_enabled ? 1 : 0, title.c_str(),
+            static_cast<unsigned long long>(identity),
+            memo_hit ? "hit" : "miss",
+            root.string().c_str());
+#endif
+    } catch (...) {
+        try {
+            Lsx4::Translation::ConfigureArtifactStore(
+                {}, {}, 0u, false);
+        } catch (...) {
+        }
+        const std::lock_guard lock{g_runtime.mutex};
+        g_runtime.active_artifact_store_enabled = false;
+    }
+}
+
+void ResetPs5TranslationSession(
+    const bool restore_current_title = false) noexcept {
     try {
         const auto generation =
             g_translation_session_generation.fetch_add(
                 1, std::memory_order_relaxed);
+        std::filesystem::path root;
+        std::string title;
+        std::uint64_t identity{};
+        if (restore_current_title) {
+            const std::lock_guard lock{g_runtime.mutex};
+            root = g_runtime.artifact_root_directory;
+            title = g_runtime.active_artifact_title;
+            identity =
+                g_runtime.active_executable_identity;
+        }
+        const bool enabled =
+            restore_current_title &&
+            identity != 0u && !title.empty() &&
+            Ps5PersistentCacheMarkerEnabled(root);
         Lsx4::Translation::ConfigureArtifactStore(
-            "", "ps5-session-" + std::to_string(generation),
-            generation, false);
+            enabled ? root.string() : std::string{},
+            enabled
+                ? title
+                : "ps5-session-" +
+                      std::to_string(generation),
+            enabled ? identity : 0u, enabled);
+        {
+            const std::lock_guard lock{g_runtime.mutex};
+            g_runtime.active_artifact_store_enabled =
+                enabled;
+            if (!restore_current_title) {
+                g_runtime.active_artifact_title.clear();
+                g_runtime.active_executable_identity = 0u;
+            }
+        }
     } catch (...) {
     }
 }
@@ -21260,10 +22111,11 @@ extern "C" int executor_lsx4_ps5_runtime_set_pad_axis(
 
 extern "C" int executor_lsx4_ps5_runtime_hud_stats(
     std::uint64_t* const values, const std::size_t value_count) {
-    constexpr std::size_t ValueCount = 21u;
+    constexpr std::size_t ValueCount = 92u;
     if (values == nullptr || value_count < ValueCount) {
         return -1;
     }
+    std::fill_n(values, ValueCount, std::uint64_t{0});
     const auto cpu = Lsx4::Translation::ReadTranslationCounters();
     std::uint64_t draw_count{};
     std::uint64_t submit_count{};
@@ -21277,9 +22129,18 @@ extern "C" int executor_lsx4_ps5_runtime_hud_stats(
     values[2] = cpu.semantic_regions;
     values[3] = cpu.unsupported_regions;
     values[4] = cpu.memory_cache_hits;
-    values[5] = draw_count;
+    const auto frame_draws_elided =
+        g_ps5_driver_draws_elided.load(
+            std::memory_order_relaxed);
+    const auto delta_frames =
+        g_ps5_driver_delta_frames.load(
+            std::memory_order_relaxed);
+    const auto frame_full_replays =
+        g_ps5_driver_full_replays.load(
+            std::memory_order_relaxed);
+    values[5] = draw_count + frame_draws_elided;
     values[6] = draw_count;
-    values[7] = 0u;
+    values[7] = frame_draws_elided;
     values[8] = submit_count;
     values[9] = submit_count;
 #ifdef __ANDROID__
@@ -21294,9 +22155,122 @@ extern "C" int executor_lsx4_ps5_runtime_hud_stats(
     values[15] = cpu.stored_native_captured;
     values[16] = cpu.stored_ir_written;
     values[17] = cpu.stored_native_written;
-    values[18] = 0u;
-    values[19] = 0u;
-    values[20] = 0u;
+    values[18] = g_ps5_managed_optimizations[1].load(
+        std::memory_order_acquire) ? 1u : 0u;
+    values[19] = g_ps5_managed_optimizations[2].load(
+        std::memory_order_acquire) ? 1u : 0u;
+    values[20] = g_ps5_managed_optimizations[3].load(
+        std::memory_order_acquire) ? 1u : 0u;
+    values[21] =
+        Ps5ManagedOptimizationEnabled(7) ? 1u : 0u;
+    values[22] =
+        Ps5ManagedOptimizationEnabled(8) ? 1u : 0u;
+    values[23] =
+        Lsx4::Ps5Desktop::IsVulkanAsyncPipelineEnabled()
+        ? 1u : 0u;
+    values[24] =
+        Lsx4::Ps5Desktop::IsVulkanMobileGpuEnabled()
+        ? 1u : 0u;
+    const auto audio =
+        Libraries::AudioOut::GetAudioOptimizationStats();
+    values[25] =
+        Libraries::AudioOut::IsManagedAudioSimdEnabled()
+        ? 1u
+        : 0u;
+    values[26] =
+        Lsx4::Ps5Desktop::GetVulkanEffectiveAnisotropy();
+    values[27] = Executor::Jit::TieredJitEnabled() ? 1u : 0u;
+    values[28] =
+        Executor::Jit::JitTraceCompilationEnabled() ? 1u : 0u;
+    const auto vk_readback =
+        Lsx4::Ps5Desktop::GetVulkanReadbackBatchStats();
+    values[29] = g_ps5_readback_batch.snapshots.load(
+        std::memory_order_relaxed) + vk_readback.snapshots;
+    values[30] = g_ps5_readback_batch.ranges.load(
+        std::memory_order_relaxed) + vk_readback.ranges;
+    values[31] = g_ps5_readback_batch.copy_commands.load(
+        std::memory_order_relaxed) + vk_readback.copy_commands;
+    values[32] = g_ps5_readback_batch.copy_regions.load(
+        std::memory_order_relaxed) + vk_readback.copy_regions;
+    values[33] = g_ps5_readback_batch.timeline_waits.load(
+        std::memory_order_relaxed) + vk_readback.retirement_waits;
+    values[34] = g_ps5_readback_batch.fallbacks.load(
+        std::memory_order_relaxed) + vk_readback.fallbacks;
+    values[35] = g_ps5_readback_batch.sidecar_labels.load(
+        std::memory_order_relaxed);
+    values[36] = g_ps5_readback_batch.sidecar_waits.load(
+        std::memory_order_relaxed);
+    const auto driver =
+        Lsx4::Ps5Desktop::GetVulkanDriverOptimizationStats();
+    values[37] = driver.pipeline_bind_attempts;
+    values[38] = driver.pipeline_binds_elided;
+    values[39] = driver.descriptor_bind_attempts;
+    values[40] = driver.descriptor_binds_elided;
+    values[41] = driver.push_constant_attempts;
+    values[42] = driver.push_constants_elided;
+    values[43] =
+        driver.barriers_elided + driver.render_scope_reuses +
+        delta_frames;
+    values[44] =
+        driver.transfer_requests > driver.transfer_copy_calls
+        ? driver.transfer_requests - driver.transfer_copy_calls
+        : 0u;
+    const auto pipeline =
+        Lsx4::Ps5Desktop::GetVulkanAsyncPipelineStats();
+    values[45] = pipeline.compute_misses;
+    values[46] = pipeline.fast_completed;
+    values[47] = pipeline.optimized_queued;
+    values[48] = pipeline.fast_completed;
+    values[49] = pipeline.optimized_completed;
+    values[50] = pipeline.published;
+    values[51] = pipeline.optimized_replacements;
+    values[52] =
+        pipeline.build_failures + pipeline.queue_drops;
+    const auto mobile =
+        Lsx4::Ps5Desktop::GetVulkanMobileGpuStats();
+    values[53] = mobile.effective_scale_percent;
+    values[54] = mobile.max_gpu_backlog;
+    values[55] = mobile.coarse_rate_draws;
+    values[56] = mobile.fsr_frames;
+    values[57] = mobile.exact_surface_reuses;
+    values[58] = mobile.exact_surface_reuse_bytes;
+    values[59] = mobile.residency_gc_evictions;
+    values[60] = audio.conversion_calls;
+    values[61] = audio.simd_frames;
+    values[62] = audio.scalar_frames;
+    values[63] =
+        audio.xruns + audio.write_errors +
+        audio.partial_writes;
+    values[64] = mobile.physical_drs_available;
+    values[65] = mobile.physical_scaled_draws;
+    values[66] = mobile.physical_scale_fallbacks;
+    values[67] = mobile.physical_resolve_blits;
+    values[68] = mobile.physical_pixels_saved;
+    values[69] = mobile.source_smaller_than_output_frames;
+    values[70] = mobile.scale_down_events;
+    values[71] = mobile.scale_up_events;
+    values[72] = driver.queue_submits;
+    values[73] = driver.queue_submit_logical_packets;
+    values[74] = driver.queue_submit_command_buffers;
+    values[75] = driver.queue_submit_calls_saved;
+    values[76] = driver.queue_submit_forced_boundaries;
+    values[77] =
+        driver.dynamic_state_full_replays +
+        frame_full_replays;
+    values[78] = driver.barrier_batches;
+    values[79] = driver.transfer_copy_calls;
+    values[80] = cpu.tier0_compiled;
+    values[81] = cpu.tier0_active;
+    values[82] = cpu.tier1_queued;
+    values[83] = cpu.tier1_compiled;
+    values[84] = cpu.tier1_active;
+    values[85] = cpu.tier1_promotions;
+    values[86] = cpu.tier1_deopts;
+    values[87] = cpu.tier1_rejected;
+    values[88] = cpu.tier1_safe_handoffs;
+    values[89] = cpu.tier1_loop_osr_handoffs;
+    values[90] = cpu.tier1_compile_time_us;
+    values[91] = cpu.tier1_generated_bytes;
     return static_cast<int>(ValueCount);
 }
 
@@ -21304,38 +22278,137 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
     const int option, const int enabled) {
     constexpr int TieredJit = 4;
     constexpr int JitTraceCompilation = 5;
-    static std::atomic<bool> tiered_jit{false};
-    static std::atomic<bool> trace_compilation{false};
+    constexpr int LimitAnisotropy2x = 6;
     const bool active = enabled != 0;
+    if (option < 1 || option >=
+            static_cast<int>(g_ps5_managed_optimizations.size())) {
+        return LSX4_PS5_EXECUTE_INVALID_ARGUMENT;
+    }
+    int status = LSX4_PS5_EXECUTE_OK;
+    bool effective = active;
     switch (option) {
     case 1:
     case 2:
     case 3:
-        return LSX4_PS5_EXECUTE_OK;
+        break;
+    case LimitAnisotropy2x:
+        break;
+    case 7: { // decoded-texture/readback reuse across AGC submits
+        const std::lock_guard lock{g_runtime.mutex};
+        ++g_runtime.agc_cpu_texture_cache_epoch;
+        ResetPs5ManagedOptimizationStats(option);
+        Lsx4::Ps5Desktop::ResetVulkanReadbackBatchStats();
+        Lsx4::Ps5Desktop::SetVulkanReadbackBatchingEnabled(
+            active);
+        break;
+    }
+    case 8: // Vulkan state/barrier/render-scope/submit deduplication
+        ResetPs5ManagedOptimizationStats(option);
+        Lsx4::Ps5Desktop::SetVulkanDriverOptimizationEnabled(active);
+        effective =
+            Lsx4::Ps5Desktop::IsVulkanDriverOptimizationEnabled();
+        break;
+    case 9: // asynchronous shader/pipeline replacement
+        Lsx4::Ps5Desktop::ResetVulkanAsyncPipelineStats();
+        Lsx4::Ps5Desktop::SetVulkanAsyncPipelineEnabled(active);
+        effective =
+            Lsx4::Ps5Desktop::IsVulkanAsyncPipelineEnabled();
+        break;
+    case 10: // adaptive mobile-GPU policy
+        Lsx4::Ps5Desktop::ResetVulkanMobileGpuStats();
+        Lsx4::Ps5Desktop::SetVulkanMobileGpuEnabled(active);
+        effective =
+            Lsx4::Ps5Desktop::IsVulkanMobileGpuEnabled();
+        break;
+    case 11: // converter A/B; shared scheduler/API stay identical
+        Libraries::AudioOut::ResetAudioOptimizationStats();
+        Libraries::AudioOut::SetManagedAudioSimdEnabled(active);
+        effective =
+            Libraries::AudioOut::IsManagedAudioSimdEnabled();
+        if (active && !effective) {
+            status = LSX4_PS5_EXECUTE_BACKEND_NOT_READY;
+        }
+        break;
+    case 12: // force exact 1x sampler mode
+        effective = active;
+        break;
+    case 13: // experimental direct stack-relative loads/stores; strict elsewhere
+        Executor::Jit::ConfigureFastGuestMemory(active);
+        effective = Executor::Jit::FastGuestMemoryEnabled();
+        break;
     case TieredJit:
-        tiered_jit.store(active, std::memory_order_release);
+        if (!active) {
+            g_ps5_managed_optimizations[JitTraceCompilation].store(
+                false, std::memory_order_release);
+        }
         break;
     case JitTraceCompilation:
-        trace_compilation.store(active, std::memory_order_release);
         if (active) {
-            tiered_jit.store(true, std::memory_order_release);
+            g_ps5_managed_optimizations[TieredJit].store(
+                true, std::memory_order_release);
         }
         break;
     default:
         return LSX4_PS5_EXECUTE_INVALID_ARGUMENT;
     }
-    Executor::Jit::ConfigureTieredJit(
-        tiered_jit.load(std::memory_order_acquire),
-        trace_compilation.load(std::memory_order_acquire));
+    g_ps5_managed_optimizations[
+        static_cast<std::size_t>(option)].store(
+            effective, std::memory_order_release);
+    if (option == LimitAnisotropy2x) {
+        if (active) {
+            g_ps5_managed_optimizations[12].store(
+                false, std::memory_order_release);
+        }
+    } else if (active && option == 12) {
+        g_ps5_managed_optimizations[LimitAnisotropy2x].store(
+            false, std::memory_order_release);
+    }
+    if (option == LimitAnisotropy2x || option == 12) {
+        const bool force_one =
+            g_ps5_managed_optimizations[12].load(
+                std::memory_order_acquire);
+        const bool limit_two =
+            g_ps5_managed_optimizations[LimitAnisotropy2x].load(
+                std::memory_order_acquire);
+        Lsx4::Ps5Desktop::SetVulkanMaxAnisotropy(
+            limit_two && !force_one ? 2u : 1u);
+    }
+    if (option == TieredJit || option == JitTraceCompilation) {
+        Executor::Jit::ConfigureTieredJit(
+            g_ps5_managed_optimizations[TieredJit].load(
+                std::memory_order_acquire),
+            g_ps5_managed_optimizations[JitTraceCompilation].load(
+                std::memory_order_acquire));
+    }
+    const auto epoch = g_ps5_managed_optimization_epoch.fetch_add(
+                           1, std::memory_order_acq_rel) +
+                       1u;
+#ifndef __ANDROID__
+    (void)epoch;
+#endif
 #ifdef __ANDROID__
     __android_log_print(
         ANDROID_LOG_INFO, "LSX4-PS5",
-        "managed JIT option=%d enabled=%d tiered=%d trace=%d",
-        option, active ? 1 : 0,
+        "managed optimization option=%d requested=%d effective=%d status=%d "
+        "tiered=%d trace=%d readback=%d driver=%d async=%d mobile=%d "
+        "audio=%d fastMemory=%d epoch=%llu",
+        option, active ? 1 : 0, effective ? 1 : 0, status,
         Executor::Jit::TieredJitEnabled() ? 1 : 0,
-        Executor::Jit::JitTraceCompilationEnabled() ? 1 : 0);
+        Executor::Jit::JitTraceCompilationEnabled() ? 1 : 0,
+        g_ps5_managed_optimizations[7].load(
+            std::memory_order_acquire) ? 1 : 0,
+        g_ps5_managed_optimizations[8].load(
+            std::memory_order_acquire) ? 1 : 0,
+        g_ps5_managed_optimizations[9].load(
+            std::memory_order_acquire) ? 1 : 0,
+        g_ps5_managed_optimizations[10].load(
+            std::memory_order_acquire) ? 1 : 0,
+        g_ps5_managed_optimizations[11].load(
+            std::memory_order_acquire) ? 1 : 0,
+        Executor::Jit::FastGuestMemoryEnabled() ? 1 : 0,
+        static_cast<unsigned long long>(epoch));
 #endif
-    return LSX4_PS5_EXECUTE_OK;
+    return status;
 }
 
 extern "C" int executor_lsx4_ps5_runtime_initialize(
@@ -21346,6 +22419,18 @@ extern "C" int executor_lsx4_ps5_runtime_initialize(
         config->guest_address_limit <= 0x10000) {
         return LSX4_PS5_EXECUTE_INVALID_ARGUMENT;
     }
+    const std::filesystem::path artifact_root =
+        config->artifact_directory != nullptr
+        ? std::filesystem::path{
+              config->artifact_directory}
+        : std::filesystem::path{};
+    const std::string configured_artifact_title =
+        config->title_id != nullptr
+        ? NormalizePs5ArtifactTitle(config->title_id)
+        : std::string{};
+    const auto configured_executable_identity =
+        config->executable_identity;
+    Common::InitializeAndroidThreadAffinity();
     executor_lsx4_ps5_runtime_reset();
     g_ps5_pad_buttons.store(0, std::memory_order_relaxed);
     g_ps5_pad_timestamp.store(0, std::memory_order_relaxed);
@@ -21363,6 +22448,12 @@ extern "C" int executor_lsx4_ps5_runtime_initialize(
         g_runtime.shutdown_requested.store(
             false, std::memory_order_release);
         g_runtime.guest_address_limit = config->guest_address_limit;
+        g_runtime.artifact_root_directory =
+            artifact_root;
+        g_runtime.configured_artifact_title =
+            configured_artifact_title;
+        g_runtime.configured_executable_identity =
+            configured_executable_identity;
         g_runtime.preferred_image_base =
             Ps5ImageBase +
             (g_translation_session_generation.load(
@@ -21386,6 +22477,10 @@ extern "C" int executor_lsx4_ps5_runtime_initialize(
     }
 
     InstallPs5DiagnosticFaultHandlers();
+#ifdef __ANDROID__
+    Lsx4::Ps5Desktop::ConfigureVulkanPipelineCacheIdentity(
+        artifact_root.string(), configured_artifact_title);
+#endif
     return 0;
 }
 
@@ -21587,6 +22682,9 @@ extern "C" int executor_lsx4_ps5_runtime_load_eboot(
         Funnel::Ps5Desktop::UnloadNextGenExecutable(host, image);
         return LSX4_PS5_EXECUTE_NOT_INITIALIZED;
     }
+
+    ConfigurePs5TranslationSessionForExecutable(
+        std::filesystem::path{path});
 
     const std::lock_guard lock{g_runtime.mutex};
     const auto found = std::ranges::find(
@@ -21995,7 +23093,7 @@ extern "C" int executor_lsx4_ps5_runtime_unload_eboot(
         }
         const auto host = Ps5LoaderHost();
         Funnel::Ps5Desktop::UnloadNextGenExecutable(host, image);
-        ResetPs5TranslationSession();
+        ResetPs5TranslationSession(true);
         SetRuntimeStatus("PS5 module unloaded");
         return LSX4_PS5_EXECUTE_OK;
     }
@@ -22360,6 +23458,8 @@ extern "C" int executor_lsx4_ps5_runtime_launch_eboot(
          entry->size < sizeof(Lsx4Ps5GuestEntry))) {
         return LSX4_PS5_EXECUTE_INVALID_ARGUMENT;
     }
+    (void)Common::ApplyCurrentThreadAffinity(
+        Common::ThreadAffinityClass::LatencyPerformance);
     *result = {};
     std::vector<std::uint64_t> startup_modules;
     {
@@ -22673,6 +23773,12 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
         kernel_files = std::move(g_runtime.kernel_files);
         g_runtime.app0_directory.clear();
         g_runtime.save_data_directory.clear();
+        g_runtime.artifact_root_directory.clear();
+        g_runtime.configured_artifact_title.clear();
+        g_runtime.configured_executable_identity = 0u;
+        g_runtime.active_artifact_title.clear();
+        g_runtime.active_executable_identity = 0u;
+        g_runtime.active_artifact_store_enabled = false;
 #ifdef __ANDROID__
         g_runtime.game_splash_active = false;
         g_runtime.game_splash_presented = false;
@@ -22780,6 +23886,8 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
     }
 #ifdef __ANDROID__
     Lsx4::Ps5Desktop::ResetVulkanPresenter();
+    Lsx4::Ps5Desktop::ConfigureVulkanPipelineCacheIdentity(
+        {}, {});
     if (android_window != nullptr) {
         ANativeWindow_release(android_window);
     }
@@ -22820,6 +23928,13 @@ extern "C" void executor_lsx4_ps5_runtime_reset() {
     if (had_runtime_session) {
         ResetPs5TranslationSession();
     }
+    {
+        const std::lock_guard sidecar_lock{
+            g_ps5_retirement_sidecar_mutex};
+        g_ps5_retirement_sidecar.clear();
+    }
+    g_ps5_retirement_serial.fetch_add(
+        1u, std::memory_order_relaxed);
     const std::lock_guard lock{g_runtime.mutex};
     g_runtime.mappings.Clear();
     g_runtime.status = "PS5 runtime is not initialized";

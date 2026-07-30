@@ -67,6 +67,10 @@ std::optional<Recipe> SelectRecipe(const X86Mnemonic mnemonic) noexcept {
 
 }
 
+bool Supports(const X86Mnemonic mnemonic) noexcept {
+    return SelectRecipe(mnemonic).has_value();
+}
+
 bool Materialize(Xbyak_aarch64::CodeGenerator& code, const X86Mnemonic mnemonic,
                  const XReg& flags, const XReg& result,
                  const XReg& scratch_a, const XReg& scratch_b) noexcept {

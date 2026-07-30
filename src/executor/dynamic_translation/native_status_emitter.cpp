@@ -3,8 +3,6 @@
 
 #include "executor/dynamic_translation/native_status_emitter.h"
 
-#include <array>
-
 namespace Executor::Jit::NativeStatus {
 namespace {
 
@@ -27,20 +25,12 @@ void PublishStatus(Xbyak_aarch64::CodeGenerator& code,
 
 void AppendNzv(Xbyak_aarch64::CodeGenerator& code,
                 const X86FlagLayout& layout) {
-    struct NativeConditionBit {
-        Xbyak_aarch64::Cond condition;
-        std::uint32_t x86_bit;
-    };
-    const std::array<NativeConditionBit, 3> status_bits = {{
-        {Xbyak_aarch64::EQ, layout.zero_bit},
-        {Xbyak_aarch64::MI, layout.sign_bit},
-        {Xbyak_aarch64::VS, layout.overflow_bit},
-    }};
-    for (const auto& status : status_bits) {
-        code.cset(code.x15, status.condition);
-        code.lsl(code.x15, code.x15, status.x86_bit);
-        code.orr(code.x14, code.x14, code.x15);
-    }
+    code.cset(code.x15, Xbyak_aarch64::EQ);
+    code.bfi(code.x14, code.x15, layout.zero_bit, 1);
+    code.cset(code.x15, Xbyak_aarch64::MI);
+    code.bfi(code.x14, code.x15, layout.sign_bit, 1);
+    code.cset(code.x15, Xbyak_aarch64::VS);
+    code.bfi(code.x14, code.x15, layout.overflow_bit, 1);
 }
 
 void AppendParity(Xbyak_aarch64::CodeGenerator& code, const WReg& result,

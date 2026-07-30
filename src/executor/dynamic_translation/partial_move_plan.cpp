@@ -78,7 +78,10 @@ std::optional<PartialMovePlan> PlanPartialPackedMove(
         }
         return PartialMovePlan{.memory_operand = 0,
                                .writes_memory = true,
-                               .source_offset = *source};
+                               .source_offset = *source,
+                               .destination_lane_offset =
+                                   static_cast<std::uint8_t>(
+                                       kind.lane == LaneSelection::High ? 8u : 0u)};
     }
 
     const std::uint8_t memory_index = kind.vex ? 2 : 1;

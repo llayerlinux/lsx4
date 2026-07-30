@@ -74,10 +74,6 @@ public class MainActivity extends Activity {
     private static final String TAG = "LSX4";
     private static final String BUILD_MARKER =
             "lsx4-2026-07-20-r27-game-side-menu";
-    private static final String JIT_PERSISTENT_JIT_CACHE_MARKER =
-            "run-jit-persistent-jit-cache";
-    private static final String JIT_PERSISTENT_JIT_CACHE_FORCE_MARKER =
-            "run-jit-persistent-jit-cache-force";
     private static final String DISABLE_DYNAMIC_SHADOWS_MARKER =
             "run-disable-dynamic-shadows";
     private static final String DISABLE_SSAO_MARKER = "run-disable-ssao";
@@ -94,6 +90,7 @@ public class MainActivity extends Activity {
     private static final String EXTRA_SCAN_GAME_PATH = "scan_game_path";
     private static final String EXTRA_LAUNCH_GAME_PATH = "launch_game_path";
     private static final String EXTRA_GAME_PLATFORM = "game_platform";
+    static final String EXTRA_RENDER_RESOLUTION_MODE = "render_resolution_mode";
     private static final String PLATFORM_PS5 = "ps5";
     private static final String EXTRA_TRANSLATOR_GUEST_ELF_PATH = "translator_guest_elf_path";
     private static final String EXTRA_TRANSLATOR_BRIDGE_LAUNCH = "translator_bridge_launch";
@@ -115,6 +112,8 @@ public class MainActivity extends Activity {
             "run_embedded_box64_mapped_entry";
     private static final String EXTRA_EMBEDDED_AARCH64_JIT_BACKEND =
             "embedded_aarch64_jit_backend";
+    private static final String EXTRA_RUNTIME_JIT_SELFTEST =
+            "runtime_jit_selftest";
     private static final String ACTION_SMOKE_PAD_SUFFIX = ".SMOKE_PAD";
     private static final String ACTION_SMOKE_TEXT_SUFFIX = ".SMOKE_TEXT";
     private static final String ACTION_SMOKE_PIXEL_COPY_SUFFIX = ".SMOKE_PIXEL_COPY";
@@ -194,6 +193,7 @@ public class MainActivity extends Activity {
     private TextView loadingBlocksText;
     private boolean launcherMode;
     private LauncherUi launcherUi;
+    private int renderResolutionMode = SettingsActivity.DEFAULT_RES_MODE;
     private boolean overlayEnabledByPreference;
     private SharedPreferences liveSettings;
     private final SharedPreferences.OnSharedPreferenceChangeListener liveSettingsListener =
@@ -403,7 +403,8 @@ public class MainActivity extends Activity {
         configureLandscapeWindow();
 
         SharedPreferences appSettings = getSharedPreferences(SettingsActivity.PREFS, MODE_PRIVATE);
-        applyExtremePerformanceProfile(appSettings);
+        renderResolutionMode = resolveRenderResolutionMode(getIntent(), appSettings);
+        applyExtremePerformanceProfile(appSettings, renderResolutionMode);
         liveSettings = appSettings;
         liveSettings.registerOnSharedPreferenceChangeListener(liveSettingsListener);
         try {
@@ -449,16 +450,21 @@ public class MainActivity extends Activity {
 
         FrameLayout renderFrame = new FrameLayout(this);
         gameRenderFrame = renderFrame;
-        final int resModeForAspect = fullscreenRender
-                ? appSettings.getInt(
-                        SettingsActivity.K_RES_MODE, SettingsActivity.RES_NATIVE) : 0;
-        final float guestAspect = 16f / 9f;
         SurfaceView renderSurface = new SurfaceView(this) {
             @Override
             protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
                 int w = MeasureSpec.getSize(widthMeasureSpec);
                 int h = MeasureSpec.getSize(heightMeasureSpec);
-                if (resModeForAspect != 0 && w > 0 && h > 0) {
+                if (fullscreenRender
+                        && renderResolutionMode != SettingsActivity.RES_NATIVE
+                        && w > 0 && h > 0) {
+                    int guestWidth =
+                            SettingsActivity.resolutionWidth(renderResolutionMode);
+                    int guestHeight =
+                            SettingsActivity.resolutionHeight(renderResolutionMode);
+                    float guestAspect = guestWidth > 0 && guestHeight > 0
+                            ? (float) guestWidth / (float) guestHeight
+                            : 16f / 9f;
                     if ((float) w / (float) h > guestAspect) {
                         w = Math.round(h * guestAspect);
                     } else {
@@ -472,14 +478,12 @@ public class MainActivity extends Activity {
         renderSurface.setZOrderOnTop(false);
         renderSurface.getHolder().setFormat(PixelFormat.RGBA_8888);
         if (fullscreenRender) {
-            int resMode = appSettings.getInt(
-                    SettingsActivity.K_RES_MODE, SettingsActivity.RES_NATIVE);
-            int outputWidth = SettingsActivity.resolutionWidth(resMode);
-            int outputHeight = SettingsActivity.resolutionHeight(resMode);
+            int outputWidth = SettingsActivity.resolutionWidth(renderResolutionMode);
+            int outputHeight = SettingsActivity.resolutionHeight(renderResolutionMode);
             if (outputWidth > 0 && outputHeight > 0) {
                 renderSurface.getHolder().setFixedSize(outputWidth, outputHeight);
             }
-            Log.i(TAG, "Requested Vulkan output resolution mode=" + resMode
+            Log.i(TAG, "Requested Vulkan output resolution mode=" + renderResolutionMode
                     + " extent=" + outputWidth + "x" + outputHeight);
         }
         renderSurface.getHolder().addCallback(new SurfaceHolder.Callback() {
@@ -637,7 +641,11 @@ public class MainActivity extends Activity {
 
         if (intentFlag(EXTRA_AUTOLOAD_EXISTING_RUNTIME) || isBareLaunch()
                 || hasIntentAutomationExtras()) {
-            root.postDelayed(() -> runIntentAutomation(root), AUTOMATION_START_DELAY_MS);
+            root.postDelayed(
+                    () -> runIntentAutomation(root),
+                    intentFlag(EXTRA_RUNTIME_JIT_SELFTEST)
+                            ? 0
+                            : AUTOMATION_START_DELAY_MS);
         }
         handleExternalControlIntent(getIntent());
     }
@@ -673,6 +681,12 @@ public class MainActivity extends Activity {
         }
         boolean wasFullscreen = fullscreenRender;
         setIntent(intent);
+        int incomingResolutionMode = resolveRenderResolutionMode(intent, liveSettings);
+        if (renderResolutionMode != incomingResolutionMode) {
+            renderResolutionMode = incomingResolutionMode;
+            applyRenderResolutionToSurface();
+            materializeRenderResolutionSetting(new File(getFilesDir(), "lsx4-home"));
+        }
         boolean nextPs5Runtime = PLATFORM_PS5.equalsIgnoreCase(
                 intent.getStringExtra(EXTRA_GAME_PLATFORM));
         if (ps5Runtime != nextPs5Runtime) {
@@ -714,10 +728,27 @@ public class MainActivity extends Activity {
     private void routeIntentToGameActivity(Intent source) {
         Intent routed = source == null ? new Intent() : new Intent(source);
         routed.setClass(this, GameActivity.class);
+        if (!routed.hasExtra(EXTRA_RENDER_RESOLUTION_MODE)) {
+            routed.putExtra(EXTRA_RENDER_RESOLUTION_MODE, resolveRenderResolutionMode(
+                    null, SettingsActivity.prefs(this)));
+        }
         routed.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT |
                 Intent.FLAG_ACTIVITY_SINGLE_TOP);
         routed.removeCategory(Intent.CATEGORY_LAUNCHER);
         startActivity(routed);
+    }
+
+    private static int resolveRenderResolutionMode(
+            Intent intent, SharedPreferences preferences) {
+        int mode = preferences == null
+                ? SettingsActivity.DEFAULT_RES_MODE
+                : preferences.getInt(
+                        SettingsActivity.K_RES_MODE, SettingsActivity.DEFAULT_RES_MODE);
+        if (intent != null && intent.hasExtra(EXTRA_RENDER_RESOLUTION_MODE)) {
+            mode = intent.getIntExtra(EXTRA_RENDER_RESOLUTION_MODE, mode);
+        }
+        return SettingsActivity.resolutionModeAtPosition(
+                SettingsActivity.resolutionModeToPosition(mode));
     }
 
     private void synchronizeGameMenuPreferences(Intent intent) {
@@ -840,6 +871,7 @@ public class MainActivity extends Activity {
                 " validate=" + intentFlag(EXTRA_VALIDATE_EMBEDDED_BOX64_MAPPED_ENTRY) +
                 " run=" + intentFlag(EXTRA_RUN_EMBEDDED_BOX64_MAPPED_ENTRY) +
                 " jit=" + intentFlag(EXTRA_EMBEDDED_AARCH64_JIT_BACKEND) +
+                " jitSelfTest=" + intentFlag(EXTRA_RUNTIME_JIT_SELFTEST) +
                 " fullscreen=" + intentFlag(EXTRA_FULLSCREEN_RENDER));
 
         boolean useTranslatorBridge = intentFlag(EXTRA_TRANSLATOR_BRIDGE_LAUNCH) ||
@@ -850,6 +882,19 @@ public class MainActivity extends Activity {
         loadRuntimeFromFile("Existing sandbox runtime");
         if (!runtimeLoaded) {
             append("Aborting automation: runtime failed to load.");
+            return;
+        }
+        if (intentFlag(EXTRA_RUNTIME_JIT_SELFTEST)) {
+            try {
+                String result = RuntimeBridge.jitSelfTest();
+                append("EXECUTOR_RUNTIME_JIT_SELFTEST=" +
+                        (result == null || result.isEmpty()
+                                ? "{\"ok\":false,\"failure\":\"unavailable\"}"
+                                : result));
+            } catch (Throwable error) {
+                append("EXECUTOR_RUNTIME_JIT_SELFTEST={\"ok\":false,\"failure\":\"" +
+                        sanitizeJson(String.valueOf(error.getMessage())) + "\"}");
+            }
             return;
         }
         if (intentFlag(EXTRA_AUTOINIT_RUNTIME) || isBareLaunch() || hasIntentAutomationExtras()) {
@@ -1405,6 +1450,7 @@ public class MainActivity extends Activity {
                 || intentFlag(intent, EXTRA_AUTOINIT_RUNTIME)
                 || intentFlag(intent, EXTRA_FULLSCREEN_RENDER)
                 || intentFlag(intent, EXTRA_EMBEDDED_AARCH64_JIT_BACKEND)
+                || intentFlag(intent, EXTRA_RUNTIME_JIT_SELFTEST)
                 || intentFlag(intent, EXTRA_PRESENT_TEST_PATTERN)
                 || intentFlag(intent, EXTRA_PRESENT_HOMEBREW_LOADER_FRAME)
                 || intentFlag(intent, EXTRA_PRESENT_FRAME_DUMP_ONLY)
@@ -2624,20 +2670,11 @@ public class MainActivity extends Activity {
             Log.i(TAG, "EXECUTOR_LIVE_SETTING audio result=" + result);
         }
         if (key == null || SettingsActivity.K_RES_MODE.equals(key)) {
+            renderResolutionMode = resolveRenderResolutionMode(
+                    key == null ? getIntent() : null, preferences);
             File root = new File(getFilesDir(), "lsx4-home");
             materializeRenderResolutionSetting(root);
-            if (fullscreenRender && renderSurfaceView != null) {
-                int mode = preferences.getInt(
-                        SettingsActivity.K_RES_MODE, SettingsActivity.RES_NATIVE);
-                int width = SettingsActivity.resolutionWidth(mode);
-                int height = SettingsActivity.resolutionHeight(mode);
-                if (width > 0 && height > 0) {
-                    renderSurfaceView.getHolder().setFixedSize(width, height);
-                } else {
-                    renderSurfaceView.getHolder().setSizeFromLayout();
-                }
-                renderSurfaceView.requestLayout();
-            }
+            applyRenderResolutionToSurface();
         }
         if (key == null || SettingsActivity.K_GPU_BACKEND.equals(key)) {
             try {
@@ -2659,21 +2696,40 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void applyExtremePerformanceProfile(SharedPreferences appSettings) {
+    private void applyRenderResolutionToSurface() {
+        if (!fullscreenRender || renderSurfaceView == null) {
+            return;
+        }
+        int width = SettingsActivity.resolutionWidth(renderResolutionMode);
+        int height = SettingsActivity.resolutionHeight(renderResolutionMode);
+        if (width > 0 && height > 0) {
+            renderSurfaceView.getHolder().setFixedSize(width, height);
+        } else {
+            renderSurfaceView.getHolder().setSizeFromLayout();
+        }
+        renderSurfaceView.requestLayout();
+        Log.i(TAG, "Applied Vulkan output resolution mode=" + renderResolutionMode
+                + " extent=" + width + "x" + height);
+    }
+
+    private void applyExtremePerformanceProfile(
+            SharedPreferences appSettings, int defaultResolutionMode) {
         if (appSettings == null) {
             return;
         }
         SharedPreferences.Editor editor = appSettings.edit();
-        editor.putInt(SettingsActivity.K_RES_MODE, SettingsActivity.RES_360P);
+        if (!appSettings.contains(SettingsActivity.K_RES_MODE)) {
+            editor.putInt(SettingsActivity.K_RES_MODE, defaultResolutionMode);
+        }
         editor.putBoolean(SettingsActivity.K_DISABLE_DYNAMIC_SHADOWS, true);
         editor.putBoolean(SettingsActivity.K_DISABLE_SSAO, true);
         editor.putBoolean(SettingsActivity.K_DISABLE_MOTION_BLUR, true);
         editor.putBoolean(SettingsActivity.K_DISABLE_DEPTH_OF_FIELD, true);
         editor.putBoolean(SettingsActivity.K_DISABLE_ANTI_ALIASING, true);
         editor.putBoolean(SettingsActivity.K_DISABLE_CHROMATIC_ABERRATION, true);
-        editor.putBoolean(SettingsActivity.K_PERSISTENT_JIT_CACHE, true);
         editor.apply();
-        Log.i(TAG, "Extreme performance profile enabled: 360p + heavy graphics effects disabled");
+        Log.i(TAG, "Extreme performance profile enabled: render resolution="
+                + defaultResolutionMode + " (default-only) + heavy graphics effects disabled");
     }
 
     private static boolean isGraphicsPatchPreference(String key) {
@@ -2792,6 +2848,57 @@ public class MainActivity extends Activity {
         }
         if (current.length > 20 && current[20] != 0) {
             managedOptimization.append("  NO-RB");
+        }
+        if (current.length > 21 && current[21] != 0) {
+            managedOptimization.append("  RB-BATCH");
+        }
+        if (current.length > 22 && current[22] != 0) {
+            managedOptimization.append("  VK-DEDUP");
+        }
+        if (current.length > 23 && current[23] != 0) {
+            managedOptimization.append("  ASYNC-PIPE");
+        }
+        if (current.length > 24 && current[24] != 0) {
+            managedOptimization.append("  MOBILE");
+            if (current.length > 53) {
+                managedOptimization.append(current[53]).append('%');
+            }
+            if (current.length > 65 && current[65] != 0) {
+                managedOptimization.append("-DRS");
+            }
+        }
+        if (current.length > 25 && current[25] != 0) {
+            managedOptimization.append("  AUDIO-SIMD");
+        }
+        if (current.length > 26 && current[26] != 0) {
+            managedOptimization.append("  ANISO").append(current[26]).append('x');
+        }
+        if (current.length > 27 && current[27] != 0) {
+            managedOptimization.append("  JIT-T");
+        }
+        if (current.length > 28 && current[28] != 0) {
+            managedOptimization.append("  TRACE");
+        }
+        if (current.length > 85 && current[85] != 0) {
+            managedOptimization.append("  T1[")
+                    .append(current[84]).append('/')
+                    .append(current[85]).append(']');
+            if (current.length > 86 && current[86] != 0) {
+                managedOptimization.append("-D")
+                        .append(current[86]);
+            }
+        }
+        if (current.length > 75 && current[75] != 0) {
+            managedOptimization.append("  VK-BATCH")
+                    .append(current[75]);
+        }
+        if (current.length > 7 && current[7] != 0) {
+            managedOptimization.append("  DRAW-ELIDE")
+                    .append(current[7]);
+        }
+        if (current.length > 77 && current[77] != 0) {
+            managedOptimization.append("  VK-REPLAY")
+                    .append(current[77]);
         }
         debugHudFps.setText(String.format(Locale.US, "FPS %,d", presentRate));
         debugHud.setText(String.format(Locale.US,
@@ -4087,34 +4194,129 @@ public class MainActivity extends Activity {
                 SettingsActivity.K_ARM_GPU_FAST_PATH, false);
         boolean coarseFragment2x2 = preferences.getBoolean(
                 SettingsActivity.K_COARSE_FRAGMENT_2X2, false);
+        int anisotropyMode = preferences.contains(
+                SettingsActivity.K_ANISOTROPY_MODE)
+                ? preferences.getInt(
+                        SettingsActivity.K_ANISOTROPY_MODE,
+                        SettingsActivity.ANISOTROPY_GUEST)
+                : (preferences.getBoolean(
+                        SettingsActivity.K_LIMIT_ANISOTROPY_2X, false)
+                        ? SettingsActivity.ANISOTROPY_2X
+                        : SettingsActivity.ANISOTROPY_GUEST);
         boolean disableVkRobustness = preferences.getBoolean(
                 SettingsActivity.K_DISABLE_VK_ROBUSTNESS, false);
         boolean tieredJit = preferences.getBoolean(
                 SettingsActivity.K_TIERED_JIT, false);
         boolean jitTraceCompilation = preferences.getBoolean(
                 SettingsActivity.K_JIT_TRACE_COMPILATION, false);
+        boolean readbackBatching = preferences.getBoolean(
+                SettingsActivity.K_READBACK_BATCHING, true);
+        boolean vulkanDriverCalls = preferences.getBoolean(
+                SettingsActivity.K_VULKAN_DRIVER_CALLS, true);
+        boolean asyncPipeline = preferences.getBoolean(
+                SettingsActivity.K_ASYNC_PIPELINE, true);
+        boolean adaptiveMobileGpu = preferences.getBoolean(
+                SettingsActivity.K_ADAPTIVE_MOBILE_GPU, true);
+        boolean audioSimd = preferences.getBoolean(
+                SettingsActivity.K_AUDIO_SIMD, true);
+        boolean fastGuestMemory = preferences.getBoolean(
+                SettingsActivity.K_FAST_GUEST_MEMORY, false);
         if (jitTraceCompilation) {
             tieredJit = true;
         }
-        int armResult = RuntimeBridge.setManagedOptimization(
-                RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH, armGpuFastPath);
-        int coarseResult = RuntimeBridge.setManagedOptimization(
-                RuntimeBridge.MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2, coarseFragment2x2);
-        int robustnessResult = RuntimeBridge.setManagedOptimization(
-                RuntimeBridge.MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS,
-                disableVkRobustness);
-        int tieredJitResult = RuntimeBridge.setManagedOptimization(
-                RuntimeBridge.MANAGED_OPTIMIZATION_TIERED_JIT, tieredJit);
-        int traceJitResult = RuntimeBridge.setManagedOptimization(
+        boolean[] requested = new boolean[14];
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH] = armGpuFastPath;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2] =
+                coarseFragment2x2;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS] =
+                disableVkRobustness;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_TIERED_JIT] = tieredJit;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_JIT_TRACE_COMPILATION] =
+                jitTraceCompilation;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_LIMIT_ANISOTROPY_2X] =
+                anisotropyMode == SettingsActivity.ANISOTROPY_2X;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_FORCE_ANISOTROPY_1X] =
+                anisotropyMode == SettingsActivity.ANISOTROPY_1X;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_READBACK_BATCHING] =
+                readbackBatching;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_VULKAN_DRIVER_CALLS] =
+                vulkanDriverCalls;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_ASYNC_PIPELINE] = asyncPipeline;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_ADAPTIVE_MOBILE_GPU] =
+                adaptiveMobileGpu;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_AUDIO_SIMD] = audioSimd;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY] =
+                fastGuestMemory;
+
+        // Establish a deterministic A/B baseline before enabling the requested
+        // set. Trace must be disabled before Tiered JIT; the final enable phase
+        // uses the opposite dependency order. Native metric resets happen as
+        // part of each state transition, so no prior run leaks into this one.
+        int[] resetOrder = {
                 RuntimeBridge.MANAGED_OPTIMIZATION_JIT_TRACE_COMPILATION,
-                jitTraceCompilation);
+                RuntimeBridge.MANAGED_OPTIMIZATION_TIERED_JIT,
+                RuntimeBridge.MANAGED_OPTIMIZATION_ADAPTIVE_MOBILE_GPU,
+                RuntimeBridge.MANAGED_OPTIMIZATION_ASYNC_PIPELINE,
+                RuntimeBridge.MANAGED_OPTIMIZATION_VULKAN_DRIVER_CALLS,
+                RuntimeBridge.MANAGED_OPTIMIZATION_READBACK_BATCHING,
+                RuntimeBridge.MANAGED_OPTIMIZATION_AUDIO_SIMD,
+                RuntimeBridge.MANAGED_OPTIMIZATION_LIMIT_ANISOTROPY_2X,
+                RuntimeBridge.MANAGED_OPTIMIZATION_FORCE_ANISOTROPY_1X,
+                RuntimeBridge.MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS,
+                RuntimeBridge.MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2,
+                RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH,
+                RuntimeBridge.MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY
+        };
+        int[] resetResults = new int[14];
+        int[] finalResults = new int[14];
+        for (int option : resetOrder) {
+            int result = RuntimeBridge.setManagedOptimization(option, false);
+            resetResults[option] = result;
+            finalResults[option] = result;
+        }
+        int[] enableOrder = {
+                RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH,
+                RuntimeBridge.MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2,
+                RuntimeBridge.MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS,
+                RuntimeBridge.MANAGED_OPTIMIZATION_FORCE_ANISOTROPY_1X,
+                RuntimeBridge.MANAGED_OPTIMIZATION_LIMIT_ANISOTROPY_2X,
+                RuntimeBridge.MANAGED_OPTIMIZATION_READBACK_BATCHING,
+                RuntimeBridge.MANAGED_OPTIMIZATION_VULKAN_DRIVER_CALLS,
+                RuntimeBridge.MANAGED_OPTIMIZATION_ASYNC_PIPELINE,
+                RuntimeBridge.MANAGED_OPTIMIZATION_ADAPTIVE_MOBILE_GPU,
+                RuntimeBridge.MANAGED_OPTIMIZATION_TIERED_JIT,
+                RuntimeBridge.MANAGED_OPTIMIZATION_JIT_TRACE_COMPILATION,
+                RuntimeBridge.MANAGED_OPTIMIZATION_AUDIO_SIMD,
+                RuntimeBridge.MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY
+        };
+        for (int option : enableOrder) {
+            if (requested[option]) {
+                finalResults[option] =
+                        RuntimeBridge.setManagedOptimization(option, true);
+            }
+        }
         Log.i(TAG, "EXECUTOR_MANAGED_OPTIMIZATION armGpuFastPath=" + armGpuFastPath
                 + " coarseFragment2x2=" + coarseFragment2x2
+                + " anisotropyMode=" + anisotropyMode
                 + " disableVkRobustness=" + disableVkRobustness
                 + " tieredJit=" + tieredJit
                 + " traceJit=" + jitTraceCompilation
-                + " results=" + armResult + "/" + coarseResult + "/" + robustnessResult
-                + "/" + tieredJitResult + "/" + traceJitResult);
+                + " readbackBatching=" + readbackBatching
+                + " vulkanDriverCalls=" + vulkanDriverCalls
+                + " asyncPipeline=" + asyncPipeline
+                + " adaptiveMobileGpu=" + adaptiveMobileGpu
+                + " audioSimd=" + audioSimd
+                + " fastGuestMemory=" + fastGuestMemory
+                + " resetResults=" + resetResults[1] + "/" + resetResults[2] + "/"
+                + resetResults[3] + "/" + resetResults[4] + "/" + resetResults[5] + "/"
+                + resetResults[6] + "/" + resetResults[7] + "/" + resetResults[8] + "/"
+                + resetResults[9] + "/" + resetResults[10] + "/" + resetResults[11]
+                + "/" + resetResults[12] + "/" + resetResults[13]
+                + " finalResults=" + finalResults[1] + "/" + finalResults[2] + "/"
+                + finalResults[3] + "/" + finalResults[4] + "/" + finalResults[5] + "/"
+                + finalResults[6] + "/" + finalResults[7] + "/" + finalResults[8] + "/"
+                + finalResults[9] + "/" + finalResults[10] + "/" + finalResults[11]
+                + "/" + finalResults[12] + "/" + finalResults[13]);
     }
 
     private void initializeRuntime() {
@@ -4230,34 +4432,10 @@ public class MainActivity extends Activity {
     }
 
     private void materializeJitPersistentJitCacheSetting(File root) throws Exception {
-        if (!root.isDirectory() && !root.mkdirs()) {
-            throw new IllegalStateException("Cannot create compiled-block cache root: " + root);
-        }
-        final boolean requestedByUser = SettingsActivity.prefs(this).getBoolean(
-                SettingsActivity.K_PERSISTENT_JIT_CACHE, true);
-        final File forceMarker = new File(root, JIT_PERSISTENT_JIT_CACHE_FORCE_MARKER);
-        final boolean forcedByAutomation = forceMarker.isFile();
-        final boolean enabled = requestedByUser || forcedByAutomation;
-        final File marker = new File(root, JIT_PERSISTENT_JIT_CACHE_MARKER);
-        try {
-            if (enabled) {
-                if (marker.exists() && !marker.isFile()) {
-                    append("Compiled-block cache unavailable: marker is not a file: " + marker);
-                    return;
-                }
-                if (!marker.isFile()) {
-                    writeSmallFile(marker, "1\n");
-                }
-            } else if (marker.exists() && !marker.delete()) {
-                append("Compiled-block cache disabled, but marker could not be removed: " + marker);
-                return;
-            }
-        } catch (Exception e) {
-            append("Compiled-block cache unavailable; continuing without it: " + e.getMessage());
-            return;
-        }
+        final boolean enabled = GameCacheManager.applyStoredSetting(
+                this, SettingsActivity.prefs(this));
+        final File marker = GameCacheManager.enableMarker(this);
         append("Persistent compiled block cache: enabled=" + enabled +
-                " forced=" + forcedByAutomation +
                 " marker=" + marker.getAbsolutePath());
     }
 
@@ -4309,8 +4487,7 @@ public class MainActivity extends Activity {
     }
 
     private void materializeRenderResolutionSetting(File root) {
-        final int mode = SettingsActivity.prefs(this).getInt(
-                SettingsActivity.K_RES_MODE, SettingsActivity.RES_NATIVE);
+        final int mode = renderResolutionMode;
         final int width = SettingsActivity.resolutionWidth(mode);
         final int height = SettingsActivity.resolutionHeight(mode);
         final File config = new File(root, RENDER_RESOLUTION_CONFIG);

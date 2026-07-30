@@ -36,6 +36,25 @@ struct TranslationCounters {
     std::uint64_t stored_native_written{};
     std::uint64_t stored_native_fallbacks{};
     std::uint64_t stored_native_rejected{};
+    std::uint64_t tier0_compiled{};
+    std::uint64_t tier0_active{};
+    std::uint64_t tier1_queued{};
+    std::uint64_t tier1_compiled{};
+    std::uint64_t tier1_active{};
+    std::uint64_t tier1_promotions{};
+    std::uint64_t tier1_deopts{};
+    std::uint64_t tier1_rejected{};
+    std::uint64_t tier1_safe_handoffs{};
+    std::uint64_t tier1_loop_osr_handoffs{};
+    std::uint64_t tier1_compile_time_us{};
+    std::uint64_t tier1_generated_bytes{};
+    std::uint64_t gpr_cached_blocks{};
+    std::uint64_t gpr_cached_registers{};
+    std::uint64_t gpr_estimated_loads_stores_avoided{};
+    std::uint64_t gpr_cache_shape_rejections{};
+    std::uint64_t simd_cached_blocks{};
+    std::uint64_t simd_cached_halves{};
+    std::uint64_t simd_estimated_loads_stores_avoided{};
 };
 
 struct HleLeafOutcome {
