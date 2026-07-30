@@ -2218,6 +2218,7 @@ void RestoreJitFaultResume(JitSynchronousFaultResumeFrame*) {
 thread_local JitSynchronousFaultResumeFrame* g_jit_fault_resume_frame = nullptr;
 thread_local JitDeferredGuestFault g_jit_deferred_guest_fault{};
 thread_local volatile sig_atomic_t g_jit_signal_context_fault_return_armed = 0;
+thread_local volatile std::uintptr_t g_jit_signal_context_return_sp = 0;
 
 void PrepareFaultResumeFrame(
     JitSynchronousFaultResumeFrame& frame, LsxMachineImage* const state,
@@ -2252,6 +2253,28 @@ std::uint64_t ReturnFromJitSignalContextFault() {
         "ldp x29, x30, [sp], #96\n"
         "mov x0, xzr\n"
         "ret\n");
+}
+
+__attribute__((noinline))
+std::uint64_t InvokeHostBlockWithSignalLanding(
+    const Arm64BlockEntry entry, LsxMachineImage* const state,
+    volatile std::uintptr_t* const return_sp) {
+    std::uintptr_t caller_sp = 0;
+    asm volatile("mov %0, sp" : "=r"(caller_sp) : : "memory");
+    // Shared-chain external entries allocate this fixed frame before entering
+    // the resident body. A helper can have an arbitrary host call stack when
+    // guest memory faults, so retain the generated frame base explicitly
+    // instead of trying to unwind frame pointers from a signal handler.
+    *return_sp = caller_sp - kGenericSharedChainFrameSize;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    try {
+        const std::uint64_t result = std::invoke(entry, state);
+        *return_sp = 0;
+        return result;
+    } catch (...) {
+        *return_sp = 0;
+        throw;
+    }
 }
 #endif
 
@@ -2325,15 +2348,19 @@ bool ExecuteHostBlockWithSignalContextFaultReturn(
     }
 #if defined(__ANDROID__) && defined(__aarch64__)
     g_jit_deferred_guest_fault = {};
+    g_jit_signal_context_return_sp = 0;
     g_jit_signal_context_fault_return_armed = 1;
     std::atomic_signal_fence(std::memory_order_seq_cst);
     try {
-        result = InvokeHostBlockUnchecked(entry, state);
+        result = InvokeHostBlockWithSignalLanding(
+            entry, state, &g_jit_signal_context_return_sp);
     } catch (...) {
         g_jit_signal_context_fault_return_armed = 0;
+        g_jit_signal_context_return_sp = 0;
         throw;
     }
     g_jit_signal_context_fault_return_armed = 0;
+    g_jit_signal_context_return_sp = 0;
     std::atomic_signal_fence(std::memory_order_seq_cst);
     if (g_jit_deferred_guest_fault.valid == 0) {
         return false;
@@ -2404,70 +2431,6 @@ bool BlockNeedsSynchronousFaultResume(const LsxDecodedRegion& block) {
         }
     }
     return false;
-}
-
-bool BlockSupportsSignalContextFaultReturn(const LsxDecodedRegion& block) {
-    if (block.instructions.empty()) {
-        return false;
-    }
-    for (std::size_t index = 0; index < block.instructions.size(); ++index) {
-        const LsxDecodedOp& ir = block.instructions[index];
-        const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
-        if (mnemonic == X86_MNEMONIC_JMP ||
-            IsConditionalBranchMnemonic(mnemonic)) {
-            continue;
-        }
-        switch (mnemonic) {
-        case X86_MNEMONIC_NOP:
-        case X86_MNEMONIC_MOV:
-        case X86_MNEMONIC_MOVBE:
-        case X86_MNEMONIC_MOVZX:
-        case X86_MNEMONIC_MOVSX:
-        case X86_MNEMONIC_MOVSXD:
-        case X86_MNEMONIC_LEA:
-        case X86_MNEMONIC_ADD:
-        case X86_MNEMONIC_SUB:
-        case X86_MNEMONIC_AND:
-        case X86_MNEMONIC_OR:
-        case X86_MNEMONIC_XOR:
-        case X86_MNEMONIC_CMP:
-        case X86_MNEMONIC_TEST:
-        case X86_MNEMONIC_ANDN:
-        case X86_MNEMONIC_INC:
-        case X86_MNEMONIC_DEC:
-        case X86_MNEMONIC_NEG:
-        case X86_MNEMONIC_NOT:
-        case X86_MNEMONIC_BEXTR:
-        case X86_MNEMONIC_BLSI:
-        case X86_MNEMONIC_BLSR:
-        case X86_MNEMONIC_SHLX:
-        case X86_MNEMONIC_SHRX:
-        case X86_MNEMONIC_SARX:
-        case X86_MNEMONIC_RORX:
-        case X86_MNEMONIC_SHL:
-        case X86_MNEMONIC_SHR:
-        case X86_MNEMONIC_SAR:
-        case X86_MNEMONIC_MOVSS:
-        case X86_MNEMONIC_MOVSD:
-        case X86_MNEMONIC_VMOVSS:
-        case X86_MNEMONIC_VMOVSD:
-        case X86_MNEMONIC_ADDSS:
-        case X86_MNEMONIC_SUBSS:
-        case X86_MNEMONIC_MULSS:
-        case X86_MNEMONIC_VADDSS:
-        case X86_MNEMONIC_VSUBSS:
-        case X86_MNEMONIC_VMULSS:
-            break;
-        case X86_MNEMONIC_IMUL:
-            if (ir.operand_count == 2 || ir.operand_count == 3) {
-                break;
-            }
-            return false;
-        default:
-            return false;
-        }
-    }
-    return true;
 }
 
 bool BlockRequiresDispatcherBoundary(const LsxDecodedRegion& block) {
@@ -6104,7 +6067,6 @@ public:
                         block.flags,
                         TranslationFeature::SynchronousFaultResume);
                 const bool signal_context_fault_return =
-                    needs_synchronous_fault_resume &&
                     TranslationHasFeature(
                         block.flags, TranslationFeature::NativeCode) &&
                     !JitLiveCheckedNativeEnabled() &&
@@ -6813,8 +6775,7 @@ public:
             plan.synchronous_fault_resume =
                 BlockNeedsSynchronousFaultResume(decoded);
             plan.signal_context_fault_return =
-                plan.synchronous_fault_resume &&
-                BlockSupportsSignalContextFaultReturn(decoded);
+                plan.chain_abi;
             plan.dispatcher_boundary =
                 BlockRequiresDispatcherBoundary(decoded) ||
                 IsDirectHleBoundary(decoded.start_rip);
@@ -8038,11 +7999,11 @@ public:
         if (BlockNeedsSynchronousFaultResume(*decoded)) {
             TranslationEnableFeature(result.flags,
                                      TranslationFeature::SynchronousFaultResume);
-            if (BlockSupportsSignalContextFaultReturn(*decoded)) {
-                TranslationEnableFeature(
-                    result.flags,
-                    TranslationFeature::SignalContextFaultReturn);
-            }
+        }
+        if (compiled_native && compiled_chain_abi) {
+            TranslationEnableFeature(
+                result.flags,
+                TranslationFeature::SignalContextFaultReturn);
         }
         if (BlockRequiresDispatcherBoundary(*decoded) ||
             IsDirectHleBoundary(guest_rip)) {
@@ -9618,56 +9579,11 @@ void RetiringTranslationRuntime::CompileTieredTrace(
 
         const bool faultable_trace =
             BlockNeedsSynchronousFaultResume(plan.combined);
-        const bool signal_context_faultable_trace =
-            faultable_trace &&
-            BlockSupportsSignalContextFaultReturn(plan.combined);
-        const bool read_only_poll_trace =
-            faultable_trace && plan.loop_head_osr &&
-            plan.members.size() >= 2 &&
-            std::ranges::any_of(
-                plan.combined.instructions,
-                [](const LsxDecodedOp& ir) {
-                    return std::ranges::any_of(
-                        std::span{ir.operands}.first(ir.operand_count),
-                        [](const LsxOperandRecord& operand) {
-                            return operand.type == X86_OPERAND_TYPE_MEMORY &&
-                                   (operand.actions &
-                                    X86_OPERAND_ACTION_MASK_READ) != 0;
-                        });
-                }) &&
-            std::ranges::all_of(
-                plan.combined.instructions,
-                [](const LsxDecodedOp& ir) {
-                    const auto mnemonic =
-                        static_cast<X86Mnemonic>(ir.mnemonic);
-                    if (IsConditionalBranchMnemonic(mnemonic) ||
-                        mnemonic == X86_MNEMONIC_NOP ||
-                        mnemonic == X86_MNEMONIC_PAUSE) {
-                        return true;
-                    }
-                    if (mnemonic != X86_MNEMONIC_CMP &&
-                        mnemonic != X86_MNEMONIC_TEST) {
-                        return false;
-                    }
-                    return std::ranges::none_of(
-                        std::span{ir.operands}.first(ir.operand_count),
-                        [](const LsxOperandRecord& operand) {
-                            return operand.type == X86_OPERAND_TYPE_MEMORY &&
-                                   (operand.actions &
-                                    X86_OPERAND_ACTION_MASK_WRITE) != 0;
-                        });
-                });
-        // The native emitter publishes per-instruction recovery descriptors
-        // for cached GPR/SIMD state. Admit bounded straight-line faultable
-        // traces, but keep faultable loops and internal guarded exits on the
-        // conservative baseline: their combined recovery/rollback path can
-        // otherwise observe a fault between cached-state handoffs.
-        if (faultable_trace && !signal_context_faultable_trace &&
-            !read_only_poll_trace &&
-            (plan.loop_head_osr || !plan.guards.empty())) {
-            reject();
-            return;
-        }
+        // Every T2 body uses the shared chain frame. Direct accesses publish
+        // exact recovery descriptors, while semantic/helper paths synchronize
+        // machine state before leaving generated code. The signal landing
+        // contract therefore covers faultable loops and guarded regions
+        // without a per-entry setjmp frame.
         const LsxDecodedOp& terminator = plan.combined.instructions.back();
         const auto mnemonic = static_cast<X86Mnemonic>(terminator.mnemonic);
         if (mnemonic == X86_MNEMONIC_RET ||
@@ -10270,6 +10186,15 @@ void RetiringTranslationRuntime::CompileTier1Block(
                             LocalJitTier::Tier1);
                     promoted.reserved_1c =
                         snapshot.revision + 1u;
+                    if (chain_abi) {
+                        TranslationEnableFeature(
+                            promoted.flags,
+                            TranslationFeature::SignalContextFaultReturn);
+                    } else {
+                        TranslationDisableFeature(
+                            promoted.flags,
+                            TranslationFeature::SignalContextFaultReturn);
+                    }
                     current->block = promoted;
                     current->tier1_published_external =
                         chain_abi ? external : direct;
@@ -11632,15 +11557,23 @@ LsxMachineImage* ActiveSignalContextFaultState(
     const void* const raw_context) noexcept {
 #if defined(__ANDROID__) && defined(__aarch64__)
     if (g_jit_signal_context_fault_return_armed == 0 ||
-        !SignalContextPcIsGeneratedCode(raw_context) ||
-        raw_context == nullptr) {
+        g_jit_signal_context_return_sp == 0 || raw_context == nullptr) {
         return nullptr;
     }
     const auto* const context =
         static_cast<const ucontext_t*>(raw_context);
     auto* const state = reinterpret_cast<LsxMachineImage*>(
         static_cast<std::uintptr_t>(context->uc_mcontext.regs[19]));
-    return state != nullptr && state == FindActiveMachineImage()
+    if (state == nullptr || state != FindActiveMachineImage()) {
+        return nullptr;
+    }
+    // Direct generated accesses publish an exact descriptor in x21. Helpers
+    // publish the current guest instruction through the existing TLS slot and
+    // preserve x19 by the AArch64 ABI. Require one of those two witnesses so an
+    // unrelated host fault is never converted into a guest fault.
+    const bool generated = SignalContextPcIsGeneratedCode(raw_context);
+    return context->uc_mcontext.regs[21] != 0 ||
+                   (!generated && CurrentPublishedFaultInstruction())
                ? state
                : nullptr;
 #else
@@ -11672,10 +11605,12 @@ executor_jit_defer_synchronous_guest_fault(
     if (fault_state == nullptr) {
         return 0;
     }
-    if (SignalContextPcIsGeneratedCode(raw_context)) {
-        if (raw_context == nullptr) {
-            return 0;
-        }
+    if (raw_context == nullptr) {
+        return 0;
+    }
+    const bool generated_fault =
+        SignalContextPcIsGeneratedCode(raw_context);
+    {
         const auto* const context =
             static_cast<const ucontext_t*>(raw_context);
         const std::uint64_t descriptor =
@@ -11693,7 +11628,8 @@ executor_jit_defer_synchronous_guest_fault(
             static_cast<std::uint32_t>(
                 context->uc_mcontext.regs[28]);
     }
-    if (!RestoreTieredFaultRegisterCaches(
+    if (generated_fault &&
+        !RestoreTieredFaultRegisterCaches(
             *fault_state, raw_context)) {
         return 0;
     }
@@ -11718,7 +11654,8 @@ executor_jit_defer_synchronous_guest_fault(
         auto* const context =
             const_cast<ucontext_t*>(
                 static_cast<const ucontext_t*>(raw_context));
-        context->uc_mcontext.sp = context->uc_mcontext.regs[29];
+        context->uc_mcontext.sp =
+            g_jit_signal_context_return_sp;
         context->uc_mcontext.pc =
             reinterpret_cast<std::uintptr_t>(
                 &ReturnFromJitSignalContextFault);
@@ -11745,6 +11682,9 @@ executor_jit_has_synchronous_guest_fault_frame(
     const void* const raw_context) {
 #if defined(__ANDROID__) && defined(__aarch64__)
     auto* const frame = ActiveSynchronousFaultFrame();
+    if (ActiveSignalContextFaultState(raw_context) != nullptr) {
+        return 1;
+    }
     // The Android SIGSEGV/SIGBUS route calls this before deferring a hardware
     // fault. Helpers still publish through the machine image. Direct generated
     // memory accesses keep the exact descriptor in x21 so the hot path avoids
@@ -11754,8 +11694,7 @@ executor_jit_has_synchronous_guest_fault_frame(
         const auto* const context =
             static_cast<const ucontext_t*>(raw_context);
         if (context->uc_mcontext.regs[21] != 0) {
-            if (frame != nullptr ||
-                ActiveSignalContextFaultState(raw_context) != nullptr) {
+            if (frame != nullptr) {
                 return 1;
             }
         }
