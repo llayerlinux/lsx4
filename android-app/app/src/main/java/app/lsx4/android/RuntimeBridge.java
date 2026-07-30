@@ -8,6 +8,14 @@ public final class RuntimeBridge {
     public static final int MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS = 3;
     public static final int MANAGED_OPTIMIZATION_TIERED_JIT = 4;
     public static final int MANAGED_OPTIMIZATION_JIT_TRACE_COMPILATION = 5;
+    public static final int MANAGED_OPTIMIZATION_LIMIT_ANISOTROPY_2X = 6;
+    public static final int MANAGED_OPTIMIZATION_READBACK_BATCHING = 7;
+    public static final int MANAGED_OPTIMIZATION_VULKAN_DRIVER_CALLS = 8;
+    public static final int MANAGED_OPTIMIZATION_ASYNC_PIPELINE = 9;
+    public static final int MANAGED_OPTIMIZATION_ADAPTIVE_MOBILE_GPU = 10;
+    public static final int MANAGED_OPTIMIZATION_AUDIO_SIMD = 11;
+    public static final int MANAGED_OPTIMIZATION_FORCE_ANISOTROPY_1X = 12;
+    public static final int MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY = 13;
 
     static {
         System.loadLibrary("lsx_runtime_bridge");

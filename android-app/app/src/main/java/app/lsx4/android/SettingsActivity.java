@@ -1,11 +1,15 @@
 package app.lsx4.android;
 
 import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.ColorFilter;
 import android.graphics.Paint;
@@ -24,6 +28,7 @@ import android.view.ViewGroup;
 import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.CheckBox;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
@@ -40,6 +45,7 @@ import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.List;
+import java.util.Locale;
 
 public final class SettingsActivity extends Activity {
     public static final String PREFS = "lsx4_settings";
@@ -63,6 +69,14 @@ public final class SettingsActivity extends Activity {
     public static final String K_DISABLE_VK_ROBUSTNESS = "managed_disable_vk_robustness";
     public static final String K_TIERED_JIT = "managed_tiered_jit";
     public static final String K_JIT_TRACE_COMPILATION = "managed_jit_trace_compilation";
+    public static final String K_LIMIT_ANISOTROPY_2X = "managed_limit_anisotropy_2x";
+    public static final String K_ANISOTROPY_MODE = "managed_anisotropy_mode";
+    public static final String K_READBACK_BATCHING = "managed_readback_batching";
+    public static final String K_VULKAN_DRIVER_CALLS = "managed_vulkan_driver_calls";
+    public static final String K_ASYNC_PIPELINE = "managed_async_pipeline";
+    public static final String K_ADAPTIVE_MOBILE_GPU = "managed_adaptive_mobile_gpu";
+    public static final String K_AUDIO_SIMD = "managed_audio_simd";
+    public static final String K_FAST_GUEST_MEMORY = "managed_fast_guest_memory";
     private static final String K_LEGACY_PERSISTENT_JIT_CACHE =
             "jit_persistent_jit_cache";
     public static final String K_DISABLE_DYNAMIC_SHADOWS = "disable_dynamic_shadows";
@@ -77,19 +91,23 @@ public final class SettingsActivity extends Activity {
     public static final int RES_1080P = 1;
     public static final int RES_720P = 2;
     public static final int RES_1620P = 3;
-    public static final int RES_540P = 4;
+    public static final int RES_544P = 4;
     public static final int RES_360P = 5;
     public static final int RES_270P = 6;
     public static final int RES_180P = 7;
+    public static final int DEFAULT_RES_MODE = RES_720P;
+    public static final int ANISOTROPY_GUEST = 0;
+    public static final int ANISOTROPY_1X = 1;
+    public static final int ANISOTROPY_2X = 2;
 
     private static final int[] RESOLUTION_MODE_ORDER = {
-            RES_NATIVE, RES_1080P, RES_720P, RES_540P,
+            RES_NATIVE, RES_1080P, RES_720P, RES_544P,
             RES_360P, RES_270P, RES_180P, RES_1620P
     };
     private static final int[] RESOLUTION_WIDTHS =
             {0, 1920, 1280, 2880, 960, 640, 480, 320};
     private static final int[] RESOLUTION_HEIGHTS =
-            {0, 1080, 720, 1620, 540, 360, 270, 180};
+            {0, 1080, 720, 1620, 544, 360, 270, 180};
 
     @Override
     protected void attachBaseContext(Context base) {
@@ -109,7 +127,7 @@ public final class SettingsActivity extends Activity {
     private String[] resolutionModeLabels() {
         return new String[]{
                 getString(R.string.resolution_native),
-                "1080p (1920×1080)", "720p (1280×720)", "540p (960×540)",
+                "1080p (1920×1080)", "720p (1280×720)", "544p (960×544)",
                 "360p (640×360)", "270p (480×270)", "180p (320×180)",
                 getString(R.string.resolution_upscale_150)
         };
@@ -236,7 +254,7 @@ public final class SettingsActivity extends Activity {
         root.addView(section(getString(R.string.graphics_resolution)));
         Spinner resolution = spinner(resolutionModeLabels());
         resolution.setSelection(resolutionModeToPosition(
-                prefs(this).getInt(K_RES_MODE, RES_NATIVE)), false);
+                prefs(this).getInt(K_RES_MODE, DEFAULT_RES_MODE)), false);
         resolution.setOnItemSelectedListener(saveSpinner(position ->
                 prefs(this).edit().putInt(K_RES_MODE,
                         resolutionModeAtPosition(position)).apply()));
@@ -502,8 +520,276 @@ public final class SettingsActivity extends Activity {
     }
 
     private void buildCache(LinearLayout root) {
-        root.addView(preferenceCheck(R.string.cache_enable, K_PERSISTENT_JIT_CACHE, true));
+        SharedPreferences preferences = prefs(this);
+        boolean enabled = GameCacheManager.configuredEnabled(this, preferences);
+        try {
+            enabled = GameCacheManager.applyStoredSetting(this, preferences);
+        } catch (IOException error) {
+            Toast.makeText(this, getString(
+                    R.string.cache_setting_failed, friendlyMessage(error)),
+                    Toast.LENGTH_LONG).show();
+        }
+
+        CheckBox cacheEnabled = check(getString(R.string.cache_enable), enabled);
+        cacheEnabled.setLayoutParams(cardMargins());
+        final boolean[] updating = {false};
+        cacheEnabled.setOnCheckedChangeListener((button, checked) -> {
+            if (updating[0]) {
+                return;
+            }
+            final boolean previous = !checked;
+            try {
+                GameCacheManager.setUserEnabled(this, checked);
+                if (!preferences.edit()
+                        .putBoolean(K_PERSISTENT_JIT_CACHE, checked)
+                        .commit()) {
+                    throw new IOException("SharedPreferences commit failed");
+                }
+            } catch (IOException error) {
+                try {
+                    GameCacheManager.setUserEnabled(this, previous);
+                } catch (IOException ignored) {
+                }
+                updating[0] = true;
+                button.setChecked(previous);
+                updating[0] = false;
+                Toast.makeText(this, getString(
+                        R.string.cache_setting_failed,
+                        friendlyMessage(error)), Toast.LENGTH_LONG).show();
+            }
+        });
+        root.addView(cacheEnabled);
         root.addView(hint(getString(R.string.cache_hint)));
+        root.addView(section(getString(R.string.cache_games)));
+
+        LinearLayout cacheList = new LinearLayout(this);
+        cacheList.setOrientation(LinearLayout.VERTICAL);
+        root.addView(cacheList, matchWrap());
+        refreshGameCacheList(cacheList);
+    }
+
+    private void refreshGameCacheList(LinearLayout cacheList) {
+        cacheList.removeAllViews();
+        TextView scanning = hint(getString(R.string.cache_scanning));
+        scanning.setPadding(dp(8), dp(10), dp(8), dp(10));
+        cacheList.addView(scanning);
+
+        Thread worker = new Thread(() -> {
+            List<GameCacheManager.Entry> entries = null;
+            Exception failure = null;
+            try {
+                entries = GameCacheManager.scan(this);
+            } catch (Exception error) {
+                failure = error;
+            }
+            final List<GameCacheManager.Entry> result = entries;
+            final Exception error = failure;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) {
+                    return;
+                }
+                cacheList.removeAllViews();
+                if (error != null) {
+                    TextView failed = hint(getString(
+                            R.string.cache_scan_failed,
+                            friendlyMessage(error)));
+                    failed.setPadding(dp(8), dp(10), dp(8), dp(10));
+                    cacheList.addView(failed);
+                    return;
+                }
+                if (result == null || result.isEmpty()) {
+                    TextView empty = hint(getString(R.string.cache_empty));
+                    empty.setPadding(dp(8), dp(10), dp(8), dp(10));
+                    cacheList.addView(empty);
+                    return;
+                }
+                for (GameCacheManager.Entry entry : result) {
+                    cacheList.addView(cacheRow(entry, cacheList),
+                            cardMargins());
+                }
+            });
+        }, "lsx4-cache-list-scan");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private View cacheRow(GameCacheManager.Entry entry,
+                          LinearLayout cacheList) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(dp(12), dp(10), dp(10), dp(10));
+        row.setBackground(cardBackground(0xff1b2026, 0xff2d3640, 14));
+        row.setElevation(dp(2));
+
+        ImageView icon = new ImageView(this);
+        icon.setScaleType(ImageView.ScaleType.CENTER_CROP);
+        Bitmap bitmap = decodeCacheIcon(entry.icon, 144);
+        if (bitmap != null) {
+            icon.setImageBitmap(bitmap);
+        } else {
+            icon.setImageResource(R.drawable.lsx4_launcher_icon);
+            icon.setPadding(dp(8), dp(8), dp(8), dp(8));
+            icon.setBackground(cardBackground(
+                    0xff2a313a, 0xff3c4652, 10));
+        }
+        LinearLayout.LayoutParams iconParams =
+                new LinearLayout.LayoutParams(dp(62), dp(62));
+        iconParams.setMargins(0, 0, dp(12), 0);
+        row.addView(icon, iconParams);
+
+        LinearLayout details = new LinearLayout(this);
+        details.setOrientation(LinearLayout.VERTICAL);
+        TextView gameTitle = label(entry.title, 15, 0xffeef2f6);
+        gameTitle.setTypeface(android.graphics.Typeface.DEFAULT,
+                android.graphics.Typeface.BOLD);
+        details.addView(gameTitle);
+        details.addView(label(entry.titleId, 11, 0xff7f8a97));
+        TextView total = label(
+                formatCacheBytes(entry.totalBytes()), 13, 0xffd7dee7);
+        total.setPadding(0, dp(4), 0, 0);
+        details.addView(total);
+        details.addView(label(getString(
+                R.string.cache_size_breakdown,
+                formatCacheBytes(entry.jitBytes),
+                formatCacheBytes(entry.gpuBytes)), 10, 0xff7f8a97));
+        row.addView(details, new LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        ImageView delete = new ImageView(this);
+        delete.setImageResource(android.R.drawable.ic_menu_delete);
+        delete.setColorFilter(0xffff806f);
+        delete.setPadding(dp(12), dp(12), dp(12), dp(12));
+        delete.setContentDescription(getString(
+                R.string.cache_delete_action, entry.title));
+        delete.setClickable(true);
+        delete.setFocusable(true);
+        delete.setBackground(cardBackground(
+                0xff232a32, 0xff3d4854, 12));
+        delete.setOnClickListener(view ->
+                confirmCacheDelete(entry, cacheList, delete));
+        LinearLayout.LayoutParams deleteParams =
+                new LinearLayout.LayoutParams(dp(48), dp(48));
+        deleteParams.setMargins(dp(8), 0, 0, 0);
+        row.addView(delete, deleteParams);
+        return row;
+    }
+
+    private void confirmCacheDelete(GameCacheManager.Entry entry,
+                                    LinearLayout cacheList,
+                                    ImageView delete) {
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.cache_delete_title)
+                .setMessage(getString(R.string.cache_delete_message,
+                        entry.title, formatCacheBytes(entry.totalBytes())))
+                .setNegativeButton(android.R.string.cancel, null)
+                .setPositiveButton(R.string.cache_delete_confirm,
+                        (dialog, which) -> {
+                            if (isGameProcessActive()) {
+                                Toast.makeText(this,
+                                        R.string.cache_delete_game_running,
+                                        Toast.LENGTH_LONG).show();
+                                return;
+                            }
+                            delete.setEnabled(false);
+                            Thread worker = new Thread(() -> {
+                                Exception failure = null;
+                                try {
+                                    GameCacheManager.delete(this, entry);
+                                } catch (Exception error) {
+                                    failure = error;
+                                }
+                                final Exception error = failure;
+                                runOnUiThread(() -> {
+                                    if (isFinishing() || isDestroyed()) {
+                                        return;
+                                    }
+                                    if (error != null) {
+                                        delete.setEnabled(true);
+                                        Toast.makeText(this, getString(
+                                                R.string.cache_delete_failed,
+                                                friendlyMessage(error)),
+                                                Toast.LENGTH_LONG).show();
+                                        return;
+                                    }
+                                    Toast.makeText(this, getString(
+                                            R.string.cache_deleted,
+                                            entry.title),
+                                            Toast.LENGTH_SHORT).show();
+                                    refreshGameCacheList(cacheList);
+                                });
+                            }, "lsx4-cache-delete");
+                            worker.setDaemon(true);
+                            worker.start();
+                        })
+                .show();
+    }
+
+    private boolean isGameProcessActive() {
+        ActivityManager manager =
+                (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+        if (manager == null) {
+            return false;
+        }
+        List<ActivityManager.RunningAppProcessInfo> processes =
+                manager.getRunningAppProcesses();
+        if (processes == null) {
+            return false;
+        }
+        String gameProcess = getPackageName() + ":game";
+        for (ActivityManager.RunningAppProcessInfo process : processes) {
+            if (gameProcess.equals(process.processName)
+                    && process.importance
+                    <= ActivityManager.RunningAppProcessInfo
+                            .IMPORTANCE_SERVICE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Bitmap decodeCacheIcon(File icon, int requestedPixels) {
+        if (icon == null || !icon.isFile()) {
+            return null;
+        }
+        try {
+            BitmapFactory.Options bounds = new BitmapFactory.Options();
+            bounds.inJustDecodeBounds = true;
+            BitmapFactory.decodeFile(icon.getAbsolutePath(), bounds);
+            int sample = 1;
+            while (bounds.outWidth / sample > requestedPixels * 2
+                    || bounds.outHeight / sample > requestedPixels * 2) {
+                sample *= 2;
+            }
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = sample;
+            return BitmapFactory.decodeFile(
+                    icon.getAbsolutePath(), options);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static String formatCacheBytes(long bytes) {
+        if (bytes >= 1024L * 1024L * 1024L) {
+            return String.format(Locale.US, "%.2f GiB",
+                    bytes / (1024.0 * 1024.0 * 1024.0));
+        }
+        if (bytes >= 1024L * 1024L) {
+            return String.format(Locale.US, "%.1f MiB",
+                    bytes / (1024.0 * 1024.0));
+        }
+        if (bytes >= 1024L) {
+            return String.format(Locale.US, "%.1f KiB",
+                    bytes / 1024.0);
+        }
+        return bytes + " B";
+    }
+
+    private static String friendlyMessage(Throwable error) {
+        String message = error.getMessage();
+        return message == null || message.trim().isEmpty()
+                ? error.getClass().getSimpleName() : message;
     }
 
     private void buildManagedOptimizations(LinearLayout root) {
@@ -519,6 +805,37 @@ public final class SettingsActivity extends Activity {
                 getString(R.string.optimization_coarse_fragment_2x2_hint));
         coarseFragmentWarning.setPadding(dp(8), dp(10), dp(8), 0);
         root.addView(coarseFragmentWarning);
+
+        SharedPreferences optimizationPreferences = prefs(this);
+        int anisotropyMode = optimizationPreferences.contains(K_ANISOTROPY_MODE)
+                ? optimizationPreferences.getInt(
+                        K_ANISOTROPY_MODE, ANISOTROPY_GUEST)
+                : (optimizationPreferences.getBoolean(
+                        K_LIMIT_ANISOTROPY_2X, false)
+                        ? ANISOTROPY_2X : ANISOTROPY_GUEST);
+        anisotropyMode = Math.max(
+                ANISOTROPY_GUEST,
+                Math.min(ANISOTROPY_2X, anisotropyMode));
+        Spinner anisotropy = spinner(new String[]{
+                getString(R.string.optimization_anisotropy_guest),
+                getString(R.string.optimization_anisotropy_1x),
+                getString(R.string.optimization_anisotropy_2x)
+        });
+        anisotropy.setSelection(anisotropyMode);
+        anisotropy.setOnItemSelectedListener(saveSpinner(position ->
+                prefs(this).edit()
+                        .putInt(K_ANISOTROPY_MODE, position)
+                        .remove(K_LIMIT_ANISOTROPY_2X)
+                        .apply()));
+        View anisotropyRow = settingRow(
+                getString(R.string.optimization_anisotropy_mode),
+                anisotropy);
+        anisotropyRow.setLayoutParams(cardMargins());
+        root.addView(anisotropyRow);
+        TextView anisotropyWarning = hint(
+                getString(R.string.optimization_limit_anisotropy_2x_hint));
+        anisotropyWarning.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(anisotropyWarning);
 
         root.addView(preferenceCheck(R.string.optimization_disable_vk_robustness,
                 K_DISABLE_VK_ROBUSTNESS, false));
@@ -556,6 +873,48 @@ public final class SettingsActivity extends Activity {
                 getString(R.string.optimization_jit_trace_compilation_hint));
         traceJitWarning.setPadding(dp(8), dp(10), dp(8), 0);
         root.addView(traceJitWarning);
+
+        root.addView(preferenceCheck(R.string.optimization_fast_guest_memory,
+                K_FAST_GUEST_MEMORY, false));
+        TextView fastGuestMemoryHint = hint(
+                getString(R.string.optimization_fast_guest_memory_hint));
+        fastGuestMemoryHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(fastGuestMemoryHint);
+
+        root.addView(preferenceCheck(R.string.optimization_readback_batching,
+                K_READBACK_BATCHING, true));
+        TextView readbackHint = hint(
+                getString(R.string.optimization_readback_batching_hint));
+        readbackHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(readbackHint);
+
+        root.addView(preferenceCheck(R.string.optimization_vulkan_driver_calls,
+                K_VULKAN_DRIVER_CALLS, true));
+        TextView driverCallsHint = hint(
+                getString(R.string.optimization_vulkan_driver_calls_hint));
+        driverCallsHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(driverCallsHint);
+
+        root.addView(preferenceCheck(R.string.optimization_async_pipeline,
+                K_ASYNC_PIPELINE, true));
+        TextView asyncPipelineHint = hint(
+                getString(R.string.optimization_async_pipeline_hint));
+        asyncPipelineHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(asyncPipelineHint);
+
+        root.addView(preferenceCheck(R.string.optimization_adaptive_mobile_gpu,
+                K_ADAPTIVE_MOBILE_GPU, true));
+        TextView mobileGpuHint = hint(
+                getString(R.string.optimization_adaptive_mobile_gpu_hint));
+        mobileGpuHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(mobileGpuHint);
+
+        root.addView(preferenceCheck(R.string.optimization_audio_simd,
+                K_AUDIO_SIMD, true));
+        TextView audioSimdHint = hint(
+                getString(R.string.optimization_audio_simd_hint));
+        audioSimdHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(audioSimdHint);
     }
 
     private void buildOther(LinearLayout root) {

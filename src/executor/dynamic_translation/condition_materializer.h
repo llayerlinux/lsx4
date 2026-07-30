@@ -11,6 +11,7 @@
 
 namespace Executor::Jit::NativeCondition {
 
+[[nodiscard]] bool Supports(X86Mnemonic mnemonic) noexcept;
 bool Materialize(Xbyak_aarch64::CodeGenerator& code, X86Mnemonic mnemonic,
                  const XReg& flags, const XReg& result,
                  const XReg& scratch_a, const XReg& scratch_b) noexcept;

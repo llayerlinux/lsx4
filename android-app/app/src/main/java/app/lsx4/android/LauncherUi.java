@@ -1372,6 +1372,9 @@ public final class LauncherUi {
         intent.putExtra(EXTRA_GAME_PLATFORM, game.platform);
         intent.putExtra("fullscreen_render", true);
         intent.putExtra(EXTRA_EMBEDDED_AARCH64_JIT_BACKEND, true);
+        intent.putExtra(MainActivity.EXTRA_RENDER_RESOLUTION_MODE,
+                SettingsActivity.prefs(activity).getInt(
+                        SettingsActivity.K_RES_MODE, SettingsActivity.DEFAULT_RES_MODE));
         try {
             activity.startActivity(intent);
         } catch (ActivityNotFoundException e) {

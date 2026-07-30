@@ -59,8 +59,14 @@ constexpr std::uint32_t kKnownNativeFlags =
     kJitNativeFlagHotAtomicPermuteV20 |
     kJitNativeFlagCmpxchgCacheSyncV21 |
     kJitNativeFlagXchgCacheSyncV22 |
+    kJitNativeFlagIndirectPicSafeLinearV26 |
     kJitNativeFlagPs5PauseYieldV23 |
-    kJitNativeFlagPs5AtomicRestoreV24;
+    kJitNativeFlagPs5AtomicRestoreV24 |
+    kJitNativeFlagHashedIndirectPicV25 |
+    kJitNativeFlagTieredScalarFloatDirectV29 |
+    kJitNativeFlagLocalLoopSamplingV28 |
+    kJitNativeFlagSignalFaultDescriptorV30 |
+    kJitNativeFlagVectorUpperZeroElisionV31;
 constexpr std::uint32_t kAarch64PointerMaterializationBytes = 4 * sizeof(std::uint32_t);
 
 constexpr std::uint16_t kBlockFlagCanJitInitial = 1u << 0;
@@ -463,6 +469,12 @@ private:
                 }
                 break;
             case JitNativeRelocationKind::ModuleRelative:
+                if (relocation.target_index != 0 ||
+                    relocation.addend < 0) {
+                    error = "invalid cached module-relative relocation";
+                    return false;
+                }
+                break;
             case JitNativeRelocationKind::BackendRelative:
                 break;
             case JitNativeRelocationKind::OutboundEdgeState:
@@ -1311,6 +1323,12 @@ bool SaveJitIrCacheFileAtomic(const std::filesystem::path& path,
         return false;
     }
 
+    return SaveJitAuxiliaryFileAtomic(path, bytes, error);
+}
+
+bool SaveJitAuxiliaryFileAtomic(const std::filesystem::path& path,
+                                const std::span<const std::uint8_t> bytes,
+                                std::string& error) {
     try {
         std::filesystem::path parent = path.parent_path();
         if (parent.empty()) {

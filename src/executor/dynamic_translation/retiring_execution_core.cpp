@@ -83,6 +83,7 @@
 #include <link.h>
 #include <sys/resource.h>
 #include <pthread.h>
+#include <ucontext.h>
 #if __has_include(<sys/mman.h>)
 #include <sys/mman.h>
 #endif
@@ -98,13 +99,9 @@ namespace Executor::Jit {
 namespace {
 std::atomic<bool> g_tiered_jit_enabled{false};
 std::atomic<bool> g_jit_trace_compilation_enabled{false};
-}
-
-void ConfigureTieredJit(const bool enabled,
-                        const bool trace_compilation_enabled) noexcept {
-    g_tiered_jit_enabled.store(enabled, std::memory_order_release);
-    g_jit_trace_compilation_enabled.store(
-        enabled && trace_compilation_enabled, std::memory_order_release);
+// This path is opt-in until its private-stack proof also covers escaped guest
+// stack addresses. Strict x86 ordering remains the safe default on every host.
+std::atomic<bool> g_fast_guest_memory_enabled{false};
 }
 
 bool TieredJitEnabled() noexcept {
@@ -113,6 +110,10 @@ bool TieredJitEnabled() noexcept {
 
 bool JitTraceCompilationEnabled() noexcept {
     return g_jit_trace_compilation_enabled.load(std::memory_order_acquire);
+}
+
+bool FastGuestMemoryEnabled() noexcept {
+    return g_fast_guest_memory_enabled.load(std::memory_order_acquire);
 }
 
 void CompareExchangeWideAtomic(LsxMachineImage& state, std::uint64_t address);
@@ -956,6 +957,29 @@ bool JitBlockUsesHotAtomicPermuteV20(const LsxDecodedRegion& block) {
     });
 }
 
+bool IsConditionalBranchMnemonic(X86Mnemonic mnemonic);
+bool TryResolveBranchTarget(const LsxDecodedOp& ir, std::uint64_t& target);
+
+bool JitBlockUsesLocalLoopSamplingV28(const LsxDecodedRegion& block) {
+    if (block.instructions.empty()) {
+        return false;
+    }
+    const LsxDecodedOp& terminator = block.instructions.back();
+    if (!IsConditionalBranchMnemonic(
+            static_cast<X86Mnemonic>(terminator.mnemonic))) {
+        return false;
+    }
+    std::uint64_t target = 0;
+    if (!TryResolveBranchTarget(terminator, target)) {
+        return false;
+    }
+    return std::ranges::any_of(
+        block.instructions.begin(), block.instructions.end() - 1,
+        [&](const LsxDecodedOp& instruction) {
+            return instruction.guest_rip == target;
+        });
+}
+
 bool JitBlockUsesCmpxchgCacheSyncV21(const LsxDecodedRegion& block) {
     return JitBlockUsesPostLoadDirectV9(block);
 }
@@ -1223,6 +1247,7 @@ thread_local std::uint64_t g_jit_selftest_shift_flag_path_emissions = 0;
 thread_local std::uint64_t g_jit_selftest_scalar_flag_helper_emissions = 0;
 thread_local std::uint64_t g_jit_selftest_scalar_flag_inline_emissions = 0;
 thread_local std::uint64_t g_jit_selftest_scalar_flag_post_memory_write_emissions = 0;
+thread_local std::uint64_t g_jit_selftest_high8_cached_access_emissions = 0;
 
 class ScopedJitSelfTestDifferential {
 public:
@@ -1312,6 +1337,11 @@ const JitStoreWatchRange& JitDiagnosticStoreWatchRange() {
         return result;
     }();
     return range;
+}
+
+bool TieredJitDiagnosticModeActive() {
+    return JitLiveCheckedNativeEnabled() ||
+           JitDiagnosticStoreWatchRange().Enabled();
 }
 
 void JitReportWatchedStore(const std::uint64_t guest_rip, const std::uint64_t address,
@@ -1540,7 +1570,7 @@ static bool JitOwnHostImageRange(std::uint64_t& lo, std::uint64_t& hi);
 
 namespace {
 constexpr std::uint32_t kJitMaxInstructionsPerBlock = 128;
-constexpr std::uint32_t kJitMaxTraceInstructions = 256;
+constexpr std::uint32_t kJitMaxTraceInstructions = 512;
 
 std::uint64_t InterpretDecodedInstruction(LsxMachineImage* state, const LsxDecodedOp* ir);
 std::uint64_t InterpretDecodedInstructionScoped(LsxMachineImage* state,
@@ -1856,15 +1886,27 @@ thread_local bool g_allow_guest_return_sentinel = false;
 thread_local std::uint64_t g_pending_stack_reservoir_base = 0;
 thread_local std::uint64_t g_pending_stack_reservoir_size = 0;
 
-struct NativeFaultDescriptor {
-    std::uint64_t guest_rip = 0;
-    std::uint32_t mnemonic = 0;
-    std::uint8_t length = 0;
-    std::array<std::uint8_t, kLsxInstructionByteLimit> bytes{};
+using NativeFaultDescriptor = LsxDecodedOp;
+
+struct NativeFaultCachedRegister {
+    std::uint16_t state_offset = 0;
+    std::uint8_t host_register = 0;
+    std::uint8_t reserved = 0;
 };
+
+struct NativeFaultRecoveryDescriptor {
+    NativeFaultDescriptor instruction{};
+    std::array<NativeFaultCachedRegister, 8> gpr{};
+    std::array<NativeFaultCachedRegister, 14> vector{};
+    std::uint8_t gpr_count = 0;
+    std::uint8_t vector_count = 0;
+};
+
+constexpr std::uintptr_t kNativeFaultRecoveryTag = 1;
 
 struct NativeDescriptorBundle {
     std::vector<NativeFaultDescriptor> faults{};
+    std::vector<NativeFaultRecoveryDescriptor> recoverable_faults{};
     std::vector<LsxDecodedOp> semantics{};
 };
 
@@ -1890,9 +1932,23 @@ PublishedFaultInstruction CurrentPublishedFaultInstruction() noexcept {
     }
     if (g_current_fault_state != nullptr &&
         g_current_fault_state->native_fault_ir != 0) {
+        const std::uintptr_t published =
+            static_cast<std::uintptr_t>(
+                g_current_fault_state->native_fault_ir);
+        if ((published & kNativeFaultRecoveryTag) != 0) {
+            const auto* const descriptor =
+                reinterpret_cast<const NativeFaultRecoveryDescriptor*>(
+                    published & ~kNativeFaultRecoveryTag);
+            return {
+                descriptor->instruction.guest_rip,
+                descriptor->instruction.mnemonic,
+                descriptor->instruction.length,
+                descriptor->instruction.bytes,
+            };
+        }
         const auto* const descriptor =
             reinterpret_cast<const NativeFaultDescriptor*>(
-            g_current_fault_state->native_fault_ir);
+                published);
         return {
             descriptor->guest_rip,
             descriptor->mnemonic,
@@ -1901,6 +1957,185 @@ PublishedFaultInstruction CurrentPublishedFaultInstruction() noexcept {
         };
     }
     return {};
+}
+
+bool RestoreTieredFaultRegisterCaches(
+    LsxMachineImage& state, const void* const raw_context) noexcept {
+#if defined(__ANDROID__) && defined(__aarch64__)
+    const std::uintptr_t published =
+        static_cast<std::uintptr_t>(state.native_fault_ir);
+    if ((published & kNativeFaultRecoveryTag) == 0) {
+        return true;
+    }
+    if (raw_context == nullptr) {
+        return false;
+    }
+    const auto* const descriptor =
+        reinterpret_cast<const NativeFaultRecoveryDescriptor*>(
+            published & ~kNativeFaultRecoveryTag);
+    const auto* const context =
+        static_cast<const ucontext_t*>(raw_context);
+    auto* const state_bytes =
+        reinterpret_cast<std::uint8_t*>(std::addressof(state));
+    for (std::uint8_t index = 0; index < descriptor->gpr_count; ++index) {
+        const NativeFaultCachedRegister& cached =
+            descriptor->gpr[index];
+        if (cached.host_register >= 31 ||
+            cached.state_offset > sizeof(state) - sizeof(std::uint64_t)) {
+            return false;
+        }
+        const std::uint64_t value =
+            static_cast<std::uint64_t>(
+                context->uc_mcontext.regs[cached.host_register]);
+        std::memcpy(state_bytes + cached.state_offset,
+                    std::addressof(value), sizeof(value));
+    }
+    if (descriptor->vector_count == 0) {
+        return true;
+    }
+
+    struct Aarch64ContextHeader {
+        std::uint32_t magic;
+        std::uint32_t size;
+    };
+    constexpr std::uint32_t kFpsimdContextMagic = 0x46508001u;
+    constexpr std::size_t kFpsimdVectorOffset = 16;
+    constexpr std::size_t kFpsimdVectorBytes = 16;
+    const auto& reserved = context->uc_mcontext.__reserved;
+    const auto* const reserved_bytes =
+        reinterpret_cast<const std::uint8_t*>(reserved);
+    const std::uint8_t* fpsimd = nullptr;
+    std::size_t offset = 0;
+    while (offset + sizeof(Aarch64ContextHeader) <= sizeof(reserved)) {
+        Aarch64ContextHeader header{};
+        std::memcpy(std::addressof(header), reserved_bytes + offset,
+                    sizeof(header));
+        if (header.magic == 0 && header.size == 0) {
+            break;
+        }
+        if (header.size < sizeof(header) ||
+            header.size > sizeof(reserved) - offset) {
+            break;
+        }
+        if (header.magic == kFpsimdContextMagic &&
+            header.size >=
+                kFpsimdVectorOffset + 32u * kFpsimdVectorBytes) {
+            fpsimd = reserved_bytes + offset;
+            break;
+        }
+        offset += header.size;
+    }
+    if (fpsimd == nullptr) {
+        return false;
+    }
+    for (std::uint8_t index = 0; index < descriptor->vector_count; ++index) {
+        const NativeFaultCachedRegister& cached =
+            descriptor->vector[index];
+        if (cached.host_register >= 32 ||
+            cached.state_offset > sizeof(state) - kFpsimdVectorBytes) {
+            return false;
+        }
+        std::memcpy(
+            state_bytes + cached.state_offset,
+            fpsimd + kFpsimdVectorOffset +
+                static_cast<std::size_t>(cached.host_register) *
+                    kFpsimdVectorBytes,
+            kFpsimdVectorBytes);
+    }
+    return true;
+#else
+    (void)state;
+    (void)raw_context;
+    return true;
+#endif
+}
+
+enum class DeferredFlagKind : std::uint8_t {
+    None = 0,
+    Decrement = 1,
+    AddImmediate = 2,
+    SubtractImmediate = 3,
+    Addition = 4,
+    Subtraction = 5,
+    Logical = 6,
+    ImulOverflow = 7,
+};
+
+constexpr std::uint64_t PackDeferredFlagMeta(
+    const DeferredFlagKind kind, const std::uint32_t width,
+    const std::int64_t immediate = 0) noexcept {
+    return static_cast<std::uint64_t>(kind) |
+           (static_cast<std::uint64_t>(width) << 8u) |
+           ((static_cast<std::uint64_t>(immediate) &
+             UINT64_C(0x0000ffffffffffff))
+            << 16u);
+}
+
+void MaterializeDeferredFlags(LsxMachineImage& state) noexcept {
+    const std::uint64_t meta = state.deferred_flags_meta;
+    const auto kind =
+        static_cast<DeferredFlagKind>(static_cast<std::uint8_t>(meta));
+    if (kind == DeferredFlagKind::None) {
+        return;
+    }
+    const std::uint32_t width =
+        static_cast<std::uint32_t>((meta >> 8u) & 0xffu);
+    if (kind == DeferredFlagKind::Decrement &&
+        (width == 8 || width == 16 || width == 32 || width == 64)) {
+        const std::uint64_t preserved_carry =
+            state.rflags & Lsx4::Translation::CarryFlag;
+        std::uint64_t flags = Lsx4::Translation::FlagsForSubtraction(
+                                  state.deferred_flags_lhs, 1, width)
+                                  .bits;
+        flags = (flags & ~Lsx4::Translation::CarryFlag) | preserved_carry;
+        state.rflags =
+            Lsx4::Translation::ReplaceArithmeticFlags(state.rflags, flags);
+    } else if ((kind == DeferredFlagKind::AddImmediate ||
+                kind == DeferredFlagKind::SubtractImmediate) &&
+               (width == 32 || width == 64)) {
+        const std::int64_t immediate =
+            static_cast<std::int64_t>(meta) >> 16u;
+        const std::uint64_t rhs =
+            static_cast<std::uint64_t>(immediate);
+        const std::uint64_t flags =
+            kind == DeferredFlagKind::AddImmediate
+                ? Lsx4::Translation::FlagsForAddition(
+                      state.deferred_flags_lhs, rhs, width)
+                      .bits
+                : Lsx4::Translation::FlagsForSubtraction(
+                      state.deferred_flags_lhs, rhs, width)
+                      .bits;
+        state.rflags =
+            Lsx4::Translation::ReplaceArithmeticFlags(state.rflags, flags);
+    } else if ((kind == DeferredFlagKind::Addition ||
+                kind == DeferredFlagKind::Subtraction) &&
+               (width == 8 || width == 16 || width == 32 || width == 64)) {
+        const std::uint64_t flags =
+            kind == DeferredFlagKind::Addition
+                ? Lsx4::Translation::FlagsForAddition(
+                      state.deferred_flags_lhs, state.deferred_flags_rhs, width)
+                      .bits
+                : Lsx4::Translation::FlagsForSubtraction(
+                      state.deferred_flags_lhs, state.deferred_flags_rhs, width)
+                      .bits;
+        state.rflags =
+            Lsx4::Translation::ReplaceArithmeticFlags(state.rflags, flags);
+    } else if (kind == DeferredFlagKind::Logical &&
+               (width == 8 || width == 16 || width == 32 || width == 64)) {
+        state.rflags = Lsx4::Translation::ReplaceArithmeticFlags(
+            state.rflags,
+            Lsx4::Translation::FlagsForLogicalResult(
+                state.deferred_flags_lhs, width)
+                .bits);
+    } else if (kind == DeferredFlagKind::ImulOverflow) {
+        const std::uint64_t overflow = state.deferred_flags_lhs & 1u;
+        const std::uint64_t affected =
+            Lsx4::Translation::CarryFlag | Lsx4::Translation::OverflowFlag;
+        const std::uint64_t flags =
+            overflow * affected;
+        state.rflags = (state.rflags & ~affected) | flags;
+    }
+    state.deferred_flags_meta = 0;
 }
 
 struct JitDeferredGuestFault {
@@ -2073,6 +2308,8 @@ bool BlockNeedsSynchronousFaultResume(const LsxDecodedRegion& block) {
         switch (mnemonic) {
         case X86_MNEMONIC_CALL:
         case X86_MNEMONIC_RET:
+        case X86_MNEMONIC_DIV:
+        case X86_MNEMONIC_IDIV:
         case X86_MNEMONIC_PUSH:
         case X86_MNEMONIC_POP:
         case X86_MNEMONIC_LEAVE:
@@ -2200,9 +2437,27 @@ struct PersistentTranslationCounters {
     std::atomic<std::uint64_t> native_written{}, restore_fallbacks{}, capture_rejected{};
 };
 struct TieredTranslationCounters {
+    std::atomic<std::uint64_t> tier0_compiled{};
+    std::atomic<std::uint64_t> tier0_active{};
+    std::atomic<std::uint64_t> tier1_queued{};
+    std::atomic<std::uint64_t> tier1_compiled{};
+    std::atomic<std::uint64_t> tier1_active{};
+    std::atomic<std::uint64_t> tier1_promotions{};
+    std::atomic<std::uint64_t> tier1_deopts{};
+    std::atomic<std::uint64_t> tier1_rejected{};
+    std::atomic<std::uint64_t> tier1_safe_handoffs{};
+    std::atomic<std::uint64_t> tier1_loop_osr_handoffs{};
+    std::atomic<std::uint64_t> tier1_compile_time_us{};
+    std::atomic<std::uint64_t> tier1_generated_bytes{};
     std::atomic<std::uint64_t> profiled_edges{};
+    std::atomic<std::uint64_t> persistent_edges_loaded{};
+    std::atomic<std::uint64_t> persistent_edges_written{};
+    std::atomic<std::uint64_t> persistent_profile_rejected{};
     std::atomic<std::uint64_t> queued{};
+    std::atomic<std::uint64_t> loop_osr_queued{};
     std::atomic<std::uint64_t> compiled{};
+    std::atomic<std::uint64_t> faultable_compiled{};
+    std::atomic<std::uint64_t> loop_osr_compiled{};
     std::atomic<std::uint64_t> active{};
     std::atomic<std::uint64_t> retired{};
     std::atomic<std::uint64_t> rejected{};
@@ -2213,12 +2468,33 @@ struct TieredTranslationCounters {
     std::atomic<std::uint64_t> entries{};
     std::atomic<std::uint64_t> internal_edges{};
     std::atomic<std::uint64_t> side_exits{};
+    std::atomic<std::uint64_t> guard_deopts{};
+    std::atomic<std::uint64_t> guard_rollbacks{};
     std::atomic<std::uint64_t> smc_retirements{};
     std::atomic<std::uint64_t> boundary_operations_avoided{};
 };
 TranslationCounters g_translation_counts{};
 PersistentTranslationCounters g_persistent_counts{};
 TieredTranslationCounters g_tiered_counts{};
+void SaturatingDecrement(std::atomic<std::uint64_t>& counter) noexcept {
+    std::uint64_t observed = counter.load(std::memory_order_relaxed);
+    while (observed != 0 &&
+           !counter.compare_exchange_weak(
+               observed, observed - 1u, std::memory_order_relaxed,
+               std::memory_order_relaxed)) {
+    }
+}
+
+bool JitBlockUsesVectorUpperZeroElisionV31(
+    const LsxDecodedRegion& block) {
+    return std::ranges::any_of(
+        block.instructions, [](const LsxDecodedOp& ir) {
+            return ir.decoded.encoding == X86_INSTRUCTION_ENCODING_VEX ||
+                   ir.decoded.encoding == X86_INSTRUCTION_ENCODING_EVEX ||
+                   ir.decoded.encoding == X86_INSTRUCTION_ENCODING_XOP;
+        });
+}
+std::atomic<std::uint64_t> g_jit_hle_slab_base_for_native_cache{};
 auto& g_jit_blocks_decoded = g_translation_counts.decoded;
 auto& g_jit_blocks_native = g_translation_counts.native;
 auto& g_jit_blocks_helper = g_translation_counts.semantic;
@@ -2256,6 +2532,14 @@ std::atomic<std::uint64_t> g_jit_native_simd_faultable_writeback_blocks{0};
 std::atomic<std::uint64_t> g_jit_native_scalar_direct_instructions{0};
 std::atomic<std::uint64_t> g_jit_native_scalar_semantic_instructions{0};
 std::atomic<std::uint64_t> g_jit_native_scalar_blocks{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_gpr_cached_blocks{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_gpr_cached_registers{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_gpr_saved_accesses{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_gpr_shape_rejections{0};
+std::atomic<std::uint64_t> g_jit_native_simd_cached_blocks{0};
+std::atomic<std::uint64_t> g_jit_native_simd_cached_halves{0};
+std::atomic<std::uint64_t> g_jit_native_simd_saved_accesses{0};
+std::atomic<std::uint64_t> g_jit_native_deferred_loop_flag_blocks{0};
 constexpr std::size_t kJitSemanticMnemonicCount =
     static_cast<std::size_t>(X86_MNEMONIC_MAX_VALUE) + 1;
 struct RuntimeInstrumentation {
@@ -2373,10 +2657,15 @@ struct StableDecodeRequest {
 
 bool HashDecodedBlockBytes(const LsxDecodedRegion& block, std::uint64_t& hash_out) noexcept;
 bool GuestBytesMatchDecoded(const LsxDecodedRegion& block) noexcept;
+std::uint64_t JitRuntimeElfBuildIdentity() noexcept;
+std::uint64_t JitNativeCacheAbiId() noexcept;
 bool ClassifyJitStableExternal(std::uint64_t value,
                                     JitNativeRelocation& relocation) noexcept;
 bool ResolveJitStableExternal(std::uint32_t target_index,
                                    std::uint64_t& target) noexcept;
+bool ValidateJitStableExternal(std::uint32_t target_index,
+                               std::uint64_t target,
+                               std::uint64_t module_base) noexcept;
 
 class PersistentIrBlockCache {
 public:
@@ -2385,14 +2674,29 @@ public:
     }
 
     [[nodiscard]] bool AcceptsNewRecords() const noexcept {
-        return enabled_ && writer_available_.load(std::memory_order_acquire);
+        return enabled_ && writer_available_.load(std::memory_order_acquire) &&
+               accepted_new_records_.load(std::memory_order_relaxed) < limits_.max_records;
+    }
+
+    [[nodiscard]] const std::filesystem::path& Directory() const noexcept {
+        return directory_;
+    }
+
+    [[nodiscard]] bool Enabled() const noexcept {
+        return enabled_ && !directory_.empty();
+    }
+
+    [[nodiscard]] std::uint64_t ProfileIdentity() const noexcept {
+        return profile_identity_;
     }
 
     void Configure(const std::string& root_dir, const std::string& title_id,
                    const std::uint64_t executable_fingerprint, const bool enabled) {
         StopWriter();
         enabled_ = false;
+        profile_identity_ = 0;
         records_by_rip_.clear();
+        accepted_new_records_.store(0, std::memory_order_relaxed);
         next_loaded_order_ = 1;
         {
             std::lock_guard hot_lock{native_hot_profile_mutex_};
@@ -2432,7 +2736,7 @@ public:
         std::ostringstream fingerprint_name;
         fingerprint_name << std::hex << std::setw(16) << std::setfill('0')
                          << executable_fingerprint;
-        const std::uint64_t native_abi_id = kJitNativeCacheSourceAbiHash;
+        const std::uint64_t native_abi_id = JitNativeCacheAbiId();
         if (native_abi_id == 0) {
             JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE] enabled=0 "
                         "reason=native_abi_id_missing");
@@ -2445,8 +2749,23 @@ public:
         directory_ = std::filesystem::path(root_dir) / "cache" / "jit" /
                      safe_title / fingerprint_name.str() / abi_name.str();
         identity_ = BuildIdentity(safe_title, executable_fingerprint, native_abi_id);
+        profile_identity_ = XXH3_64bits_withSeed(
+            identity_.content_key.data(), identity_.content_key.size(),
+            identity_.jit_abi_version ^ UINT64_C(0x54503250474f4c53));
         limits_.max_instructions_per_block = kJitMaxInstructionsPerBlock;
-        records_by_rip_.reserve(1u << 19);
+#ifdef __ANDROID__
+        // Keep the persistent cache useful without materializing an entire title's IR and
+        // native code into the process. Bloodborne consumes roughly 240K unique blocks in the
+        // first 25 seconds and about 326K before gameplay; a 64K cap forced most of that path
+        // through the emitter on every launch. Keep the complete startup working set while
+        // retaining bounded IR/native budgets on mobile.
+        limits_.max_records = 384u * 1024u;
+        limits_.max_total_instructions = 4u * 1024u * 1024u;
+        limits_.max_total_native_bytes = 768u * 1024u * 1024u;
+        limits_.max_total_native_relocations = 16'000'000u;
+#endif
+        records_by_rip_.reserve(static_cast<std::size_t>(
+            std::min<std::uint64_t>(limits_.max_records, 1u << 19)));
 
         std::error_code error;
         std::filesystem::create_directories(directory_, error);
@@ -2461,14 +2780,17 @@ public:
 
         std::uint64_t loaded_records = 0;
         const bool migration_complete = HasNativeMigrationMarker();
-        loaded_records += LoadExistingShards(directory_, identity_, true, false);
-        if (!migration_complete) {
+        loaded_records += LoadExistingShards(
+            directory_, identity_, true, false, limits_.max_records);
+        if (!migration_complete && loaded_records < limits_.max_records) {
             for (const auto& [compatible_directory, compatible_abi_id] :
-                 FindNewestCompatibleBuildDirectories(native_abi_id, 2)) {
+                 FindNewestCompatibleBuildDirectories(native_abi_id, 1)) {
+                const std::uint64_t remaining_records =
+                    limits_.max_records - loaded_records;
                 const std::uint64_t source_loaded = LoadExistingShards(
                     compatible_directory,
                     BuildIdentity(safe_title, executable_fingerprint, compatible_abi_id), false,
-                    true);
+                    true, remaining_records);
                 loaded_records += source_loaded;
                 JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_IR_REUSE] source=%s "
                             "sourceAbi=0x%llx targetAbi=0x%llx loaded=%llu "
@@ -2492,13 +2814,16 @@ public:
                         exception.what());
         }
         JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE] enabled=1 path=%s loaded=%llu "
-                    "writer=%d nativeAbi=0x%llx sourceHash=0x%llx migrated=%d",
+                    "writer=%d nativeAbi=0x%llx sourceHash=0x%llx "
+                    "elfBuild=0x%llx migrated=%d",
                     directory_.string().c_str(),
                     static_cast<unsigned long long>(
                         g_jit_persistent_ir_records_loaded.load(std::memory_order_relaxed)),
                     writer_available_.load(std::memory_order_acquire) ? 1 : 0,
                     static_cast<unsigned long long>(native_abi_id),
                     static_cast<unsigned long long>(kJitNativeCacheSourceAbiHash),
+                    static_cast<unsigned long long>(
+                        JitRuntimeElfBuildIdentity()),
                     migration_complete ? 1 : 0);
     }
 
@@ -2506,6 +2831,7 @@ public:
         if (!enabled_) {
             return {};
         }
+        std::lock_guard records_lock{records_mutex_};
         auto records_it = records_by_rip_.find(guest_rip);
         if (records_it == records_by_rip_.end()) {
             g_jit_persistent_ir_misses.fetch_add(1, std::memory_order_relaxed);
@@ -2582,6 +2908,7 @@ public:
                 hot_rank.try_emplace(native_hot_rips_[index], index);
             }
         }
+        std::lock_guard records_lock{records_mutex_};
         std::vector<Selection> selections;
         selections.reserve(std::min(max_records, records_by_rip_.size()));
         for (auto& [guest_rip, versions] : records_by_rip_) {
@@ -2667,6 +2994,7 @@ public:
         record.native_flags = stable.native_flags;
         record.loaded_ir_validated = stable.loaded_ir_validated;
         record.needs_identity_migration = stable.needs_identity_migration;
+        std::lock_guard records_lock{records_mutex_};
         record.loaded_order = next_loaded_order_++;
         records_by_rip_[record.guest_rip].push_back(std::move(record));
     }
@@ -2679,6 +3007,20 @@ public:
         if (!enabled_ || !writer_available_.load(std::memory_order_acquire) ||
             block.instructions.empty()) {
             return;
+        }
+        RecordNativeWarmRip(block.start_rip);
+        std::uint64_t accepted = accepted_new_records_.load(std::memory_order_relaxed);
+        while (accepted < limits_.max_records &&
+               !accepted_new_records_.compare_exchange_weak(
+                   accepted, accepted + 1, std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {
+        }
+        if (accepted >= limits_.max_records) {
+            return;
+        }
+        if (accepted + 1 == limits_.max_records) {
+            JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_WRITE_BUDGET] records=%llu",
+                   static_cast<unsigned long long>(limits_.max_records));
         }
         JitIrCacheRecord record{};
         record.guest_rip = block.start_rip;
@@ -2805,6 +3147,16 @@ public:
                                         guest_rips.begin(), guest_rips.end());
     }
 
+    void RecordNativeWarmRip(const std::uint64_t guest_rip) noexcept {
+        if (!enabled_ || guest_rip == 0) {
+            return;
+        }
+        std::lock_guard hot_lock{native_hot_profile_mutex_};
+        if (pending_native_hot_rips_.size() < kMaxNativeHotProfileRecords) {
+            pending_native_hot_rips_.push_back(guest_rip);
+        }
+    }
+
     void FlushNativeWarmProfile() noexcept {
         if (!enabled_ || directory_.empty()) {
             return;
@@ -2829,9 +3181,12 @@ public:
                 }
             }
         };
-        append_unique(pending_native_hot_rips_);
+        // Preserve launch order from the previous run first. Newly observed
+        // blocks extend that startup path instead of evicting its earliest,
+        // most latency-sensitive portion.
+        append_unique(native_hot_rips_);
         if (merged.size() < kMaxNativeHotProfileRecords) {
-            append_unique(native_hot_rips_);
+            append_unique(pending_native_hot_rips_);
         }
 
         const std::uint64_t magic = kNativeHotProfileMagic;
@@ -2997,12 +3352,12 @@ private:
     }
 
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210008ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210010ull;
     static constexpr std::uint64_t kSerializedDecodedOpLayoutToken = 344;
-    static constexpr std::size_t kWriterBatchRecords = 512;
+    static constexpr std::size_t kWriterBatchRecords = 2048;
     static constexpr std::size_t kMaxShardRecords = 2048;
     static constexpr std::size_t kMigrationShardRecords = 8192;
-    static constexpr std::size_t kMaxNativeHotProfileRecords = 16u * 1024u;
+    static constexpr std::size_t kMaxNativeHotProfileRecords = 320u * 1024u;
     static constexpr std::uint64_t kNativeHotProfileMagic = 0x31544f4842425845ull;
     static constexpr std::uint32_t kNativeHotProfileVersion = 2;
     static constexpr std::string_view kNativeHotProfileFile =
@@ -3112,7 +3467,11 @@ private:
     std::uint64_t LoadExistingShards(const std::filesystem::path& source_directory,
                                      const JitIrCacheIdentity& source_identity,
                                      const bool restore_native,
-                                     const bool needs_identity_migration) {
+                                     const bool needs_identity_migration,
+                                     const std::uint64_t record_budget) {
+        if (record_budget == 0) {
+            return 0;
+        }
         std::vector<std::filesystem::path> shards;
         std::error_code error;
         for (std::filesystem::directory_iterator it(source_directory, error), end;
@@ -3169,10 +3528,19 @@ private:
             }
         }
         std::sort(shards.begin(), shards.end());
-        constexpr std::size_t kMaxLoadedShards = 1024;
+        constexpr std::size_t kMaxLoadedShards =
+#ifdef __ANDROID__
+            512;
+#else
+            1024;
+#endif
         if (shards.size() > kMaxLoadedShards) {
             shards.erase(shards.begin(), shards.end() - kMaxLoadedShards);
         }
+        // Newer shards contain native enrichments for IR-only records from older
+        // generations. Merge them first so the record cap cannot hide the native
+        // payload behind an older duplicate.
+        std::reverse(shards.begin(), shards.end());
 
         const auto load_started = std::chrono::steady_clock::now();
         std::vector<JitIrCacheLoadResult> shard_results(shards.size());
@@ -3210,6 +3578,8 @@ private:
         std::uint64_t total_instructions = 0;
         std::uint64_t total_native_bytes = 0;
         std::uint64_t total_native_relocations = 0;
+        const std::uint64_t max_loaded_records =
+            std::min(record_budget, limits_.max_records);
         std::uint32_t bad_log_budget = 8;
         bool aggregate_limit_reached = false;
         for (std::size_t shard_index = 0; shard_index < shards.size(); ++shard_index) {
@@ -3243,7 +3613,32 @@ private:
                     record_native_relocations += segment.relocs.size();
                 }
                 const std::uint64_t record_instructions = record.block.instructions.size();
-                if (candidate_records >= limits_.max_records ||
+                auto& versions = records_by_rip_[record.guest_rip];
+                const auto duplicate = std::find_if(
+                    versions.begin(), versions.end(), [&](const JitIrCacheRecord& existing) {
+                        return existing.guest_hash == record.guest_hash &&
+                               existing.block.end_rip == record.block.end_rip;
+                    });
+                if (duplicate != versions.end()) {
+                    const bool incoming_native =
+                        (record.native_flags & kJitNativeFlagValid) != 0;
+                    const bool existing_native =
+                        (duplicate->native_flags & kJitNativeFlagValid) != 0;
+                    if (incoming_native && !existing_native &&
+                        record_native_bytes <=
+                            limits_.max_total_native_bytes - total_native_bytes &&
+                        record_native_relocations <=
+                            limits_.max_total_native_relocations -
+                                total_native_relocations) {
+                        total_native_bytes += record_native_bytes;
+                        total_native_relocations += record_native_relocations;
+                        const std::uint64_t original_order = duplicate->loaded_order;
+                        *duplicate = std::move(record);
+                        duplicate->loaded_order = original_order;
+                    }
+                    continue;
+                }
+                if (candidate_records >= max_loaded_records ||
                     record_instructions > limits_.max_total_instructions - total_instructions ||
                     record_native_bytes > limits_.max_total_native_bytes - total_native_bytes ||
                     record_native_relocations >
@@ -3256,28 +3651,12 @@ private:
                 total_native_bytes += record_native_bytes;
                 total_native_relocations += record_native_relocations;
 
-                auto& versions = records_by_rip_[record.guest_rip];
-                const auto duplicate = std::find_if(
-                    versions.begin(), versions.end(), [&](const JitIrCacheRecord& existing) {
-                        return existing.guest_hash == record.guest_hash &&
-                               existing.block.end_rip == record.block.end_rip;
-                    });
-                if (duplicate != versions.end()) {
-                    const bool incoming_native =
-                        (record.native_flags & kJitNativeFlagValid) != 0;
-                    if (incoming_native) {
-                        const std::uint64_t original_order = duplicate->loaded_order;
-                        *duplicate = std::move(record);
-                        duplicate->loaded_order = original_order;
-                    }
-                } else {
-                    constexpr std::size_t kVersionsPerRip = 8;
-                    if (versions.size() == kVersionsPerRip) {
-                        versions.erase(versions.begin());
-                    }
-                    versions.push_back(std::move(record));
-                    ++loaded;
+                constexpr std::size_t kVersionsPerRip = 8;
+                if (versions.size() == kVersionsPerRip) {
+                    versions.erase(versions.begin());
                 }
+                versions.push_back(std::move(record));
+                ++loaded;
             }
             if (aggregate_limit_reached) {
                 JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_LOAD_LIMIT] records=%llu "
@@ -3357,6 +3736,7 @@ private:
                                     native_records,
                                     static_cast<unsigned long long>(native_written),
                                     shard.string().c_str());
+                        FlushNativeWarmProfile();
                     }
                 } else {
                     JitLog("[EXECUTOR_JIT_PERSISTENT_CACHE_WRITE_FAIL] records=%zu "
@@ -3379,6 +3759,7 @@ private:
     }
 
     void StopWriter() {
+        FlushNativeWarmProfile();
         if (writer_.joinable()) {
             {
                 std::lock_guard lock{writer_mutex_};
@@ -3396,8 +3777,10 @@ private:
     bool enabled_ = false;
     std::atomic_bool writer_available_{true};
     JitIrCacheIdentity identity_{};
+    std::uint64_t profile_identity_ = 0;
     JitIrCacheLimits limits_{};
     std::filesystem::path directory_{};
+    std::mutex records_mutex_{};
     std::unordered_map<std::uint64_t, std::vector<JitIrCacheRecord>> records_by_rip_{};
     std::mutex native_hot_profile_mutex_{};
     std::vector<std::uint64_t> native_hot_rips_{};
@@ -3410,6 +3793,7 @@ private:
     std::uint64_t shard_sequence_ = static_cast<std::uint64_t>(
         std::chrono::system_clock::now().time_since_epoch().count());
     std::uint64_t next_loaded_order_ = 1;
+    std::atomic<std::uint64_t> accepted_new_records_{0};
 };
 
 struct PublishedCodeWitness {
@@ -3417,6 +3801,24 @@ struct PublishedCodeWitness {
 
     const LsxDecodedRegion* const decoded = nullptr;
     mutable std::atomic<std::uint32_t> revision{1};
+};
+
+enum class LocalJitTier : std::uint8_t {
+    Tier0 = 0,
+    Tier1 = 1,
+    Tier2 = 2,
+};
+static_assert(static_cast<std::uint8_t>(LocalJitTier::Tier0) !=
+              static_cast<std::uint8_t>(LocalJitTier::Tier1));
+static_assert(static_cast<std::uint8_t>(LocalJitTier::Tier1) !=
+              static_cast<std::uint8_t>(LocalJitTier::Tier2));
+
+enum class Tier1PromotionState : std::uint8_t {
+    Cold = 0,
+    Queued,
+    Compiling,
+    Active,
+    Deoptimized,
 };
 
 struct JitExecutionLookup {
@@ -3429,6 +3831,13 @@ struct CachedTranslationRecord {
     TranslationRecord block{};
     const LsxDecodedRegion* decoded = nullptr;
     PublishedCodeWitness* witness = nullptr;
+    TranslationRecord tier0_block{};
+    Arm64BlockEntry tier0_published_external = nullptr;
+    Arm64BlockEntry tier0_published_resident = nullptr;
+    Arm64BlockEntry tier1_published_external = nullptr;
+    Arm64BlockEntry tier1_published_resident = nullptr;
+    LocalJitTier tier = LocalJitTier::Tier0;
+    Tier1PromotionState tier1_state = Tier1PromotionState::Cold;
 };
 
 class GuestRegionDirectory {
@@ -3509,7 +3918,7 @@ private:
     tsl::robin_map<std::uint64_t, Page> pages_{};
 };
 
-constexpr std::size_t kJitExecutionSetCount = 4096;
+constexpr std::size_t kJitExecutionSetCount = 16384;
 constexpr std::size_t kJitExecutionWaysPerSet = 4;
 constexpr std::uint32_t kJitInspectionSampleThreshold = 8192u;
 
@@ -3624,8 +4033,10 @@ thread_local JitThreadExecutionCache g_jit_thread_execution_cache{};
 struct alignas(16) OutboundEdgeState {
     explicit OutboundEdgeState(const std::uint64_t rip,
                             RetiringTranslationRuntime* edge_owner = nullptr,
-                            const std::uint64_t source = 0)
-        : guest_rip(rip), owner(edge_owner), source_rip(source) {}
+                            const std::uint64_t source = 0,
+                            const bool resident_frame = false)
+        : guest_rip(rip), owner(edge_owner), source_rip(source),
+          enters_resident_frame(resident_frame) {}
 
     std::atomic<Arm64BlockEntry> target{nullptr};
     const std::uint64_t guest_rip = 0;
@@ -3635,10 +4046,19 @@ struct alignas(16) OutboundEdgeState {
     const std::uint64_t source_rip = 0;
     bool enters_resident_frame = false;
     std::atomic<std::uint8_t> inspection_pending{1};
+    // Keep this in the old tail padding: persisted native blocks embed the
+    // offsets of owner/source_rip/enters_resident_frame. Source validation
+    // identifies an edge emitted by a trace so its already-selected hot exit
+    // isn't fed back into PGO on every bounded safepoint.
+    std::atomic<const TraceValidationRecord*> source_trace_validation{nullptr};
 };
 
 static_assert(offsetof(OutboundEdgeState, target) == 0);
 static_assert(offsetof(OutboundEdgeState, guest_rip) == 0x08);
+static_assert(offsetof(OutboundEdgeState, owner) == 0x20);
+static_assert(offsetof(OutboundEdgeState, source_rip) == 0x28);
+static_assert(offsetof(OutboundEdgeState, enters_resident_frame) == 0x30);
+static_assert(sizeof(OutboundEdgeState) == 0x40);
 static_assert(std::atomic<Arm64BlockEntry>::is_always_lock_free);
 static_assert(sizeof(std::atomic<Arm64BlockEntry>) == sizeof(Arm64BlockEntry));
 
@@ -3669,9 +4089,11 @@ struct alignas(64) IndirectEdgeFanout {
     static constexpr std::uint32_t kReturnWayCount = 16;
 
     IndirectEdgeFanout(RetiringTranslationRuntime* backend, const std::uint64_t rip,
-                     const bool return_site = false)
+                     const bool return_site = false,
+                     const bool resident_frame_entry = false)
         : owner(backend), source_rip(rip),
-          way_count(return_site ? kReturnWayCount : kJumpWayCount) {}
+          way_count(return_site ? kReturnWayCount : kJumpWayCount),
+          resident_frame(resident_frame_entry) {}
 
     void Retire() noexcept {
         active.store(0, std::memory_order_release);
@@ -3686,6 +4108,7 @@ struct alignas(64) IndirectEdgeFanout {
     std::array<std::atomic<OutboundEdgeState*>, kReturnWayCount> ways{};
     std::atomic<std::uint32_t> replacement{0};
     std::atomic<std::uint32_t> active{1};
+    const bool resident_frame = false;
 };
 
 static_assert(offsetof(IndirectEdgeFanout, way_count) == 0x10);
@@ -3715,6 +4138,10 @@ struct TraceValidationRecord {
     Arm64BlockEntry baseline_resident_entry = nullptr;
     const PublishedCodeWitness* baseline_witness = nullptr;
     std::vector<TraceValidationMember> members{};
+    // Successful trace entries are sampled at the outbound safepoint. Keep
+    // the estimate on the trace itself so a rare guard exit is judged by its
+    // rate, rather than eventually retiring every long-lived hot trace.
+    mutable std::atomic<std::uint64_t> estimated_entries{};
     std::atomic<bool> active{false};
 
     bool Matches() const noexcept {
@@ -3873,6 +4300,9 @@ struct JitLeafHlePltTarget {
     std::uint64_t expected_thunk = 0;
     std::uint64_t native_function = 0;
 };
+
+bool TryExecuteJitResolvedLeafHleTail(
+    LsxMachineImage& state, const JitLeafHlePltTarget& target);
 
 bool TryResolveJitLeafHlePlt(const std::uint64_t plt_rip,
                                   JitLeafHlePltTarget& target) {
@@ -4203,6 +4633,17 @@ void EmitPublishFaultDescriptor(Xbyak_aarch64::CodeGenerator& code,
     code.str(code.x9, destination);
 }
 
+void EmitPublishFaultRecoveryDescriptor(
+    Xbyak_aarch64::CodeGenerator& code,
+    const NativeFaultRecoveryDescriptor& descriptor,
+    const XReg& publication_slot) {
+    const std::uintptr_t tagged =
+        reinterpret_cast<std::uintptr_t>(std::addressof(descriptor)) |
+        kNativeFaultRecoveryTag;
+    EmitJitRelocatablePointer(code, code.x9, tagged);
+    code.str(code.x9, Xbyak_aarch64::ptr(publication_slot));
+}
+
 template <typename Value>
 void EmitCallArgument(Xbyak_aarch64::CodeGenerator& code,
                       const std::uint32_t argument_index,
@@ -4364,7 +4805,7 @@ void EmitLeafHleGuard(Xbyak_aarch64::CodeGenerator& code,
                       Xbyak_aarch64::Label& fallback) {
     code.mov(code.x9, got_slot);
     code.ldr(code.x10, Xbyak_aarch64::ptr(code.x9));
-    code.mov(code.x11, expected_thunk);
+    EmitJitRelocatablePointer(code, code.x11, expected_thunk);
     code.cmp(code.x10, code.x11);
     code.bne(fallback);
 }
@@ -4554,53 +4995,229 @@ std::uint64_t JitModuleBaseForNativeCache() noexcept {
     return 0;
 }
 
+struct JitOwnModuleMetadata {
+    std::uint64_t module_base = 0;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 16> load_ranges{};
+    std::size_t load_range_count = 0;
+    std::uint64_t build_identity = 0;
+    bool build_identity_from_gnu_note = false;
+};
+
+const JitOwnModuleMetadata& JitOwnModuleMetadataForNativeCache() noexcept {
+    static const JitOwnModuleMetadata metadata = []() noexcept {
+        JitOwnModuleMetadata result{};
+        result.module_base = JitModuleBaseForNativeCache();
+#ifdef __ANDROID__
+        if (result.module_base == 0) {
+            return result;
+        }
+        dl_iterate_phdr(
+            [](dl_phdr_info* info, std::size_t, void* opaque) {
+                auto& result =
+                    *static_cast<JitOwnModuleMetadata*>(opaque);
+                if (static_cast<std::uint64_t>(info->dlpi_addr) !=
+                    result.module_base) {
+                    return 0;
+                }
+                for (ElfW(Half) index = 0;
+                     index < info->dlpi_phnum; ++index) {
+                    const ElfW(Phdr)& header = info->dlpi_phdr[index];
+                    if (header.p_type == PT_LOAD && header.p_memsz != 0 &&
+                        result.load_range_count <
+                            result.load_ranges.size() &&
+                        header.p_vaddr <=
+                            std::numeric_limits<std::uint64_t>::max() -
+                                result.module_base) {
+                        const std::uint64_t begin =
+                            result.module_base + header.p_vaddr;
+                        if (header.p_memsz <=
+                            std::numeric_limits<std::uint64_t>::max() -
+                                begin) {
+                            result.load_ranges[
+                                result.load_range_count++] = {
+                                begin, begin + header.p_memsz};
+                        }
+                    }
+                    if (header.p_type != PT_NOTE ||
+                        header.p_memsz < sizeof(ElfW(Nhdr)) ||
+                        header.p_vaddr >
+                            std::numeric_limits<std::uint64_t>::max() -
+                                result.module_base ||
+                        header.p_memsz >
+                            std::numeric_limits<std::size_t>::max()) {
+                        continue;
+                    }
+                    const std::uint64_t note_begin =
+                        result.module_base + header.p_vaddr;
+                    if (header.p_memsz >
+                        std::numeric_limits<std::uint64_t>::max() -
+                            note_begin) {
+                        continue;
+                    }
+                    const std::uint64_t note_end =
+                        note_begin + header.p_memsz;
+                    bool note_is_mapped = false;
+                    for (ElfW(Half) load_index = 0;
+                         load_index < info->dlpi_phnum;
+                         ++load_index) {
+                        const ElfW(Phdr)& load =
+                            info->dlpi_phdr[load_index];
+                        if (load.p_type != PT_LOAD ||
+                            (load.p_flags & PF_R) == 0 ||
+                            load.p_vaddr >
+                                std::numeric_limits<std::uint64_t>::max() -
+                                    result.module_base) {
+                            continue;
+                        }
+                        const std::uint64_t load_begin =
+                            result.module_base + load.p_vaddr;
+                        if (load.p_memsz >
+                            std::numeric_limits<std::uint64_t>::max() -
+                                load_begin) {
+                            continue;
+                        }
+                        const std::uint64_t load_end =
+                            load_begin + load.p_memsz;
+                        if (note_begin >= load_begin &&
+                            note_end <= load_end) {
+                            note_is_mapped = true;
+                            break;
+                        }
+                    }
+                    if (!note_is_mapped) {
+                        continue;
+                    }
+                    const auto* cursor =
+                        reinterpret_cast<const std::uint8_t*>(
+                            note_begin);
+                    std::size_t remaining =
+                        static_cast<std::size_t>(header.p_memsz);
+                    while (remaining >= sizeof(ElfW(Nhdr))) {
+                        ElfW(Nhdr) note{};
+                        std::memcpy(&note, cursor, sizeof(note));
+                        cursor += sizeof(note);
+                        remaining -= sizeof(note);
+                        const auto align_note_field =
+                            [](const std::uint32_t size,
+                               std::size_t& aligned) {
+                            if (size >
+                                std::numeric_limits<std::uint32_t>::max() -
+                                    3u) {
+                                return false;
+                            }
+                            aligned = static_cast<std::size_t>(
+                                (size + 3u) & ~std::uint32_t{3u});
+                            return true;
+                        };
+                        std::size_t name_bytes = 0;
+                        std::size_t descriptor_bytes = 0;
+                        if (!align_note_field(
+                                note.n_namesz, name_bytes) ||
+                            !align_note_field(
+                                note.n_descsz, descriptor_bytes) ||
+                            name_bytes > remaining ||
+                            descriptor_bytes >
+                                remaining - name_bytes) {
+                            break;
+                        }
+                        const auto* name = cursor;
+                        const auto* descriptor = cursor + name_bytes;
+                        if (result.build_identity == 0 &&
+                            note.n_type == NT_GNU_BUILD_ID &&
+                            note.n_namesz >= 3 &&
+                            std::memcmp(name, "GNU", 3) == 0 &&
+                            note.n_descsz != 0) {
+                            result.build_identity =
+                                Common::FingerprintBytes(
+                                    std::span<const std::uint8_t>{
+                                        descriptor,
+                                        static_cast<std::size_t>(
+                                            note.n_descsz)},
+                                    Common::FingerprintDomain::
+                                            NativeSegment ^
+                                        0x4255494c44494431ull);
+                            if (result.build_identity == 0) {
+                                result.build_identity = 1;
+                            }
+                            result.build_identity_from_gnu_note = true;
+                        }
+                        const std::size_t consumed =
+                            name_bytes + descriptor_bytes;
+                        cursor += consumed;
+                        remaining -= consumed;
+                    }
+                }
+
+                // Android linkers normally provide NT_GNU_BUILD_ID. If a
+                // stripped/custom linker omits it, hash the base-independent
+                // ELF layout plus immutable file-backed load bytes. This is
+                // deliberately more expensive and only runs once.
+                if (result.build_identity == 0) {
+                    Common::ContentFingerprint64 fallback{
+                        Common::FingerprintDomain::NativeSegment ^
+                        0x454c4646414c4c42ull};
+                    fallback.UpdateLittleEndian(
+                        static_cast<std::uint64_t>(info->dlpi_phnum));
+                    for (ElfW(Half) index = 0;
+                         index < info->dlpi_phnum; ++index) {
+                        const ElfW(Phdr)& header =
+                            info->dlpi_phdr[index];
+                        fallback.UpdateLittleEndian(header.p_type);
+                        fallback.UpdateLittleEndian(header.p_flags);
+                        fallback.UpdateLittleEndian(header.p_vaddr);
+                        fallback.UpdateLittleEndian(header.p_filesz);
+                        fallback.UpdateLittleEndian(header.p_memsz);
+                        fallback.UpdateLittleEndian(header.p_align);
+                        if (header.p_type != PT_LOAD ||
+                            (header.p_flags & PF_R) == 0 ||
+                            (header.p_flags & PF_W) != 0 ||
+                            header.p_filesz == 0 ||
+                            header.p_vaddr >
+                                std::numeric_limits<std::uint64_t>::max() -
+                                    result.module_base) {
+                            continue;
+                        }
+                        const std::uint64_t available =
+                            std::min<std::uint64_t>(
+                                header.p_filesz, header.p_memsz);
+                        if (available >
+                            std::numeric_limits<std::size_t>::max()) {
+                            continue;
+                        }
+                        fallback.Update(
+                            reinterpret_cast<const void*>(
+                                result.module_base + header.p_vaddr),
+                            static_cast<std::size_t>(available));
+                    }
+                    result.build_identity = fallback.Finish();
+                    if (result.build_identity == 0) {
+                        result.build_identity =
+                            0x454c4646414c4c42ull;
+                    }
+                }
+                return 1;
+            },
+            &result);
+#endif
+        return result;
+    }();
+    return metadata;
+}
+
 bool JitAddressInOwnLoadSegment(const std::uint64_t address,
-                                     const std::uint64_t module_base) noexcept {
+                                      const std::uint64_t module_base) noexcept {
 #ifdef __ANDROID__
     if (address == 0 || module_base == 0) {
         return false;
     }
-    struct ModuleSegments {
-        std::uint64_t module_base = 0;
-        std::array<std::pair<std::uint64_t, std::uint64_t>, 16> ranges{};
-        std::size_t count = 0;
-    };
-    static const ModuleSegments own_segments = []() noexcept {
-        ModuleSegments segments{};
-        segments.module_base = JitModuleBaseForNativeCache();
-        if (segments.module_base == 0) {
-            return segments;
-        }
-        dl_iterate_phdr(
-            [](dl_phdr_info* info, std::size_t, void* opaque) {
-                auto& segments = *static_cast<ModuleSegments*>(opaque);
-                if (static_cast<std::uint64_t>(info->dlpi_addr) != segments.module_base) {
-                    return 0;
-                }
-                for (std::uint16_t index = 0;
-                     index < info->dlpi_phnum && index < std::numeric_limits<std::uint16_t>::max();
-                     ++index) {
-                    const ElfW(Phdr)& header = info->dlpi_phdr[index];
-                    if (header.p_type != PT_LOAD || header.p_memsz == 0 ||
-                        segments.count == segments.ranges.size()) {
-                        continue;
-                    }
-                    const std::uint64_t begin = segments.module_base + header.p_vaddr;
-                    if (header.p_memsz > std::numeric_limits<std::uint64_t>::max() - begin) {
-                        continue;
-                    }
-                    segments.ranges[segments.count++] = {begin, begin + header.p_memsz};
-                }
-                return 0;
-            },
-            &segments);
-        return segments;
-    }();
-    if (module_base != own_segments.module_base) {
+    const JitOwnModuleMetadata& own_module =
+        JitOwnModuleMetadataForNativeCache();
+    if (module_base != own_module.module_base) {
         return false;
     }
-    for (std::size_t index = 0; index < own_segments.count; ++index) {
-        const auto [begin, end] = own_segments.ranges[index];
+    for (std::size_t index = 0;
+         index < own_module.load_range_count; ++index) {
+        const auto [begin, end] = own_module.load_ranges[index];
         if (address >= begin && address < end) {
             return true;
         }
@@ -4613,8 +5230,66 @@ bool JitAddressInOwnLoadSegment(const std::uint64_t address,
 #endif
 }
 
+std::uint64_t JitRuntimeElfBuildIdentity() noexcept {
+#ifdef __ANDROID__
+    return JitOwnModuleMetadataForNativeCache().build_identity;
+#else
+    return kJitNativeCacheSourceAbiHash != 0
+        ? kJitNativeCacheSourceAbiHash
+        : 0x4e4f4e454c464142ull;
+#endif
+}
+
+std::uint64_t JitNativeCacheAbiId() noexcept {
+    if (kJitNativeCacheSourceAbiHash == 0) {
+        return 0;
+    }
+    // Persisted native blocks only admit symbolic stable-external, IR, edge and
+    // segment relocations. Their ABI is therefore independent of unrelated
+    // renderer/UI/cache-loader changes that alter the enclosing ELF or source
+    // hash. Bump this explicit epoch only when the emitted-code ABI, machine
+    // state layout, relocation IDs or stable helper contracts become
+    // incompatible. The value intentionally preserves the portable cache
+    // created by the first relocation-safe runtime.
+    // Bump whenever native register-allocation or fault-publication semantics
+    // change.  The previous identity could restore experimental Tier-1 SIMD
+    // bodies generated with a now-reverted allocation policy.
+    constexpr std::uint64_t kStrictMemoryAbi = 0xba50b33ef8e67392ull;
+    // Tags 1 and 3 were rejected fully-relaxed and RCpc experiments; tag 5
+    // used an NZCV-clobbering alignment test, and tag 7 was the narrower
+    // private-stack experiment. Tag 11 keeps the Box64-style strong-memory
+    // sequences introduced by tag 9 and adds the non-faultable fast execution
+    // contract: direct dispatch plus conservative T0 scalar residency.
+    constexpr std::uint64_t kStrongMemorySequenceAbiTag =
+        0x000000000000000bull;
+    return kStrictMemoryAbi ^
+           (FastGuestMemoryEnabled()
+                ? kStrongMemorySequenceAbiTag
+                : 0ull);
+}
+
+bool ClassifyJitModuleRelative(
+    const std::uint64_t value,
+    const std::uint64_t module_base,
+    JitNativeRelocation& relocation) noexcept {
+    if (value < module_base ||
+        !JitAddressInOwnLoadSegment(value, module_base)) {
+        return false;
+    }
+    const std::uint64_t offset = value - module_base;
+    if (offset >
+        static_cast<std::uint64_t>(
+            std::numeric_limits<std::int64_t>::max())) {
+        return false;
+    }
+    relocation.kind = JitNativeRelocationKind::ModuleRelative;
+    relocation.target_index = 0;
+    relocation.addend = static_cast<std::int64_t>(offset);
+    return true;
+}
+
 bool AddJitNativeRelocationAddend(const std::uint64_t base,
-                                       const std::int64_t addend,
+                                        const std::int64_t addend,
                                        std::uint64_t& result) noexcept {
     if (addend >= 0) {
         const auto positive = static_cast<std::uint64_t>(addend);
@@ -4653,12 +5328,95 @@ StableDecodedBlock DecodeStableBlock(const StableDecodeRequest& request) {
     throw std::runtime_error(error.str());
 }
 
+struct TieredGuardDeoptContext {
+    RetiringTranslationRuntime* owner = nullptr;
+    TraceValidationRecord* validation = nullptr;
+    std::uint64_t seed_rip = 0;
+    std::uint64_t source_rip = 0;
+    std::uint64_t cold_target = 0;
+    std::atomic<std::uint64_t> exits{};
+    std::atomic<bool> rollback_requested{false};
+};
+
 struct TieredGuardEmission {
     std::size_t instruction_index = 0;
+    std::uint64_t source_block_rip = 0;
     std::uint64_t hot_target = 0;
     std::uint64_t cold_target = 0;
     bool hot_path_is_taken = false;
+    TieredGuardDeoptContext* deopt_context = nullptr;
 };
+
+std::uint64_t ExecuteTieredGuardDeopt(
+    LsxMachineImage* state, TieredGuardDeoptContext* context) noexcept;
+
+#if defined(__ANDROID__) && defined(__aarch64__)
+struct SignalSafeJitSlabRange {
+    std::atomic<std::uintptr_t> begin{0};
+    std::atomic<std::uintptr_t> end{0};
+};
+
+constexpr std::size_t kMaximumSignalSafeJitSlabs = 512;
+constexpr std::size_t kInvalidSignalSafeJitSlab =
+    std::numeric_limits<std::size_t>::max();
+std::array<SignalSafeJitSlabRange, kMaximumSignalSafeJitSlabs>
+    g_signal_safe_jit_slabs{};
+
+std::size_t PublishSignalSafeJitSlab(void* const base,
+                                     const std::size_t size) noexcept {
+    if (base == nullptr || size == 0) {
+        return kInvalidSignalSafeJitSlab;
+    }
+    const auto begin = reinterpret_cast<std::uintptr_t>(base);
+    if (begin > std::numeric_limits<std::uintptr_t>::max() - size) {
+        return kInvalidSignalSafeJitSlab;
+    }
+    for (std::size_t index = 0; index < g_signal_safe_jit_slabs.size();
+         ++index) {
+        std::uintptr_t empty = 0;
+        auto& range = g_signal_safe_jit_slabs[index];
+        if (!range.begin.compare_exchange_strong(
+                empty, begin, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            continue;
+        }
+        range.end.store(begin + size, std::memory_order_release);
+        return index;
+    }
+    return kInvalidSignalSafeJitSlab;
+}
+
+void WithdrawSignalSafeJitSlab(const std::size_t index) noexcept {
+    if (index >= g_signal_safe_jit_slabs.size()) {
+        return;
+    }
+    auto& range = g_signal_safe_jit_slabs[index];
+    range.end.store(0, std::memory_order_release);
+    range.begin.store(0, std::memory_order_release);
+}
+
+bool SignalContextPcIsGeneratedCode(const void* const raw_context) noexcept {
+    if (raw_context == nullptr) {
+        return false;
+    }
+    const auto* const context =
+        static_cast<const ucontext_t*>(raw_context);
+    const auto pc = static_cast<std::uintptr_t>(context->uc_mcontext.pc);
+    for (const auto& range : g_signal_safe_jit_slabs) {
+        const std::uintptr_t end =
+            range.end.load(std::memory_order_acquire);
+        if (end == 0 || pc >= end) {
+            continue;
+        }
+        const std::uintptr_t begin =
+            range.begin.load(std::memory_order_relaxed);
+        if (begin != 0 && pc >= begin) {
+            return true;
+        }
+    }
+    return false;
+}
+#endif
 
 class NativeSegmentDepot {
 public:
@@ -4668,7 +5426,11 @@ public:
     };
 
     NativeSegmentDepot() {
+#ifdef __ANDROID__
+        code_ranges_.reserve(128u * 1024u);
+#else
         code_ranges_.reserve(1u << 20);
+#endif
     }
     ~NativeSegmentDepot();
 
@@ -4683,7 +5445,10 @@ public:
                                            bool* chain_abi_out = nullptr,
                                            Arm64BlockEntry* resident_entry_out = nullptr,
                                            const std::vector<TieredGuardEmission>*
-                                               tiered_guards = nullptr);
+                                               tiered_guards = nullptr,
+                                           bool force_local_loop_dispatch_safepoint = false,
+                                           LocalJitTier compilation_tier =
+                                               LocalJitTier::Tier0);
     Arm64BlockEntry EmitCheckedNativeBlock(const LsxDecodedRegion& block, Arm64BlockEntry native);
     Arm64BlockEntry EmitInterpreterBridge(const LsxDecodedRegion& block);
     bool CapturePersistentNativeBlock(Arm64BlockEntry entry, Arm64BlockEntry direct,
@@ -4714,12 +5479,15 @@ private:
 
 #ifdef __ANDROID__
     struct ExecutableSlab {
-        ExecutableSlab(std::uint8_t* mapping, const std::size_t mapping_size)
-            : base(mapping), size(mapping_size) {}
+        ExecutableSlab(std::uint8_t* mapping, const std::size_t mapping_size,
+                       const std::size_t signal_range_slot)
+            : base(mapping), size(mapping_size),
+              signal_slot(signal_range_slot) {}
 
         std::uint8_t* base{};
         std::size_t size{};
         std::atomic<std::size_t> used{0};
+        std::size_t signal_slot{kInvalidSignalSafeJitSlab};
     };
 #endif
 
@@ -4727,8 +5495,15 @@ private:
     Arm64BlockEntry PublishDirectEntry(Arm64BlockEntry* published_target,
                                        Arm64BlockEntry direct_target);
     Arm64BlockEntry CommitCode(std::unique_ptr<Xbyak_aarch64::CodeGenerator> code);
-    const CommittedCodeRange* FindCommittedCodeRange(Arm64BlockEntry entry) const;
+    std::optional<CommittedCodeRange>
+    FindCommittedCodeRange(Arm64BlockEntry entry) const;
     NativeDescriptorBundle* CreateDescriptorBundle();
+    void RegisterPersistentDescriptorRelocation(
+        const LsxDecodedOp* descriptor, const LsxDecodedRegion& owner,
+        const LsxDecodedOp& source);
+    bool ClassifyPersistentDescriptorRelocation(
+        std::uint64_t value, const LsxDecodedRegion& owner,
+        JitNativeRelocation& relocation) const;
 #ifdef __ANDROID__
     std::uint8_t* AllocateCommittedCode(std::size_t size);
     std::vector<std::unique_ptr<ExecutableSlab>> executable_slabs_;
@@ -4738,20 +5513,127 @@ private:
     std::vector<std::unique_ptr<Xbyak_aarch64::CodeGenerator>> owned_blocks_;
 #endif
     std::vector<CommittedCodeRange> code_ranges_;
+    std::unordered_map<std::uintptr_t, std::size_t> code_ranges_by_base_;
     mutable std::mutex code_ranges_mutex_;
     std::vector<std::unique_ptr<CheckedNativeBlockContext>> checked_native_contexts_;
     std::deque<LsxDecodedOp> auxiliary_fault_descriptors_;
     std::vector<std::unique_ptr<NativeDescriptorBundle>>
         native_descriptor_bundles_;
     std::mutex auxiliary_fault_descriptors_mutex_;
+    struct PersistentDescriptorRelocationTarget {
+        const LsxDecodedRegion* owner = nullptr;
+        std::uint32_t instruction_index = 0;
+    };
+    std::unordered_map<std::uint64_t, PersistentDescriptorRelocationTarget>
+        persistent_descriptor_relocations_;
+    mutable std::mutex persistent_descriptor_relocations_mutex_;
 };
 
 struct TieredEdgeProfile {
     std::uint64_t total_samples = 0;
     std::unordered_map<std::uint64_t, std::uint64_t> targets{};
+    std::uint64_t live_samples = 0;
+    std::unordered_map<std::uint64_t, std::uint64_t> live_targets{};
     bool queued = false;
+    bool imported = false;
     std::uint64_t retry_after_samples = 0;
+    std::uint8_t trace_rollback_count = 0;
+    bool tier1_queued = false;
+    bool tier1_promoted = false;
+    bool tier1_permanently_rejected = false;
+    std::uint64_t tier1_retry_after_samples = 0;
 };
+
+struct PersistedTieredEdgeRecord {
+    std::uint64_t source_rip = 0;
+    std::uint64_t target_rip = 0;
+    std::uint32_t samples = 0;
+    std::uint32_t reserved = 0;
+};
+
+static_assert(sizeof(PersistedTieredEdgeRecord) == 24);
+static_assert(std::is_trivially_copyable_v<PersistedTieredEdgeRecord>);
+
+constexpr std::uint64_t kTieredEdgeProfileMagic = UINT64_C(0x324f47504534584c);
+constexpr std::uint32_t kTieredEdgeProfileVersion = 2;
+constexpr std::string_view kTieredEdgeProfileFile = "tiered-edges-v2.bin";
+constexpr std::size_t kMaximumPersistedTieredEdges = 32u * 1024u;
+constexpr std::size_t kMaximumPersistedTargetsPerSource = 4u;
+constexpr std::uint64_t kTieredEdgeSampleCap = 1u << 20;
+// Runtime edge traffic can exceed thousands of samples per second. Flushing
+// the complete title profile every 4096 samples serialized the game threads
+// behind filesystem I/O roughly once per second. Shutdown/reconfiguration
+// already force a final flush, so keep periodic checkpoints deliberately rare.
+constexpr std::uint64_t kTieredProfileFlushSamples = 1u << 20;
+constexpr std::uint64_t kTieredProfileLiveValidationSamples = 8;
+constexpr std::uint64_t kTieredDominantNumerator = 9;
+constexpr std::uint64_t kTieredDominantDenominator = 10;
+constexpr std::uint64_t kTieredInternalDominantNumerator = 4;
+constexpr std::uint64_t kTieredInternalDominantDenominator = 5;
+constexpr std::size_t kMaximumTieredTraceGuards = 16;
+
+std::optional<std::uint64_t> SelectTieredTargetAtRatio(
+    const TieredEdgeProfile& profile,
+    const std::uint64_t minimum_total_samples,
+    const std::uint64_t dominant_numerator,
+    const std::uint64_t dominant_denominator) {
+    if (profile.total_samples < minimum_total_samples ||
+        profile.targets.empty()) {
+        return std::nullopt;
+    }
+    const auto dominant = std::ranges::max_element(
+        profile.targets, {}, [](const auto& item) {
+            return item.second;
+        });
+    if (dominant == profile.targets.end() ||
+        dominant->first == 0 ||
+        dominant->second * dominant_denominator <
+            profile.total_samples * dominant_numerator) {
+        return std::nullopt;
+    }
+    if (!profile.imported) {
+        return dominant->first;
+    }
+
+    const auto live = profile.live_targets.find(dominant->first);
+    if (profile.live_samples < kTieredProfileLiveValidationSamples ||
+        live == profile.live_targets.end() ||
+        live->second < kTieredProfileLiveValidationSamples) {
+        // Identity-bound PGO can safely seed an exact guarded trace before a
+        // fresh sparse sample arrives, but only for an overwhelmingly stable
+        // path. A wrong phase prediction side-exits to the preserved baseline
+        // and the existing rollback policy retires it.
+        constexpr std::uint64_t kWarmImportedSamples = 256;
+        constexpr std::uint64_t kWarmImportedPercent = 99;
+        return profile.total_samples >= kWarmImportedSamples &&
+                       dominant->second * 100u >=
+                           profile.total_samples *
+                               kWarmImportedPercent
+                   ? std::optional<std::uint64_t>{dominant->first}
+                   : std::nullopt;
+    }
+    if (live->second * dominant_denominator <
+        profile.live_samples * dominant_numerator) {
+        return std::nullopt;
+    }
+    return dominant->first;
+}
+
+std::optional<std::uint64_t> SelectStableTieredTarget(
+    const TieredEdgeProfile& profile,
+    const std::uint64_t minimum_total_samples) {
+    return SelectTieredTargetAtRatio(
+        profile, minimum_total_samples, kTieredDominantNumerator,
+        kTieredDominantDenominator);
+}
+
+std::optional<std::uint64_t> SelectStableInternalTieredTarget(
+    const TieredEdgeProfile& profile,
+    const std::uint64_t minimum_total_samples) {
+    return SelectTieredTargetAtRatio(
+        profile, minimum_total_samples, kTieredInternalDominantNumerator,
+        kTieredInternalDominantDenominator);
+}
 
 struct TieredTraceMemberPlan {
     std::uint64_t guest_rip = 0;
@@ -4764,10 +5646,18 @@ struct TieredTracePlan {
     LsxDecodedRegion combined{};
     std::vector<TieredTraceMemberPlan> members{};
     std::vector<TieredGuardEmission> guards{};
+    bool loop_head_osr = false;
+};
+
+struct TieredTracePlanDiagnostic {
+    const char* reason = nullptr;
+    std::uint64_t guest_rip = 0;
+    std::size_t member_count = 0;
 };
 
 struct TieredTraceArtifact {
     std::unique_ptr<TraceValidationRecord> validation{};
+    std::vector<std::unique_ptr<TieredGuardDeoptContext>> guard_contexts{};
     Arm64BlockEntry external_entry = nullptr;
     Arm64BlockEntry resident_entry = nullptr;
     OutboundEdgeState* primary_outbound_edge = nullptr;
@@ -4790,7 +5680,12 @@ void AppendDispatchIrContext(std::ostringstream& diagnostic,
 class RetiringTranslationRuntime final {
 public:
     RetiringTranslationRuntime() {
-        constexpr std::size_t kExpectedStartupBlocks = 1u << 19;
+        constexpr std::size_t kExpectedStartupBlocks =
+#ifdef __ANDROID__
+            64u * 1024u;
+#else
+            1u << 19;
+#endif
         edge_directory_.ReserveDestinations(kExpectedStartupBlocks);
         indirect_edge_fanouts_.reserve(kExpectedStartupBlocks / 8u);
         indirect_edge_fanout_storage_.reserve(kExpectedStartupBlocks / 8u);
@@ -4800,6 +5695,7 @@ public:
     }
 
     ~RetiringTranslationRuntime() {
+        tiered_profile_accepting_samples_.store(false, std::memory_order_release);
         StopTieredWorker();
         if (g_jit_thread_execution_cache.backend == this) {
             g_jit_thread_execution_cache.Reset(nullptr);
@@ -4820,34 +5716,42 @@ public:
 
     void RecordTieredEdge(std::uint64_t source_rip,
                           std::uint64_t target_rip) noexcept;
+    std::uint64_t HandleTieredGuardDeopt(
+        TieredGuardDeoptContext& context) noexcept;
     void RetirePublishedDestination(
         std::uint64_t guest_rip,
         const PublishedCodeWitness* rejected_witness) noexcept;
     void StartTieredWorker();
     void StopTieredWorker() noexcept;
+    void StopTieredWorkerLocked() noexcept;
+    void ApplyTieredConfiguration(bool enabled,
+                                  bool trace_compilation_enabled) noexcept;
     void TieredWorkerMain(std::stop_token stop_token) noexcept;
+    void CompileTier1Block(std::uint64_t guest_rip) noexcept;
+    bool DemoteTier1Locked(CachedTranslationRecord& record,
+                           std::uint64_t guest_rip,
+                           bool publish_tier0) noexcept;
     std::optional<TieredTracePlan> BuildTieredTracePlan(
-        std::uint64_t seed_rip);
+        std::uint64_t seed_rip, bool require_loop_closure,
+        TieredTracePlanDiagnostic* diagnostic);
     void CompileTieredTrace(TieredTracePlan plan) noexcept;
+    void LoadTieredEdgeProfile() noexcept;
+    void FlushTieredEdgeProfile() noexcept;
 
     std::uint64_t RunGuest(const std::uint64_t guest_rip, const LsxEntryPacket& ctx) {
 #ifdef __ANDROID__
         bool start_persistent_native_prewarm = false;
-        bool wait_for_persistent_native_prewarm = false;
         {
             std::lock_guard lock{block_cache_mutex_};
             if (persistent_native_prewarm_pending_) {
                 persistent_native_prewarm_pending_ = false;
                 persistent_native_prewarm_active_.store(true, std::memory_order_release);
                 start_persistent_native_prewarm = true;
-            } else {
-                wait_for_persistent_native_prewarm =
-                    persistent_native_prewarm_active_.load(std::memory_order_acquire);
             }
         }
         if (start_persistent_native_prewarm) {
             StartPersistentNativePrewarm();
-        } else if (wait_for_persistent_native_prewarm) {
+        } else if (persistent_native_prewarm_active_.load(std::memory_order_acquire)) {
             std::unique_lock warm_lock{persistent_native_prewarm_mutex_};
             persistent_native_prewarm_cv_.wait(warm_lock, [this] {
                 return !persistent_native_prewarm_active_.load(std::memory_order_acquire);
@@ -4873,6 +5777,10 @@ public:
         auto* const allow_guest_return_sentinel_slot = &g_allow_guest_return_sentinel;
         auto* const helper_fault_message_slot = &g_helper_fault_message;
         auto* const recent_execution_trace_slot = &g_recent_execution_trace;
+        auto* const execution_cache = &g_jit_thread_execution_cache;
+        if (execution_cache->backend != this) {
+            execution_cache->Reset(this);
+        }
         const bool rip_probe_enabled = !JitDiagnosticRipProbes().empty();
 #if defined(__ANDROID__) && defined(__aarch64__)
         auto** const synchronous_fault_resume_frame_slot =
@@ -4913,6 +5821,22 @@ public:
         std::uint64_t prior_dispatch_next_rip = 0;
         std::uint32_t prior_dispatch_size = 0;
         const LsxDecodedRegion* prior_dispatch_block = nullptr;
+        const auto advance_after_direct_hle_tail = [&]() {
+            result = state.rip_or_exit;
+            rip = state.rip_or_exit;
+            if (rip == kRunStopMarker || GuestRunCompletionPending()) {
+                result = GuestRunCompletionPending() ? GuestRunCompletionValue()
+                                                      : ReadGuestGpr64(state, LsxGpr::Rax);
+                cleanup();
+                return true;
+            }
+            if (rip == 0) {
+                result = ReadGuestGpr64(state, LsxGpr::Rax);
+                cleanup();
+                return true;
+            }
+            return false;
+        };
         for (;; ++executed_blocks) {
             if (process_exit_rip != 0 && rip == process_exit_rip) {
                 result = ReadGuestGpr64(state, LsxGpr::Rdi);
@@ -4936,25 +5860,27 @@ public:
                 cleanup();
                 return result;
             }
-            if (TryExecuteJitDirectHleTail({state, rip})) {
-                result = state.rip_or_exit;
-                rip = state.rip_or_exit;
-                if (rip == kRunStopMarker || GuestRunCompletionPending()) {
-                    result = GuestRunCompletionPending() ? GuestRunCompletionValue()
-                                                    : ReadGuestGpr64(state, LsxGpr::Rax);
-                    cleanup();
-                    return result;
-                }
-                if (rip == 0) {
-                    result = ReadGuestGpr64(state, LsxGpr::Rax);
-                    cleanup();
-                    return result;
-                }
-                continue;
-            }
-            const JitExecutionLookup execution = ResolveExecutableRegionCached(rip);
+            const JitExecutionLookup execution =
+                ResolveExecutableRegionCached(rip, *execution_cache);
             const TranslationRecord& block = execution.block;
             const LsxDecodedRegion* decoded_block = execution.decoded;
+            if (TranslationHasFeature(
+                    block.flags, TranslationFeature::DispatcherBoundary)) {
+                if (TryExecuteJitDirectHleTail({state, rip})) {
+                    if (advance_after_direct_hle_tail()) {
+                        return result;
+                    }
+                    continue;
+                }
+                JitLeafHlePltTarget plt_target{};
+                if (TryResolveJitLeafHlePlt(rip, plt_target) &&
+                    TryExecuteJitResolvedLeafHleTail(state, plt_target)) {
+                    if (advance_after_direct_hle_tail()) {
+                        return result;
+                    }
+                    continue;
+                }
+            }
             if (block.entry == nullptr) {
                 std::uint64_t trap_return_rip{};
                 if (TryExecutePs5FsTrapReturnBlock(
@@ -5023,8 +5949,11 @@ public:
             try {
                 JitDeferredGuestFault deferred_fault{};
                 bool synchronous_fault_resumed = false;
-                if (TranslationHasFeature(
-                        block.flags, TranslationFeature::SynchronousFaultResume)) {
+                if (TranslationHasFeature(block.flags,
+                                          TranslationFeature::NativeCode) ||
+                    TranslationHasFeature(
+                        block.flags,
+                        TranslationFeature::SynchronousFaultResume)) {
                     synchronous_fault_resumed =
                         ExecuteHostBlockWithSynchronousFaultResume(
                             block.entry, &state, result, &deferred_fault
@@ -5328,9 +6257,12 @@ public:
     }
 
     void ConfigurePersistentCache(const std::string& root_dir, const std::string& title_id,
-                                  const std::uint64_t executable_fingerprint,
-                                  const bool enabled) {
-        StopTieredWorker();
+                                   const std::uint64_t executable_fingerprint,
+                                   const bool enabled) {
+        tiered_profile_accepting_samples_.store(false, std::memory_order_release);
+        tiered_profile_generation_.fetch_add(1, std::memory_order_acq_rel);
+        std::unique_lock lifecycle_lock{tiered_worker_lifecycle_mutex_};
+        StopTieredWorkerLocked();
 #ifdef __ANDROID__
         StopPersistentNativePrewarm();
 #endif
@@ -5367,11 +6299,14 @@ public:
             }
             active_tiered_traces_.clear();
             tiered_active_code_bytes_.store(0, std::memory_order_release);
+            g_tiered_counts.active.store(0, std::memory_order_relaxed);
         }
         {
             std::lock_guard profile_lock{tiered_profile_mutex_};
             tiered_edge_profiles_.clear();
+            tier1_compile_queue_.clear();
             tiered_compile_queue_.clear();
+            tiered_loop_seed_requests_.clear();
         }
         for (auto& [rip, decoded] : decoded_blocks_) {
             (void)rip;
@@ -5381,11 +6316,18 @@ public:
         }
         decoded_blocks_.clear();
         block_results_.Clear();
+        g_tiered_counts.tier0_active.store(
+            0, std::memory_order_relaxed);
+        g_tiered_counts.tier1_active.store(
+            0, std::memory_order_relaxed);
         persistent_ir_cache_.Configure(root_dir, title_id, executable_fingerprint, enabled);
+        LoadTieredEdgeProfile();
 #ifdef __ANDROID__
         persistent_native_prewarm_pending_ = enabled;
         persistent_native_prewarm_active_.store(false, std::memory_order_release);
+        g_jit_hle_slab_base_for_native_cache.store(0, std::memory_order_release);
 #endif
+        tiered_profile_accepting_samples_.store(true, std::memory_order_release);
     }
 
     void StopPersistentNativePrewarm() {
@@ -5403,11 +6345,13 @@ public:
 #endif
     }
 
-    void FinishPersistentNativePrewarm() noexcept {
+    void FinishPersistentNativePrewarm(const bool background = false) noexcept {
 #ifdef __ANDROID__
-        const int purge_mode =
-            android_get_device_api_level() >= 34 ? M_PURGE_ALL : M_PURGE;
-        (void)mallopt(purge_mode, 0);
+        if (!background) {
+            const int purge_mode =
+                android_get_device_api_level() >= 34 ? M_PURGE_ALL : M_PURGE;
+            (void)mallopt(purge_mode, 0);
+        }
         persistent_native_prewarm_active_.store(false, std::memory_order_release);
         persistent_native_prewarm_cv_.notify_all();
 #endif
@@ -5429,10 +6373,13 @@ public:
         }
 
         const auto started = std::chrono::steady_clock::now();
+        g_jit_hle_slab_base_for_native_cache.store(
+            executor_jit_ensure_hle_thunk_slab(), std::memory_order_release);
         std::vector<StableDecodedBlock> warm_set;
         try {
+            constexpr std::size_t kAndroidNativePrewarmRecords = 384u * 1024u;
             warm_set = persistent_ir_cache_.TakeNativeWarmSet(
-                std::numeric_limits<std::size_t>::max(), false);
+                kAndroidNativePrewarmRecords, false);
         } catch (const std::exception& exception) {
             JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
                         "reason=complete_extract_failed error=%s",
@@ -5454,21 +6401,25 @@ public:
         const auto extracted_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
         JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM_START] requested=%zu "
-                    "extractMs=%lld mode=synchronous-complete-live-validated",
+                    "extractMs=%lld mode=synchronous-full",
                     warm_set.size(), static_cast<long long>(extracted_ms));
         try {
-            PrewarmPersistentNativeCache(std::move(warm_set), started,
-                                         std::stop_token{}, false);
+            PrewarmPersistentNativeCache(
+                std::move(warm_set), started, std::stop_token{}, false);
             persistent_ir_cache_.FlushNativeWarmProfile();
         } catch (const std::exception& exception) {
             JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
-                        "reason=complete_restore_failed error=%s",
-                        exception.what());
+                   "reason=synchronous_restore_failed error=%s", exception.what());
         } catch (...) {
             JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=0 "
-                        "reason=complete_restore_failed error=unknown");
+                   "reason=synchronous_restore_failed error=unknown");
         }
-        FinishPersistentNativePrewarm();
+        // The restored native/IR working set is hundreds of megabytes for large
+        // titles. A synchronous M_PURGE_ALL here can take longer than the game
+        // startup itself while every other guest thread waits on the prewarm gate.
+        // Retain allocator pages for the running title and release them normally
+        // when the runtime is torn down.
+        FinishPersistentNativePrewarm(true);
 #endif
     }
 
@@ -5502,9 +6453,11 @@ public:
             bool synchronous_fault_resume = false;
             bool dispatcher_boundary = false;
             bool return_terminator = false;
+            bool backward_vector_loop = false;
             std::uint64_t guest_rip = 0;
             std::uint64_t outgoing_rip = 0;
             std::uint64_t alternate_rip = 0;
+            std::uint32_t vector_instruction_count = 0;
             OutboundEdgeState* outgoing_slot = nullptr;
             OutboundEdgeState* alternate_slot = nullptr;
             std::unique_ptr<IndirectEdgeFanout> indirect_edge_fanout{};
@@ -5548,6 +6501,11 @@ public:
             if (JitBlockUsesScalarFloatAddSubMul(decoded) &&
                 (stable.native_flags &
                  kJitNativeFlagScalarFloatDirectV1) == 0) {
+                continue;
+            }
+            if (JitBlockUsesScalarFloatAddSubMul(decoded) &&
+                (stable.native_flags &
+                 kJitNativeFlagTieredScalarFloatDirectV29) == 0) {
                 continue;
             }
             if (JitBlockUsesScalarFloatDirectV2(decoded) &&
@@ -5654,6 +6612,22 @@ public:
                  kJitNativeFlagPs5AtomicRestoreV24) == 0) {
                 continue;
             }
+            if (TieredJitEnabled() &&
+                JitBlockUsesLocalLoopSamplingV28(decoded) &&
+                (stable.native_flags &
+                 kJitNativeFlagLocalLoopSamplingV28) == 0) {
+                continue;
+            }
+            if (BlockNeedsSynchronousFaultResume(decoded) &&
+                (stable.native_flags &
+                 kJitNativeFlagSignalFaultDescriptorV30) == 0) {
+                continue;
+            }
+            if (JitBlockUsesVectorUpperZeroElisionV31(decoded) &&
+                (stable.native_flags &
+                 kJitNativeFlagVectorUpperZeroElisionV31) == 0) {
+                continue;
+            }
             const LsxDecodedOp& terminator = decoded.instructions.back();
             const auto mnemonic = static_cast<X86Mnemonic>(terminator.mnemonic);
 
@@ -5686,12 +6660,20 @@ public:
                         });
                 });
             if (requires_indirect_edge_fanout) {
+                if ((stable.native_flags &
+                     kJitNativeFlagHashedIndirectPicV25) != 0 &&
+                    (stable.native_flags &
+                     kJitNativeFlagIndirectPicSafeLinearV26) == 0) {
+                    plan.eligible = false;
+                    continue;
+                }
                 if (!IsIndirectPicTerminator(terminator)) {
                     plan.eligible = false;
                     continue;
                 }
                 plan.indirect_edge_fanout = std::make_unique<IndirectEdgeFanout>(
-                    this, decoded.start_rip, mnemonic == X86_MNEMONIC_RET);
+                    this, decoded.start_rip, mnemonic == X86_MNEMONIC_RET,
+                    plan.chain_abi);
             }
             std::uint64_t static_target = 0;
             if ((mnemonic == X86_MNEMONIC_JMP || mnemonic == X86_MNEMONIC_CALL) &&
@@ -5699,8 +6681,7 @@ public:
                 plan.outgoing_rip = static_target;
                 if (mnemonic == X86_MNEMONIC_CALL) {
                     JitLeafHlePltTarget leaf_target{};
-                    if (TryResolveJitLeafHlePlt(static_target, leaf_target) &&
-                        (stable.native_flags & kJitNativeFlagLeafHleFused) == 0) {
+                    if (TryResolveJitLeafHlePlt(static_target, leaf_target)) {
                         plan.eligible = false;
                     }
                 }
@@ -5715,6 +6696,23 @@ public:
                        mnemonic != X86_MNEMONIC_RET) {
                 plan.outgoing_rip = decoded.end_rip;
             }
+            plan.vector_instruction_count =
+                static_cast<std::uint32_t>(std::ranges::count_if(
+                    decoded.instructions,
+                    [](const LsxDecodedOp& instruction) {
+                        return std::ranges::any_of(
+                            std::span{instruction.operands}.first(
+                                instruction.operand_count),
+                            [](const LsxOperandRecord& operand) {
+                                return IsXmmOperand(operand);
+                            });
+                    }));
+            plan.backward_vector_loop =
+                plan.vector_instruction_count >= 8u &&
+                ((plan.outgoing_rip != 0 &&
+                  plan.outgoing_rip <= plan.guest_rip) ||
+                 (plan.alternate_rip != 0 &&
+                  plan.alternate_rip <= plan.guest_rip));
             if (!plan.eligible) {
                 continue;
             }
@@ -5740,8 +6738,9 @@ public:
         }
 
         const unsigned available = std::max(1u, std::thread::hardware_concurrency());
+        const unsigned worker_limit = background ? 4u : 8u;
         const unsigned worker_count = std::min<unsigned>(
-            8u, std::min<unsigned>(available,
+            worker_limit, std::min<unsigned>(available,
                 static_cast<unsigned>((warm_set.size() + 2047u) / 2048u)));
         const auto restore = [&](const unsigned worker_index) {
             const std::size_t chunk =
@@ -5772,9 +6771,10 @@ public:
                     entry == nullptr) {
                     continue;
                 }
-
                 TranslationRecord result{};
                 result.entry = entry;
+                result.reserved_0c =
+                    static_cast<std::uint32_t>(LocalJitTier::Tier0);
                 result.guest_size = static_cast<std::uint32_t>(
                     stable.block->end_rip - stable.block->start_rip);
                 result.guest_hash = stable.guest_hash;
@@ -5915,8 +6915,18 @@ public:
                     PublishedCodeWitness* const witness =
                         AllocateCodeWitness(decoded_ptr);
                     plan.witness = witness;
-                    block_results_.Install(
-                        guest_rip, {plan.result, decoded_ptr, witness});
+                    CachedTranslationRecord& installed =
+                        block_results_.Install(
+                            guest_rip, {plan.result, decoded_ptr, witness});
+                    installed.tier0_block = plan.result;
+                    installed.tier0_published_external =
+                        plan.direct != nullptr
+                            ? (plan.chain_abi ? plan.entry : plan.direct)
+                            : nullptr;
+                    installed.tier0_published_resident =
+                        plan.direct != nullptr && plan.chain_abi
+                            ? plan.direct
+                            : nullptr;
                     plan.published = true;
                     ++restored;
                 }
@@ -5942,10 +6952,285 @@ public:
 
         g_jit_blocks_decoded.fetch_add(restored, std::memory_order_relaxed);
         g_jit_blocks_native.fetch_add(restored, std::memory_order_relaxed);
+        g_tiered_counts.tier0_compiled.fetch_add(
+            restored, std::memory_order_relaxed);
+        g_tiered_counts.tier0_active.fetch_add(
+            restored, std::memory_order_relaxed);
         g_jit_persistent_ir_hits.fetch_add(restored, std::memory_order_relaxed);
         g_jit_persistent_native_hits.fetch_add(restored, std::memory_order_relaxed);
         g_jit_persistent_native_segments_restored.fetch_add(
             restored_segments, std::memory_order_relaxed);
+        // The persisted edge profile used to be loaded but not acted on until
+        // another sparse 4096-edge safepoint happened in the new process.
+        // That misses the most valuable mobile workload: large SIMD loop
+        // bodies with a backward exit.  They can execute tens of thousands of
+        // iterations in T0 while their individual edge never gets 32 sampled
+        // callbacks.  Queue the strongest title-PGO and structural loop
+        // candidates immediately after their safe T0 publications exist.
+        struct WarmTier1Candidate {
+            std::uint64_t rip = 0;
+            std::uint64_t samples = 0;
+            std::uint32_t vector_instructions = 0;
+            bool backward_vector_loop = false;
+        };
+        std::unordered_map<std::uint64_t, std::uint64_t>
+            persisted_tier1_samples;
+        {
+            std::lock_guard profile_lock{tiered_profile_mutex_};
+            persisted_tier1_samples.reserve(tiered_edge_profiles_.size());
+            for (const auto& [rip, profile] : tiered_edge_profiles_) {
+                if (profile.total_samples >= 32u &&
+                    !profile.tier1_promoted &&
+                    !profile.tier1_permanently_rejected) {
+                    persisted_tier1_samples.emplace(
+                        rip, profile.total_samples);
+                }
+            }
+        }
+        std::vector<WarmTier1Candidate> warm_tier1_candidates;
+        for (const WarmPlan& plan : plans) {
+            if (!plan.published ||
+                !plan.backward_vector_loop) {
+                continue;
+            }
+            const auto persisted =
+                persisted_tier1_samples.find(plan.guest_rip);
+            warm_tier1_candidates.push_back({
+                plan.guest_rip,
+                persisted != persisted_tier1_samples.end()
+                    ? persisted->second
+                    : 0,
+                plan.vector_instruction_count,
+                true});
+        }
+        {
+            std::lock_guard block_lock{block_cache_mutex_};
+            block_results_.VisitRecords(
+                [&](CachedTranslationRecord& record) {
+                    const LsxDecodedRegion* const decoded = record.decoded;
+                    if (decoded == nullptr ||
+                        decoded->instructions.empty() ||
+                        record.tier != LocalJitTier::Tier0 ||
+                        record.block.entry == nullptr ||
+                        !TranslationHasFeature(
+                            record.block.flags,
+                            TranslationFeature::Executable) ||
+                        !TranslationHasFeature(
+                            record.block.flags,
+                            TranslationFeature::NativeCode) ||
+                        !TranslationHasFeature(
+                            record.block.flags,
+                            TranslationFeature::DirectEntry) ||
+                        TranslationHasFeature(
+                            record.block.flags,
+                            TranslationFeature::DispatcherBoundary) ||
+                        record.tier0_published_external == nullptr) {
+                        return;
+                    }
+                    std::uint32_t vector_instructions = 0;
+                    for (const LsxDecodedOp& instruction :
+                         decoded->instructions) {
+                        const bool uses_vector =
+                            std::ranges::any_of(
+                                std::span{instruction.operands}.first(
+                                    instruction.operand_count),
+                                [](const LsxOperandRecord& operand) {
+                                    return IsXmmOperand(operand);
+                                });
+                        vector_instructions +=
+                            static_cast<std::uint32_t>(uses_vector);
+                    }
+                    const LsxDecodedOp& terminator =
+                        decoded->instructions.back();
+                    std::uint64_t static_target = 0;
+                    const bool backward_edge =
+                        (IsConditionalBranchMnemonic(
+                             static_cast<X86Mnemonic>(
+                                 terminator.mnemonic)) ||
+                         static_cast<X86Mnemonic>(
+                             terminator.mnemonic) ==
+                             X86_MNEMONIC_JMP) &&
+                        TryResolveBranchTarget(
+                            terminator, static_target) &&
+                        static_target <= decoded->start_rip;
+                    const auto persisted =
+                        persisted_tier1_samples.find(
+                            decoded->start_rip);
+                    const std::uint64_t samples =
+                        persisted != persisted_tier1_samples.end()
+                            ? persisted->second
+                            : 0;
+                    const bool backward_vector_loop =
+                        backward_edge && vector_instructions >= 8u;
+                    if (!backward_vector_loop && samples < 32u) {
+                        return;
+                    }
+                    if (backward_vector_loop &&
+                        std::ranges::any_of(
+                            warm_tier1_candidates,
+                            [&](const WarmTier1Candidate& candidate) {
+                                return candidate.rip ==
+                                       decoded->start_rip;
+                            })) {
+                        return;
+                    }
+                    warm_tier1_candidates.push_back({
+                        decoded->start_rip, samples,
+                        vector_instructions,
+                        backward_vector_loop});
+                });
+        }
+        std::sort(
+            warm_tier1_candidates.begin(),
+            warm_tier1_candidates.end(),
+            [](const WarmTier1Candidate& lhs,
+               const WarmTier1Candidate& rhs) {
+                if (lhs.backward_vector_loop !=
+                    rhs.backward_vector_loop) {
+                    return lhs.backward_vector_loop >
+                           rhs.backward_vector_loop;
+                }
+                if (lhs.vector_instructions !=
+                    rhs.vector_instructions) {
+                    return lhs.vector_instructions >
+                           rhs.vector_instructions;
+                }
+                return lhs.samples > rhs.samples;
+            });
+        constexpr std::size_t kWarmTier1QueueLimit = 1024;
+        if (warm_tier1_candidates.size() >
+            kWarmTier1QueueLimit) {
+            warm_tier1_candidates.resize(
+                kWarmTier1QueueLimit);
+        }
+        std::vector<std::uint64_t> warm_tier1_queued;
+        {
+            std::lock_guard profile_lock{tiered_profile_mutex_};
+            warm_tier1_queued.reserve(
+                warm_tier1_candidates.size());
+            for (const WarmTier1Candidate& candidate :
+                 warm_tier1_candidates) {
+                TieredEdgeProfile& profile =
+                    tiered_edge_profiles_[candidate.rip];
+                if (profile.tier1_promoted ||
+                    profile.tier1_queued ||
+                    profile.tier1_permanently_rejected) {
+                    continue;
+                }
+                profile.tier1_queued = true;
+                tier1_compile_queue_.push_back(candidate.rip);
+                warm_tier1_queued.push_back(candidate.rip);
+            }
+        }
+        if (!warm_tier1_queued.empty()) {
+            {
+                std::lock_guard block_lock{
+                    block_cache_mutex_};
+                for (const std::uint64_t rip :
+                     warm_tier1_queued) {
+                    if (CachedTranslationRecord* const record =
+                            block_results_.Find(rip);
+                        record != nullptr &&
+                        record->tier == LocalJitTier::Tier0) {
+                        record->tier1_state =
+                            Tier1PromotionState::Queued;
+                    }
+                }
+            }
+            g_tiered_counts.tier1_queued.fetch_add(
+                warm_tier1_queued.size(),
+                std::memory_order_relaxed);
+            JitLog(
+                "[EXECUTOR_TIER1_WARM_QUEUE] queued=%zu "
+                "candidates=%zu structuralFirst=%d",
+                warm_tier1_queued.size(),
+                warm_tier1_candidates.size(),
+                !warm_tier1_candidates.empty() &&
+                        warm_tier1_candidates.front().
+                            backward_vector_loop
+                    ? 1
+                    : 0);
+            StartTieredWorker();
+            tiered_worker_cv_.notify_one();
+        }
+        // Title-bound PGO previously warmed T1 only. T2 then waited for a
+        // fresh sparse edge sample even when the persistent profile already
+        // contained a strongly dominant forward chain, leaving TRACE nearly
+        // idle throughout mobile gameplay. Queue a bounded set of the hottest
+        // forward seeds now. BuildTieredTracePlan still revalidates every
+        // member and refuses imported conditional guards until live samples
+        // confirm them, so stale phase-specific paths remain exact fallbacks.
+        struct WarmTraceCandidate {
+            std::uint64_t seed = 0;
+            std::uint64_t samples = 0;
+        };
+        std::vector<WarmTraceCandidate> warm_trace_candidates;
+        if (JitTraceCompilationEnabled()) {
+            std::lock_guard profile_lock{tiered_profile_mutex_};
+            warm_trace_candidates.reserve(
+                std::min<std::size_t>(
+                    tiered_edge_profiles_.size(), 512u));
+            for (const auto& [source, profile] :
+                 tiered_edge_profiles_) {
+                if (source == 0 || profile.queued ||
+                    profile.total_samples < 64u ||
+                    profile.targets.empty()) {
+                    continue;
+                }
+                const auto dominant = std::ranges::max_element(
+                    profile.targets, {}, [](const auto& item) {
+                        return item.second;
+                    });
+                if (dominant == profile.targets.end() ||
+                    dominant->first <= source ||
+                    dominant->second * 100u <
+                        profile.total_samples * 95u) {
+                    continue;
+                }
+                warm_trace_candidates.push_back(
+                    {source, profile.total_samples});
+            }
+        }
+        std::sort(
+            warm_trace_candidates.begin(),
+            warm_trace_candidates.end(),
+            [](const WarmTraceCandidate& lhs,
+               const WarmTraceCandidate& rhs) {
+                return lhs.samples > rhs.samples;
+            });
+        constexpr std::size_t kWarmTraceQueueLimit = 2048;
+        if (warm_trace_candidates.size() >
+            kWarmTraceQueueLimit) {
+            warm_trace_candidates.resize(
+                kWarmTraceQueueLimit);
+        }
+        std::size_t warm_traces_queued = 0;
+        if (!warm_trace_candidates.empty()) {
+            std::lock_guard profile_lock{tiered_profile_mutex_};
+            for (const WarmTraceCandidate& candidate :
+                 warm_trace_candidates) {
+                TieredEdgeProfile& profile =
+                    tiered_edge_profiles_[candidate.seed];
+                if (profile.queued) {
+                    continue;
+                }
+                profile.queued = true;
+                tiered_compile_queue_.push_back(candidate.seed);
+                ++warm_traces_queued;
+            }
+        }
+        if (warm_traces_queued != 0) {
+            g_tiered_counts.queued.fetch_add(
+                warm_traces_queued,
+                std::memory_order_relaxed);
+            JitLog(
+                "[EXECUTOR_TIERED_WARM_QUEUE] queued=%zu "
+                "candidates=%zu",
+                warm_traces_queued,
+                warm_trace_candidates.size());
+            StartTieredWorker();
+            tiered_worker_cv_.notify_one();
+        }
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
         JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=1 "
@@ -5985,12 +7270,8 @@ public:
         return native_depot_.FindCodeRange(host_pc);
     }
 
-    JitExecutionLookup ResolveExecutableRegionCached(const std::uint64_t guest_rip) {
-        auto& cache = g_jit_thread_execution_cache;
-        if (cache.backend != this) {
-            cache.Reset(this);
-        }
-
+    JitExecutionLookup ResolveExecutableRegionCached(
+        const std::uint64_t guest_rip, JitThreadExecutionCache& cache) {
         const std::size_t set_index = JitExecutionSetIndex(guest_rip);
         JitExecutionCacheSet& set = cache.sets[set_index];
         const auto store_result = [&](const JitExecutionLookup& execution,
@@ -6065,6 +7346,27 @@ public:
                 cached.witness->revision.fetch_add(
                     1, std::memory_order_release);
             }
+            if (cached.block.entry != nullptr) {
+                if (cached.tier == LocalJitTier::Tier1) {
+                    SaturatingDecrement(g_tiered_counts.tier1_active);
+                    g_tiered_counts.tier1_deopts.fetch_add(
+                        1, std::memory_order_relaxed);
+                } else {
+                    SaturatingDecrement(g_tiered_counts.tier0_active);
+                }
+            }
+            {
+                std::lock_guard profile_lock{tiered_profile_mutex_};
+                if (auto profile =
+                        tiered_edge_profiles_.find(guest_rip);
+                    profile != tiered_edge_profiles_.end()) {
+                    profile->second.tier1_queued = false;
+                    profile->second.tier1_promoted = false;
+                    profile->second.tier1_permanently_rejected = false;
+                    profile->second.tier1_retry_after_samples =
+                        profile->second.total_samples + 32u;
+                }
+            }
             g_jit_cache_hash_misses.fetch_add(1, std::memory_order_relaxed);
             RetireIndirectEdgeFanout(guest_rip);
             JitLog("[EXECUTOR_JIT_SMC_INVALIDATE] rip=0x%llx size=0x%x",
@@ -6079,9 +7381,29 @@ public:
         }
 
         StableDecodedBlock stable = persistent_ir_cache_.TryLoad(guest_rip);
-        const bool decoded_from_persistent_cache = stable.block != nullptr;
+        bool decoded_from_persistent_cache = stable.block != nullptr;
+        if (decoded_from_persistent_cache && !stable.block->instructions.empty()) {
+            const LsxDecodedOp& terminator = stable.block->instructions.back();
+            const auto mnemonic =
+                static_cast<X86Mnemonic>(terminator.mnemonic);
+            const bool rip_relative_indirect_control =
+                (mnemonic == X86_MNEMONIC_CALL ||
+                 mnemonic == X86_MNEMONIC_JMP) &&
+                terminator.operand_count == 1 &&
+                terminator.operands[0].type == X86_OPERAND_TYPE_MEMORY &&
+                IsGuestInstructionPointerRegister(
+                    terminator.operands[0].mem.base);
+            if (rip_relative_indirect_control) {
+                stable = DecodeStableBlock(
+                    {guest_rip, kJitMaxInstructionsPerBlock});
+                decoded_from_persistent_cache = false;
+            }
+        }
         if (!decoded_from_persistent_cache) {
-            stable = DecodeStableBlock({guest_rip, kJitMaxInstructionsPerBlock});
+            if (stable.block == nullptr) {
+                stable = DecodeStableBlock(
+                    {guest_rip, kJitMaxInstructionsPerBlock});
+            }
         }
         auto decoded = std::move(stable.block);
         const std::uint64_t decoded_count =
@@ -6107,6 +7429,12 @@ public:
             scalar_float_direct_candidate &&
             (stable.native_flags &
              kJitNativeFlagScalarFloatDirectV1) == 0;
+        const bool tiered_scalar_float_direct_v29_candidate =
+            scalar_float_direct_candidate;
+        const bool tiered_scalar_float_direct_v29_requires_reemit =
+            tiered_scalar_float_direct_v29_candidate &&
+            (stable.native_flags &
+             kJitNativeFlagTieredScalarFloatDirectV29) == 0;
         const bool scalar_float_direct_v2_candidate =
             JitBlockUsesScalarFloatDirectV2(*decoded);
         const bool scalar_float_direct_v2_requires_reemit =
@@ -6232,6 +7560,25 @@ public:
             ps5_atomic_restore_v24_candidate &&
             (stable.native_flags &
              kJitNativeFlagPs5AtomicRestoreV24) == 0;
+        const bool local_loop_sampling_v27_candidate =
+            TieredJitEnabled() &&
+            JitBlockUsesLocalLoopSamplingV28(*decoded);
+        const bool local_loop_sampling_v27_requires_reemit =
+            local_loop_sampling_v27_candidate &&
+            (stable.native_flags &
+             kJitNativeFlagLocalLoopSamplingV28) == 0;
+        const bool signal_fault_descriptor_v30_candidate =
+            BlockNeedsSynchronousFaultResume(*decoded);
+        const bool signal_fault_descriptor_v30_requires_reemit =
+            signal_fault_descriptor_v30_candidate &&
+            (stable.native_flags &
+             kJitNativeFlagSignalFaultDescriptorV30) == 0;
+        const bool vector_upper_zero_elision_v31_candidate =
+            JitBlockUsesVectorUpperZeroElisionV31(*decoded);
+        const bool vector_upper_zero_elision_v31_requires_reemit =
+            vector_upper_zero_elision_v31_candidate &&
+            (stable.native_flags &
+             kJitNativeFlagVectorUpperZeroElisionV31) == 0;
         const bool persistent_native_mode =
             !JitLiveCheckedNativeEnabled() && !JitDiagnosticStoreWatchRange().Enabled();
         bool restored_persistent_native = false;
@@ -6254,7 +7601,8 @@ public:
                 if (indirect_pic_candidate) {
                     pending_indirect_edge_fanout =
                         std::make_unique<IndirectEdgeFanout>(
-                            this, guest_rip, mnemonic == X86_MNEMONIC_RET);
+                            this, guest_rip, mnemonic == X86_MNEMONIC_RET,
+                            !JitLiveCheckedNativeEnabled());
                     indirect_edge_fanout = pending_indirect_edge_fanout.get();
                 }
                 std::uint64_t static_target = 0;
@@ -6284,11 +7632,17 @@ public:
                         CreateOutboundEdge(decoded->end_rip, guest_rip);
                 }
             }
+            const bool unsafe_hashed_indirect_pic_v25_requires_reemit =
+                persistent_native_uses_indirect_pic &&
+                (stable.native_flags &
+                 kJitNativeFlagHashedIndirectPicV25) != 0 &&
+                (stable.native_flags &
+                 kJitNativeFlagIndirectPicSafeLinearV26) == 0;
             if (persistent_native_mode && stable.HasNativeCode() &&
                 (!persistent_native_uses_indirect_pic || indirect_pic_candidate) &&
-                (!leaf_hle_requires_reemit ||
-                 (stable.native_flags & kJitNativeFlagLeafHleFused) != 0) &&
+                !leaf_hle_requires_reemit &&
                 !scalar_float_direct_requires_reemit &&
+                !tiered_scalar_float_direct_v29_requires_reemit &&
                 !scalar_float_direct_v2_requires_reemit &&
                 !packed_float_direct_v3_requires_reemit &&
                 !mixed_hot_direct_v4_requires_reemit &&
@@ -6309,7 +7663,11 @@ public:
                  !cmpxchg_cache_sync_v21_requires_reemit &&
                  !xchg_cache_sync_v22_requires_reemit &&
                  !ps5_pause_yield_v23_requires_reemit &&
-                 !ps5_atomic_restore_v24_requires_reemit) {
+                 !ps5_atomic_restore_v24_requires_reemit &&
+                 !local_loop_sampling_v27_requires_reemit &&
+                 !signal_fault_descriptor_v30_requires_reemit &&
+                 !vector_upper_zero_elision_v31_requires_reemit &&
+                 !unsafe_hashed_indirect_pic_v25_requires_reemit) {
                 restored_persistent_native = native_depot_.RestorePersistentNativeBlock(
                     stable.native_segments, stable.entry_segment_index,
                     stable.direct_segment_index, *decoded, primary_outbound_edge,
@@ -6487,6 +7845,8 @@ public:
 
         TranslationRecord result{
             .entry = compiled_entry,
+            .reserved_0c =
+                static_cast<std::uint32_t>(LocalJitTier::Tier0),
         };
         const Arm64BlockEntry persistent_native_direct_target = direct_target;
         const auto decoded_byte_count =
@@ -6597,6 +7957,37 @@ public:
                 TranslationEnableFeature(result.flags, TranslationFeature::DirectEntry);
             }
         }
+        const bool immediate_tier1_vector_loop = [&] {
+            if (!TieredJitEnabled() || !compiled_native ||
+                direct_target == nullptr ||
+                decoded->instructions.empty()) {
+                return false;
+            }
+            const LsxDecodedOp& terminator =
+                decoded->instructions.back();
+            const auto mnemonic =
+                static_cast<X86Mnemonic>(terminator.mnemonic);
+            std::uint64_t static_target = 0;
+            if ((!IsConditionalBranchMnemonic(mnemonic) &&
+                 mnemonic != X86_MNEMONIC_JMP) ||
+                !TryResolveBranchTarget(
+                    terminator, static_target) ||
+                static_target > decoded->start_rip) {
+                return false;
+            }
+            const std::size_t vector_instructions =
+                std::ranges::count_if(
+                    decoded->instructions,
+                    [](const LsxDecodedOp& instruction) {
+                        return std::ranges::any_of(
+                            std::span{instruction.operands}.first(
+                                instruction.operand_count),
+                            [](const LsxOperandRecord& operand) {
+                                return IsXmmOperand(operand);
+                            });
+                    });
+            return vector_instructions >= 8u;
+        }();
         LsxDecodedRegion* decoded_ptr = decoded.get();
         if (indirect_pic_used && pending_indirect_edge_fanout) {
             RetireIndirectEdgeFanout(guest_rip);
@@ -6607,8 +7998,24 @@ public:
         decoded_blocks_[guest_rip] = std::move(decoded);
         PublishedCodeWitness* const published_witness =
             AllocateCodeWitness(decoded_ptr);
-        block_results_.Install(
-            guest_rip, {result, decoded_ptr, published_witness});
+        CachedTranslationRecord& installed =
+            block_results_.Install(
+                guest_rip, {result, decoded_ptr, published_witness});
+        installed.tier0_block = result;
+        installed.tier0_published_external =
+            direct_target != nullptr
+                ? (compiled_chain_abi ? compiled_entry : direct_target)
+                : nullptr;
+        installed.tier0_published_resident =
+            direct_target != nullptr && compiled_chain_abi
+                ? resident_entry
+                : nullptr;
+        if (compiled_entry != nullptr) {
+            g_tiered_counts.tier0_compiled.fetch_add(
+                1, std::memory_order_relaxed);
+            g_tiered_counts.tier0_active.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         if (!decoded_from_persistent_cache || captured_persistent_native) {
             persistent_ir_cache_.Remember(
                 *decoded_ptr, result.guest_hash,
@@ -6621,6 +8028,9 @@ public:
                             : 0u) |
                        (scalar_float_direct_candidate
                             ? kJitNativeFlagScalarFloatDirectV1
+                            : 0u) |
+                       (tiered_scalar_float_direct_v29_candidate
+                            ? kJitNativeFlagTieredScalarFloatDirectV29
                             : 0u) |
                        (scalar_float_direct_v2_candidate
                             ? kJitNativeFlagScalarFloatDirectV2
@@ -6687,6 +8097,18 @@ public:
                               : 0u) |
                          (ps5_atomic_restore_v24_candidate
                               ? kJitNativeFlagPs5AtomicRestoreV24
+                              : 0u) |
+                          (local_loop_sampling_v27_candidate
+                               ? kJitNativeFlagLocalLoopSamplingV28
+                               : 0u) |
+                          (signal_fault_descriptor_v30_candidate
+                               ? kJitNativeFlagSignalFaultDescriptorV30
+                               : 0u) |
+                          (vector_upper_zero_elision_v31_candidate
+                               ? kJitNativeFlagVectorUpperZeroElisionV31
+                               : 0u) |
+                          (indirect_pic_used
+                              ? kJitNativeFlagIndirectPicSafeLinearV26
                               : 0u))
                     : 0);
         }
@@ -6700,27 +8122,61 @@ public:
                 compiled_chain_abi ? resident_entry : nullptr,
                 published_witness, result.flags);
         }
+        if (immediate_tier1_vector_loop) {
+            bool queued_now = false;
+            {
+                std::lock_guard profile_lock{
+                    tiered_profile_mutex_};
+                TieredEdgeProfile& profile =
+                    tiered_edge_profiles_[guest_rip];
+                if (!profile.tier1_promoted &&
+                    !profile.tier1_queued &&
+                    !profile.tier1_permanently_rejected) {
+                    profile.tier1_queued = true;
+                    tier1_compile_queue_.push_back(
+                        guest_rip);
+                    queued_now = true;
+                }
+            }
+            if (queued_now) {
+                installed.tier1_state =
+                    Tier1PromotionState::Queued;
+                g_tiered_counts.tier1_queued.fetch_add(
+                    1, std::memory_order_relaxed);
+                JitLog(
+                    "[EXECUTOR_TIER1_VECTOR_LOOP_QUEUE] "
+                    "rip=0x%llx ops=%zu",
+                    static_cast<unsigned long long>(
+                        guest_rip),
+                    decoded_ptr->instructions.size());
+                StartTieredWorker();
+                tiered_worker_cv_.notify_one();
+            }
+        }
         return {result, decoded_ptr, published_witness};
     }
 
     OutboundEdgeState* CreateOutboundEdge(
         const std::uint64_t guest_rip,
-        const std::uint64_t source_rip = 0) {
+        const std::uint64_t source_rip = 0,
+        const bool resident_frame = false) {
         if (JitIsRipProbeTarget(guest_rip)) {
             return nullptr;
         }
         std::lock_guard lock{edge_graph_mutex_};
-        return AllocateOutboundEdgeLocked(guest_rip, source_rip);
+        return AllocateOutboundEdgeLocked(
+            guest_rip, source_rip, resident_frame);
     }
 
     OutboundEdgeState* AllocateOutboundEdgeLocked(
         const std::uint64_t guest_rip,
-        const std::uint64_t source_rip = 0) {
+        const std::uint64_t source_rip = 0,
+        const bool resident_frame = false) {
         void* const storage = edge_lifetime_pool_.allocate(
             sizeof(OutboundEdgeState), alignof(OutboundEdgeState));
         OutboundEdgeState* const edge = std::construct_at(
             static_cast<OutboundEdgeState*>(storage), guest_rip, this,
-            source_rip);
+            source_rip, resident_frame);
         edge_directory_.Attach(guest_rip, edge);
         if (const PublishedDestination* const destination =
                 edge_directory_.FindPublished(guest_rip);
@@ -6859,12 +8315,20 @@ private:
     std::vector<std::unique_ptr<LsxDecodedRegion>> retired_decoded_blocks_;
     GuestRegionDirectory block_results_;
     std::mutex tiered_profile_mutex_;
+    std::mutex tiered_worker_lifecycle_mutex_;
     std::condition_variable_any tiered_worker_cv_;
     std::unordered_map<std::uint64_t, TieredEdgeProfile> tiered_edge_profiles_;
+    std::deque<std::uint64_t> tier1_compile_queue_;
     std::deque<std::uint64_t> tiered_compile_queue_;
+    std::unordered_set<std::uint64_t> tiered_loop_seed_requests_;
+    std::atomic<std::uint64_t> tiered_profile_dirty_samples_{0};
+    std::atomic<bool> tiered_profile_flush_requested_{false};
+    std::atomic<bool> tiered_profile_accepting_samples_{true};
+    std::atomic<std::uint64_t> tiered_profile_generation_{1};
     std::unordered_map<std::uint64_t, TieredTraceArtifact*> active_tiered_traces_;
     std::vector<std::unique_ptr<TieredTraceArtifact>> tiered_trace_artifacts_;
     std::jthread tiered_worker_;
+    std::atomic<std::uint64_t> tier1_generated_code_bytes_{0};
     std::atomic<std::uint64_t> tiered_active_code_bytes_{0};
 #ifdef __ANDROID__
     bool persistent_native_prewarm_pending_ = false;
@@ -6876,7 +8340,12 @@ private:
 };
 
 void RetiringTranslationRuntime::StartTieredWorker() {
-    if (!TieredJitEnabled()) {
+    if (!TieredJitEnabled() || TieredJitDiagnosticModeActive() ||
+        !tiered_profile_accepting_samples_.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard lifecycle_lock{tiered_worker_lifecycle_mutex_};
+    if (!tiered_profile_accepting_samples_.load(std::memory_order_acquire)) {
         return;
     }
     std::lock_guard lock{tiered_profile_mutex_};
@@ -6890,44 +8359,396 @@ void RetiringTranslationRuntime::StartTieredWorker() {
 }
 
 void RetiringTranslationRuntime::StopTieredWorker() noexcept {
-    if (!tiered_worker_.joinable()) {
+    std::lock_guard lifecycle_lock{tiered_worker_lifecycle_mutex_};
+    StopTieredWorkerLocked();
+}
+
+void RetiringTranslationRuntime::StopTieredWorkerLocked() noexcept {
+    if (tiered_worker_.joinable()) {
+        tiered_worker_.request_stop();
+        tiered_worker_cv_.notify_all();
+        tiered_worker_.join();
+    }
+    FlushTieredEdgeProfile();
+}
+
+void RetiringTranslationRuntime::ApplyTieredConfiguration(
+    const bool enabled, const bool trace_compilation_enabled) noexcept {
+    // A managed OFF transition is a real execution-mode transition, not just
+    // a request to stop producing more Tier-2 code. Stop the compiler first,
+    // invalidate every published trace and reconnect its validated Tier-1
+    // destination before returning to the caller. The trace depot retains
+    // ownership of generated code, so an invocation already inside a trace
+    // can safely finish while all subsequent entries use baseline code.
+    tiered_profile_accepting_samples_.store(false, std::memory_order_release);
+    tiered_profile_generation_.fetch_add(1, std::memory_order_acq_rel);
+    StopTieredWorker();
+
+    std::uint64_t withdrawn = 0;
+    {
+        std::lock_guard edge_lock{edge_graph_mutex_};
+        for (auto& [seed, artifact] : active_tiered_traces_) {
+            if (artifact == nullptr || !artifact->validation) {
+                edge_directory_.WithdrawAndDisconnect(seed);
+                continue;
+            }
+            TraceValidationRecord& validation = *artifact->validation;
+            validation.active.store(false, std::memory_order_release);
+            if (validation.baseline_witness != nullptr &&
+                validation.baseline_witness->decoded != nullptr &&
+                GuestBytesMatchDecoded(*validation.baseline_witness->decoded)) {
+                edge_directory_.PublishAndConnect(
+                    seed,
+                    {validation.baseline_external_entry,
+                     validation.baseline_resident_entry,
+                     validation.baseline_witness, nullptr});
+            } else {
+                edge_directory_.WithdrawAndDisconnect(seed);
+            }
+            ++withdrawn;
+        }
+        active_tiered_traces_.clear();
+        tiered_active_code_bytes_.store(0, std::memory_order_release);
+    }
+    std::uint64_t tier1_demoted = 0;
+    if (!enabled) {
+        std::lock_guard block_lock{block_cache_mutex_};
+        block_results_.VisitRecords(
+            [this, &tier1_demoted](
+                CachedTranslationRecord& record) {
+                const std::uint64_t guest_rip =
+                    record.decoded != nullptr
+                        ? record.decoded->start_rip
+                        : 0;
+                if (guest_rip != 0 &&
+                    DemoteTier1Locked(
+                        record, guest_rip, true)) {
+                    ++tier1_demoted;
+                }
+            });
+    }
+    {
+        std::lock_guard profile_lock{tiered_profile_mutex_};
+        tier1_compile_queue_.clear();
+        tiered_compile_queue_.clear();
+        tiered_loop_seed_requests_.clear();
+        for (auto& [seed, profile] : tiered_edge_profiles_) {
+            (void)seed;
+            profile.queued = false;
+            profile.tier1_queued = false;
+            if (!enabled) {
+                profile.tier1_promoted = false;
+            }
+            profile.live_samples = 0;
+            profile.live_targets.clear();
+        }
+        tiered_profile_flush_requested_.store(false,
+                                              std::memory_order_release);
+        tiered_profile_dirty_samples_.store(0, std::memory_order_relaxed);
+    }
+
+    // Managed A/B telemetry is interval-local. Reset only Tier-2 counters:
+    // decoded/T0/T1 and persistent-cache counters describe the common
+    // baseline and intentionally remain continuous.
+    g_tiered_counts.profiled_edges.store(0, std::memory_order_relaxed);
+    g_tiered_counts.persistent_edges_loaded.store(0,
+                                                   std::memory_order_relaxed);
+    g_tiered_counts.persistent_edges_written.store(0,
+                                                    std::memory_order_relaxed);
+    g_tiered_counts.persistent_profile_rejected.store(
+        0, std::memory_order_relaxed);
+    g_tiered_counts.queued.store(0, std::memory_order_relaxed);
+    g_tiered_counts.loop_osr_queued.store(0, std::memory_order_relaxed);
+    g_tiered_counts.compiled.store(0, std::memory_order_relaxed);
+    g_tiered_counts.faultable_compiled.store(0, std::memory_order_relaxed);
+    g_tiered_counts.loop_osr_compiled.store(0, std::memory_order_relaxed);
+    g_tiered_counts.active.store(0, std::memory_order_relaxed);
+    g_tiered_counts.retired.store(0, std::memory_order_relaxed);
+    g_tiered_counts.rejected.store(0, std::memory_order_relaxed);
+    g_tiered_counts.compile_time_us.store(0, std::memory_order_relaxed);
+    g_tiered_counts.generated_bytes.store(0, std::memory_order_relaxed);
+    g_tiered_counts.member_blocks.store(0, std::memory_order_relaxed);
+    g_tiered_counts.guest_instructions.store(0, std::memory_order_relaxed);
+    g_tiered_counts.entries.store(0, std::memory_order_relaxed);
+    g_tiered_counts.internal_edges.store(0, std::memory_order_relaxed);
+    g_tiered_counts.side_exits.store(0, std::memory_order_relaxed);
+    g_tiered_counts.guard_deopts.store(0, std::memory_order_relaxed);
+    g_tiered_counts.guard_rollbacks.store(0, std::memory_order_relaxed);
+    g_tiered_counts.smc_retirements.store(0, std::memory_order_relaxed);
+    g_tiered_counts.boundary_operations_avoided.store(
+        0, std::memory_order_relaxed);
+
+    tiered_profile_accepting_samples_.store(enabled,
+                                             std::memory_order_release);
+    JitLog(
+        "[EXECUTOR_TIERED_CONFIG] enabled=%d trace=%d "
+        "withdrawn=%llu tier1Demoted=%llu metricsReset=1",
+        enabled ? 1 : 0,
+        enabled && trace_compilation_enabled ? 1 : 0,
+        static_cast<unsigned long long>(withdrawn),
+        static_cast<unsigned long long>(tier1_demoted));
+}
+
+void RetiringTranslationRuntime::LoadTieredEdgeProfile() noexcept {
+    tiered_profile_dirty_samples_.store(0, std::memory_order_relaxed);
+    tiered_profile_flush_requested_.store(false, std::memory_order_release);
+    if (!persistent_ir_cache_.Enabled()) {
         return;
     }
-    tiered_worker_.request_stop();
-    tiered_worker_cv_.notify_all();
-    tiered_worker_.join();
+    try {
+        const auto path =
+            persistent_ir_cache_.Directory() / std::string{kTieredEdgeProfileFile};
+        std::ifstream input{path, std::ios::binary};
+        if (!input) {
+            return;
+        }
+        std::uint64_t magic = 0;
+        std::uint32_t version = 0;
+        std::uint32_t count = 0;
+        std::uint64_t profile_identity = 0;
+        std::uint64_t checksum = 0;
+        input.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        input.read(reinterpret_cast<char*>(&version), sizeof(version));
+        input.read(reinterpret_cast<char*>(&count), sizeof(count));
+        input.read(reinterpret_cast<char*>(&profile_identity),
+                   sizeof(profile_identity));
+        input.read(reinterpret_cast<char*>(&checksum), sizeof(checksum));
+        const std::uint64_t expected_identity =
+            persistent_ir_cache_.ProfileIdentity();
+        if (!input || magic != kTieredEdgeProfileMagic ||
+            version != kTieredEdgeProfileVersion ||
+            count == 0 || count > kMaximumPersistedTieredEdges ||
+            profile_identity == 0 || profile_identity != expected_identity) {
+            g_tiered_counts.persistent_profile_rejected.fetch_add(
+                1, std::memory_order_relaxed);
+            JitLog(
+                "[EXECUTOR_TIERED_PGO] loaded=0 reason=header "
+                "identity=0x%llx expected=0x%llx",
+                static_cast<unsigned long long>(profile_identity),
+                static_cast<unsigned long long>(expected_identity));
+            return;
+        }
+        std::vector<PersistedTieredEdgeRecord> records(count);
+        input.read(reinterpret_cast<char*>(records.data()),
+                   static_cast<std::streamsize>(records.size() *
+                                                sizeof(records.front())));
+        const bool trailing_bytes =
+            input.peek() != std::char_traits<char>::eof();
+        const std::uint64_t actual_checksum = XXH3_64bits_withSeed(
+            records.data(), records.size() * sizeof(records.front()),
+            kTieredEdgeProfileMagic ^ kTieredEdgeProfileVersion ^
+                profile_identity);
+        if (trailing_bytes || actual_checksum != checksum) {
+            g_tiered_counts.persistent_profile_rejected.fetch_add(
+                1, std::memory_order_relaxed);
+            JitLog("[EXECUTOR_TIERED_PGO] loaded=0 reason=%s",
+                   trailing_bytes ? "trailing-bytes" : "payload");
+            return;
+        }
+
+        std::uint64_t loaded = 0;
+        std::lock_guard lock{tiered_profile_mutex_};
+        for (const PersistedTieredEdgeRecord& record : records) {
+            if (record.source_rip == 0 || record.target_rip == 0 ||
+                record.samples == 0 || record.reserved != 0) {
+                continue;
+            }
+            // Age every persisted observation by one generation. It remains a
+            // useful prior, but cannot indefinitely dominate fresh title data.
+            const std::uint64_t samples = std::min<std::uint64_t>(
+                kTieredEdgeSampleCap, (static_cast<std::uint64_t>(record.samples) + 1u) / 2u);
+            auto& profile = tiered_edge_profiles_[record.source_rip];
+            auto target = profile.targets.find(record.target_rip);
+            if (target == profile.targets.end() &&
+                profile.targets.size() >= kMaximumPersistedTargetsPerSource) {
+                continue;
+            }
+            const std::uint64_t available =
+                kTieredEdgeSampleCap - std::min(profile.total_samples,
+                                                kTieredEdgeSampleCap);
+            const std::uint64_t accepted = std::min(samples, available);
+            if (accepted == 0) {
+                continue;
+            }
+            profile.targets[record.target_rip] += accepted;
+            profile.total_samples += accepted;
+            profile.imported = true;
+            ++loaded;
+        }
+        g_tiered_counts.persistent_edges_loaded.fetch_add(
+            loaded, std::memory_order_relaxed);
+        JitLog("[EXECUTOR_TIERED_PGO] loaded=1 edges=%llu liveValidation=%llu "
+               "identity=0x%llx",
+               static_cast<unsigned long long>(loaded),
+               static_cast<unsigned long long>(
+                   kTieredProfileLiveValidationSamples),
+               static_cast<unsigned long long>(profile_identity));
+    } catch (const std::exception& exception) {
+        g_tiered_counts.persistent_profile_rejected.fetch_add(
+            1, std::memory_order_relaxed);
+        JitLog("[EXECUTOR_TIERED_PGO] loaded=0 reason=%s", exception.what());
+    } catch (...) {
+        g_tiered_counts.persistent_profile_rejected.fetch_add(
+            1, std::memory_order_relaxed);
+        JitLog("[EXECUTOR_TIERED_PGO] loaded=0 reason=unknown");
+    }
+}
+
+void RetiringTranslationRuntime::FlushTieredEdgeProfile() noexcept {
+    tiered_profile_flush_requested_.store(false, std::memory_order_release);
+    if (!persistent_ir_cache_.Enabled()) {
+        tiered_profile_dirty_samples_.store(0, std::memory_order_relaxed);
+        return;
+    }
+
+    std::uint64_t dirty_samples = 0;
+    try {
+        std::vector<PersistedTieredEdgeRecord> records;
+        {
+            std::lock_guard lock{tiered_profile_mutex_};
+            dirty_samples =
+                tiered_profile_dirty_samples_.exchange(0, std::memory_order_acq_rel);
+            if (dirty_samples == 0) {
+                return;
+            }
+            records.reserve(std::min<std::size_t>(
+                kMaximumPersistedTieredEdges,
+                tiered_edge_profiles_.size() *
+                    kMaximumPersistedTargetsPerSource));
+            for (const auto& [source_rip, profile] : tiered_edge_profiles_) {
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> targets(
+                    profile.targets.begin(), profile.targets.end());
+                std::ranges::sort(targets, std::greater{}, [](const auto& item) {
+                    return item.second;
+                });
+                const std::size_t target_count = std::min(
+                    targets.size(), kMaximumPersistedTargetsPerSource);
+                for (std::size_t index = 0; index < target_count; ++index) {
+                    const auto [target_rip, samples] = targets[index];
+                    if (source_rip == 0 || target_rip == 0 || samples == 0) {
+                        continue;
+                    }
+                    records.push_back({
+                        .source_rip = source_rip,
+                        .target_rip = target_rip,
+                        .samples = static_cast<std::uint32_t>(
+                            std::min(samples, kTieredEdgeSampleCap)),
+                    });
+                }
+            }
+        }
+        if (records.empty()) {
+            return;
+        }
+        std::ranges::sort(records, std::greater{},
+                          &PersistedTieredEdgeRecord::samples);
+        if (records.size() > kMaximumPersistedTieredEdges) {
+            records.resize(kMaximumPersistedTieredEdges);
+        }
+        std::ranges::sort(records, std::less{},
+                          [](const PersistedTieredEdgeRecord& item) {
+            return std::pair{item.source_rip, item.target_rip};
+        });
+
+        const std::uint64_t magic = kTieredEdgeProfileMagic;
+        const std::uint32_t version = kTieredEdgeProfileVersion;
+        const std::uint32_t count =
+            static_cast<std::uint32_t>(records.size());
+        const std::uint64_t profile_identity =
+            persistent_ir_cache_.ProfileIdentity();
+        if (profile_identity == 0) {
+            throw std::runtime_error("profile-identity-unavailable");
+        }
+        const std::uint64_t checksum = XXH3_64bits_withSeed(
+            records.data(), records.size() * sizeof(records.front()),
+            kTieredEdgeProfileMagic ^ kTieredEdgeProfileVersion ^
+                profile_identity);
+        const auto target =
+            persistent_ir_cache_.Directory() / std::string{kTieredEdgeProfileFile};
+        std::vector<std::uint8_t> bytes;
+        bytes.reserve(sizeof(magic) + sizeof(version) + sizeof(count) +
+                      sizeof(profile_identity) + sizeof(checksum) +
+                      records.size() * sizeof(records.front()));
+        const auto append = [&bytes](const void* const data,
+                                     const std::size_t size) {
+            const auto* const begin = static_cast<const std::uint8_t*>(data);
+            bytes.insert(bytes.end(), begin, begin + size);
+        };
+        append(&magic, sizeof(magic));
+        append(&version, sizeof(version));
+        append(&count, sizeof(count));
+        append(&profile_identity, sizeof(profile_identity));
+        append(&checksum, sizeof(checksum));
+        append(records.data(), records.size() * sizeof(records.front()));
+        std::string write_error;
+        if (!SaveJitAuxiliaryFileAtomic(target, bytes, write_error)) {
+            throw std::runtime_error("atomic-write:" + write_error);
+        }
+        g_tiered_counts.persistent_edges_written.fetch_add(
+            records.size(), std::memory_order_relaxed);
+        JitLog("[EXECUTOR_TIERED_PGO] saved=1 edges=%zu dirtySamples=%llu "
+               "identity=0x%llx",
+               records.size(),
+               static_cast<unsigned long long>(dirty_samples),
+               static_cast<unsigned long long>(profile_identity));
+    } catch (const std::exception& exception) {
+        tiered_profile_dirty_samples_.fetch_add(
+            dirty_samples, std::memory_order_relaxed);
+        g_tiered_counts.persistent_profile_rejected.fetch_add(
+            1, std::memory_order_relaxed);
+        JitLog("[EXECUTOR_TIERED_PGO] saved=0 reason=%s", exception.what());
+    } catch (...) {
+        tiered_profile_dirty_samples_.fetch_add(
+            dirty_samples, std::memory_order_relaxed);
+        g_tiered_counts.persistent_profile_rejected.fetch_add(
+            1, std::memory_order_relaxed);
+        JitLog("[EXECUTOR_TIERED_PGO] saved=0 reason=unknown");
+    }
 }
 
 void RetiringTranslationRuntime::RecordTieredEdge(
     const std::uint64_t source_rip,
     const std::uint64_t target_rip) noexcept {
-    if (!TieredJitEnabled() || source_rip == 0 || target_rip == 0) {
+    if (!TieredJitEnabled() || TieredJitDiagnosticModeActive() ||
+        source_rip == 0 || target_rip == 0) {
+        return;
+    }
+    const std::uint64_t profile_generation =
+        tiered_profile_generation_.load(std::memory_order_acquire);
+    if (!tiered_profile_accepting_samples_.load(std::memory_order_acquire)) {
         return;
     }
     struct LocalEdgeSample {
         std::uint64_t source = 0;
         std::uint64_t target = 0;
         std::uint8_t count = 0;
+        std::uint8_t merged_windows = 0;
+        std::uint16_t sparse_phase = 0;
     };
     struct LocalEdgeSketch {
         RetiringTranslationRuntime* owner = nullptr;
-        std::array<LocalEdgeSample, 64> samples{};
+        std::uint64_t generation = 0;
+        // Real games routinely execute several hundred distinct edges per
+        // host thread. A 64-entry sketch thrashed on FMOD and never reached
+        // the sparse stable state, preserving the million-sample PGO storm.
+        std::array<LocalEdgeSample, 1024> samples{};
     };
     thread_local LocalEdgeSketch sketch{};
-    if (sketch.owner != this) {
+    if (sketch.owner != this || sketch.generation != profile_generation) {
         sketch = {};
         sketch.owner = this;
+        sketch.generation = profile_generation;
     }
     const std::size_t first =
         static_cast<std::size_t>(
             (source_rip ^ std::rotl(target_rip, 17)) * UINT64_C(0x9e3779b97f4a7c15)) &
         (sketch.samples.size() - 1u);
     LocalEdgeSample* selected = nullptr;
-    for (std::size_t probe = 0; probe < 4; ++probe) {
+    for (std::size_t probe = 0; probe < 8; ++probe) {
         auto& sample =
             sketch.samples[(first + probe) & (sketch.samples.size() - 1u)];
         if ((sample.source == source_rip && sample.target == target_rip) ||
-            sample.count == 0) {
+            sample.source == 0) {
             selected = std::addressof(sample);
             break;
         }
@@ -6936,59 +8757,196 @@ void RetiringTranslationRuntime::RecordTieredEdge(
         selected = std::addressof(sketch.samples[first]);
         *selected = {};
     }
-    if (selected->count == 0) {
+    if (selected->source != source_rip ||
+        selected->target != target_rip) {
+        *selected = {};
         selected->source = source_rip;
         selected->target = target_rip;
+    }
+    // Four full windows are enough to promote T1/T2 and validate the live
+    // target of an imported profile. Afterwards retain 1/256 observations.
+    // A changed target hashes to a distinct sample and is observed at full
+    // rate, while stable audio/job polling edges stop causing a shared-map
+    // merge and complete PGO-file rewrite every few hundred milliseconds.
+    constexpr std::uint8_t kDenseProfileWindows = 4;
+    constexpr std::uint16_t kStableProfilePeriod = 256;
+    if (selected->merged_windows >= kDenseProfileWindows) {
+        if (++selected->sparse_phase < kStableProfilePeriod) {
+            return;
+        }
+        selected->sparse_phase = 0;
     }
     if (selected->count != std::numeric_limits<std::uint8_t>::max()) {
         ++selected->count;
     }
-    constexpr std::uint8_t kLocalMergeSamples = 4;
+    // Keep the profiler thread-local for longer. Two merges are still enough
+    // to reach the 32-sample tier-up threshold, while shared-map lock traffic
+    // drops by 4x on hot guest edges.
+    constexpr std::uint8_t kLocalMergeSamples = 16;
     if (selected->count < kLocalMergeSamples) {
         return;
     }
     selected->count = 0;
+    if (selected->merged_windows !=
+        std::numeric_limits<std::uint8_t>::max()) {
+        ++selected->merged_windows;
+    }
+    if (!tiered_profile_accepting_samples_.load(std::memory_order_acquire) ||
+        tiered_profile_generation_.load(std::memory_order_acquire) !=
+            profile_generation) {
+        return;
+    }
 
     bool queued = false;
+    bool tier1_queued_now = false;
+    bool flush_requested = false;
+    bool queued_loop_osr = false;
+    std::uint64_t queued_seed = source_rip;
+    std::uint64_t queued_target = target_rip;
     {
         std::lock_guard lock{tiered_profile_mutex_};
+        if (!tiered_profile_accepting_samples_.load(std::memory_order_acquire) ||
+            tiered_profile_generation_.load(std::memory_order_acquire) !=
+                profile_generation) {
+            return;
+        }
         auto& profile = tiered_edge_profiles_[source_rip];
+        if (profile.total_samples >
+            kTieredEdgeSampleCap - kLocalMergeSamples) {
+            profile.total_samples = 0;
+            for (auto target = profile.targets.begin();
+                 target != profile.targets.end();) {
+                target->second = (target->second + 1u) / 2u;
+                if (target->second == 0) {
+                    target = profile.targets.erase(target);
+                } else {
+                    profile.total_samples += target->second;
+                    ++target;
+                }
+            }
+            profile.live_samples = 0;
+            for (auto target = profile.live_targets.begin();
+                 target != profile.live_targets.end();) {
+                target->second = (target->second + 1u) / 2u;
+                if (target->second == 0) {
+                    target = profile.live_targets.erase(target);
+                } else {
+                    profile.live_samples += target->second;
+                    ++target;
+                }
+            }
+            profile.retry_after_samples = std::min(
+                profile.retry_after_samples / 2u,
+                profile.total_samples + 1024u);
+        }
         profile.total_samples += kLocalMergeSamples;
         profile.targets[target_rip] += kLocalMergeSamples;
+        profile.live_samples += kLocalMergeSamples;
+        profile.live_targets[target_rip] += kLocalMergeSamples;
         g_tiered_counts.profiled_edges.fetch_add(
             kLocalMergeSamples, std::memory_order_relaxed);
-        const auto dominant = std::ranges::max_element(
-            profile.targets, {}, [](const auto& item) {
-                return item.second;
-            });
-        const bool stable =
-            dominant != profile.targets.end() &&
-            dominant->second * 10u >= profile.total_samples * 9u;
+        const std::uint64_t dirty =
+            tiered_profile_dirty_samples_.fetch_add(
+                kLocalMergeSamples, std::memory_order_relaxed) +
+            kLocalMergeSamples;
+        if (dirty >= kTieredProfileFlushSamples &&
+            !tiered_profile_flush_requested_.exchange(
+                true, std::memory_order_acq_rel)) {
+            flush_requested = true;
+        }
         constexpr std::uint64_t kMinimumTraceSamples = 32;
-        if (JitTraceCompilationEnabled() && stable && !profile.queued &&
-            profile.total_samples >= kMinimumTraceSamples &&
+        constexpr std::uint64_t kMinimumTier1Samples = 32;
+        if (!profile.tier1_promoted && !profile.tier1_queued &&
+            !profile.tier1_permanently_rejected &&
+            profile.total_samples >= kMinimumTier1Samples &&
+            profile.total_samples >= profile.tier1_retry_after_samples) {
+            profile.tier1_queued = true;
+            profile.tier1_retry_after_samples =
+                profile.total_samples + 1024u;
+            tier1_compile_queue_.push_back(source_rip);
+            g_tiered_counts.tier1_queued.fetch_add(
+                1, std::memory_order_relaxed);
+            tier1_queued_now = true;
+        }
+        const auto stable_target =
+            SelectStableTieredTarget(profile, kMinimumTraceSamples);
+        if (JitTraceCompilationEnabled() && stable_target &&
             profile.total_samples >= profile.retry_after_samples) {
-            profile.queued = true;
-            // A rejected seed must cool down before it can consume worker time
-            // again. Successful traces leave queued set and never requeue.
-            profile.retry_after_samples = profile.total_samples + 1024;
-            tiered_compile_queue_.push_back(source_rip);
-            g_tiered_counts.queued.fetch_add(1, std::memory_order_relaxed);
-            queued = true;
+            queued_target = *stable_target;
+            queued_loop_osr = queued_target <= source_rip;
+            queued_seed = queued_loop_osr ? queued_target : source_rip;
+            const auto seed_profile = tiered_edge_profiles_.find(queued_seed);
+            const bool seed_is_queued =
+                seed_profile != tiered_edge_profiles_.end() &&
+                seed_profile->second.queued;
+            if (!seed_is_queued) {
+                // A rejected trigger edge must cool down before it can consume
+                // worker time again. Loop requests publish at the backward
+                // edge target (the loop head), which gives natural OSR on the
+                // next Tier-1 edge into that header.
+                profile.retry_after_samples = profile.total_samples + 1024;
+                if (queued_seed == source_rip) {
+                    profile.queued = true;
+                } else {
+                    tiered_edge_profiles_[queued_seed].queued = true;
+                    tiered_loop_seed_requests_.insert(queued_seed);
+                }
+                tiered_compile_queue_.push_back(queued_seed);
+                g_tiered_counts.queued.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (queued_loop_osr) {
+                    g_tiered_counts.loop_osr_queued.fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                queued = true;
+            }
+        }
+    }
+    if (tier1_queued_now) {
+        {
+            std::lock_guard block_lock{block_cache_mutex_};
+            CachedTranslationRecord* const current =
+                block_results_.Find(source_rip);
+            if (current != nullptr &&
+                current->tier == LocalJitTier::Tier0) {
+                current->tier1_state =
+                    Tier1PromotionState::Queued;
+            }
+        }
+        static std::atomic<std::uint32_t> tier1_queued_logs{0};
+        if (tier1_queued_logs.fetch_add(
+                1, std::memory_order_relaxed) < 64) {
+            JitLog(
+                "[EXECUTOR_TIER1_QUEUED] rip=0x%llx sampledEdges=%llu",
+                static_cast<unsigned long long>(source_rip),
+                static_cast<unsigned long long>(
+                    g_tiered_counts.profiled_edges.load(
+                        std::memory_order_relaxed)));
         }
     }
     if (queued) {
         static std::atomic<std::uint32_t> queued_logs{0};
         if (queued_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+#ifdef __ANDROID__
+            char host_thread_name[16] = "unknown";
+            (void)pthread_getname_np(
+                pthread_self(), host_thread_name, sizeof(host_thread_name));
+#else
+            constexpr const char* host_thread_name = "host";
+#endif
             JitLog(
                 "[EXECUTOR_TIERED_TRACE_QUEUED] seed=0x%llx target=0x%llx "
-                "sampledEdges=%llu",
-                static_cast<unsigned long long>(source_rip),
-                static_cast<unsigned long long>(target_rip),
+                "loopOsr=%d sampledEdges=%llu thread=%s",
+                static_cast<unsigned long long>(queued_seed),
+                static_cast<unsigned long long>(queued_target),
+                queued_loop_osr ? 1 : 0,
                 static_cast<unsigned long long>(
                     g_tiered_counts.profiled_edges.load(
-                        std::memory_order_relaxed)));
+                        std::memory_order_relaxed)),
+                host_thread_name);
         }
+    }
+    if (queued || tier1_queued_now || flush_requested) {
         StartTieredWorker();
         tiered_worker_cv_.notify_one();
     }
@@ -6996,14 +8954,50 @@ void RetiringTranslationRuntime::RecordTieredEdge(
 
 std::optional<TieredTracePlan>
 RetiringTranslationRuntime::BuildTieredTracePlan(
-    const std::uint64_t seed_rip) {
-    constexpr std::size_t kMaximumTraceBlocks = 8;
+    const std::uint64_t seed_rip,
+    const bool require_loop_closure,
+    TieredTracePlanDiagnostic* const diagnostic) {
+    // Eight blocks exhausted the managed Tier-2 budget on short fragments and
+    // returned to the dispatcher in the middle of stable game loops. Keep the
+    // same per-member witnesses, guards and deopt exits, but let one validated
+    // trace span a useful mobile CPU scheduling quantum.
+    constexpr std::size_t kMaximumTraceBlocks = 32;
+    if (diagnostic != nullptr) {
+        *diagnostic = {};
+    }
     TieredTracePlan plan{};
     plan.seed_rip = seed_rip;
     plan.combined.start_rip = seed_rip;
     plan.combined.decode_status = RegionDecodeStatus::Ready;
     plan.combined.SelectInitialNativeTier(true);
-    plan.combined.diagnostic = "tiered-straight-line-trace";
+    plan.combined.diagnostic = require_loop_closure
+        ? "tiered-loop-head-osr-trace"
+        : "tiered-straight-line-trace";
+    plan.loop_head_osr = require_loop_closure;
+
+    TieredTracePlanDiagnostic stop{};
+    const auto note_stop = [&](const char* const reason,
+                               const std::uint64_t guest_rip) {
+        if (stop.reason == nullptr) {
+            stop.reason = reason;
+            stop.guest_rip = guest_rip;
+            stop.member_count = plan.members.size();
+        }
+    };
+    const auto reject = [&](const char* const reason,
+                            const std::uint64_t guest_rip)
+        -> std::optional<TieredTracePlan> {
+        if (diagnostic != nullptr) {
+            if (stop.reason != nullptr) {
+                *diagnostic = stop;
+            } else {
+                diagnostic->reason = reason;
+                diagnostic->guest_rip = guest_rip;
+                diagnostic->member_count = plan.members.size();
+            }
+        }
+        return std::nullopt;
+    };
 
     std::unordered_set<std::uint64_t> visited;
     std::uint64_t rip = seed_rip;
@@ -7011,47 +9005,84 @@ RetiringTranslationRuntime::BuildTieredTracePlan(
     for (std::size_t member_index = 0;
          member_index < kMaximumTraceBlocks; ++member_index) {
         CachedTranslationRecord* const cached = block_results_.Find(rip);
-        if (cached == nullptr || cached->decoded == nullptr ||
-            cached->witness == nullptr ||
-            !TranslationHasFeature(cached->block.flags,
-                                   TranslationFeature::NativeCode) ||
-            !TranslationHasFeature(cached->block.flags,
-                                   TranslationFeature::DirectEntry) ||
-            TranslationHasFeature(cached->block.flags,
-                                  TranslationFeature::DispatcherBoundary) ||
-            TranslationHasFeature(
-                cached->block.flags,
-                TranslationFeature::SynchronousFaultResume) ||
-            !cached->decoded->SupportsInitialNativeTier() ||
-            !GuestBytesMatchDecoded(*cached->decoded) ||
-            !visited.insert(rip).second) {
+        if (cached == nullptr) {
+            note_stop("cached_translation_missing", rip);
             break;
         }
-        std::unique_ptr<LsxDecodedRegion> expanded;
-        const LsxDecodedRegion* decoded_ptr = cached->decoded;
-        if (decoded_ptr->instructions.empty()) {
-            try {
-                StableDecodedBlock stable =
-                    DecodeStableBlock({rip, kJitMaxInstructionsPerBlock});
-                expanded = std::move(stable.block);
-            } catch (...) {
-                break;
-            }
-            if (expanded == nullptr ||
-                expanded->start_rip != cached->decoded->start_rip ||
-                expanded->end_rip != cached->decoded->end_rip ||
-                !expanded->SupportsInitialNativeTier() ||
-                !GuestBytesMatchDecoded(*expanded)) {
-                break;
-            }
-            decoded_ptr = expanded.get();
+        if (cached->decoded == nullptr) {
+            note_stop("decoded_region_missing", rip);
+            break;
         }
-        const auto& decoded = *decoded_ptr;
+        if (cached->witness == nullptr) {
+            note_stop("published_witness_missing", rip);
+            break;
+        }
+        if (!TranslationHasFeature(cached->block.flags,
+                                   TranslationFeature::NativeCode)) {
+            note_stop("native_code_missing", rip);
+            break;
+        }
+        if (!TranslationHasFeature(cached->block.flags,
+                                   TranslationFeature::DirectEntry)) {
+            note_stop("direct_entry_missing", rip);
+            break;
+        }
+        if (TranslationHasFeature(cached->block.flags,
+                                  TranslationFeature::DispatcherBoundary)) {
+            note_stop("dispatcher_boundary", rip);
+            break;
+        }
+        if (!cached->decoded->SupportsInitialNativeTier()) {
+            note_stop("initial_native_tier_unsupported", rip);
+            break;
+        }
+        if (!GuestBytesMatchDecoded(*cached->decoded)) {
+            note_stop("guest_bytes_changed", rip);
+            break;
+        }
+        if (!visited.insert(rip).second) {
+            note_stop("member_revisited", rip);
+            break;
+        }
+        // Persistent native restore may compact a published region down to the
+        // instructions referenced by native fault/semantic relocations.  That
+        // non-empty subset is sufficient for the restored block, but it is not
+        // a complete input for a new multi-block trace.  Always decode a fresh
+        // member from current guest bytes before T2 concatenates regions.
+        std::unique_ptr<LsxDecodedRegion> expanded;
+        try {
+            StableDecodedBlock stable =
+                DecodeStableBlock({rip, kJitMaxInstructionsPerBlock});
+            expanded = std::move(stable.block);
+        } catch (...) {
+            note_stop("stable_decode_failed", rip);
+            break;
+        }
+        if (expanded == nullptr) {
+            note_stop("stable_decode_missing", rip);
+            break;
+        }
+        if (expanded->start_rip != cached->decoded->start_rip ||
+            expanded->end_rip != cached->decoded->end_rip) {
+            note_stop("stable_decode_range_changed", rip);
+            break;
+        }
+        if (!expanded->SupportsInitialNativeTier()) {
+            note_stop("stable_decode_native_tier_unsupported", rip);
+            break;
+        }
+        if (!GuestBytesMatchDecoded(*expanded)) {
+            note_stop("stable_decode_guest_bytes_changed", rip);
+            break;
+        }
+        const auto& decoded = *expanded;
         if (decoded.instructions.empty()) {
+            note_stop("decoded_instructions_empty", rip);
             break;
         }
         if (plan.combined.instructions.size() + decoded.instructions.size() >
             kJitMaxTraceInstructions) {
+            note_stop("trace_instruction_limit", rip);
             break;
         }
         plan.members.push_back({
@@ -7073,74 +9104,204 @@ RetiringTranslationRuntime::BuildTieredTracePlan(
             break;
         }
 
-        std::uint64_t dominant_target = 0;
-        {
-            std::lock_guard profile_lock{tiered_profile_mutex_};
-            const auto profile = tiered_edge_profiles_.find(rip);
-            if (profile == tiered_edge_profiles_.end() ||
-                profile->second.total_samples < 4) {
-                break;
-            }
-            const auto dominant = std::ranges::max_element(
-                profile->second.targets, {}, [](const auto& item) {
-                    return item.second;
-                });
-            if (dominant == profile->second.targets.end() ||
-                dominant->second * 10u <
-                    profile->second.total_samples * 9u) {
-                break;
-            }
-            dominant_target = dominant->first;
-        }
         const LsxDecodedOp& terminator = decoded.instructions.back();
         const auto mnemonic =
             static_cast<X86Mnemonic>(terminator.mnemonic);
-        bool can_fuse = !terminator.terminates_block &&
-                        dominant_target == decoded.end_rip;
+        std::uint64_t dominant_target = 0;
         std::uint64_t direct_target = 0;
-        const bool removable_direct_jump =
+        bool can_fuse = false;
+        bool removable_direct_jump =
             mnemonic == X86_MNEMONIC_JMP &&
-            TryResolveBranchTarget(terminator, direct_target) &&
-            direct_target == dominant_target;
-        if (removable_direct_jump) {
-            // The selected path is unconditional, so the guest JMP has no
-            // architectural effect. Omitting it lets the existing native
-            // emitter keep register caches live across the Tier-1 boundary.
-            plan.combined.instructions.pop_back();
+            TryResolveBranchTarget(terminator, direct_target);
+        const bool conditional_terminator =
+            IsConditionalBranchMnemonic(mnemonic);
+        const bool conditional_target_resolved =
+            conditional_terminator &&
+            TryResolveBranchTarget(terminator, direct_target);
+        std::optional<TieredGuardEmission> pending_guard;
+        if (!terminator.terminates_block) {
+            dominant_target = decoded.end_rip;
             can_fuse = true;
-        } else if (IsConditionalBranchMnemonic(mnemonic) &&
-                   TryResolveBranchTarget(terminator, direct_target)) {
-            const std::uint64_t fallthrough =
-                terminator.guest_rip + terminator.length;
-            if (dominant_target == direct_target ||
-                dominant_target == fallthrough) {
-                plan.guards.push_back({
+        } else if (removable_direct_jump) {
+            // A direct JMP has one statically known successor. It does not
+            // need sampled edge evidence and is safe to fuse without a side
+            // exit as long as the destination is a compatible native block.
+            dominant_target = direct_target;
+            can_fuse = true;
+        } else if (conditional_target_resolved) {
+            if (NativeCondition::Supports(mnemonic) &&
+                plan.guards.size() < kMaximumTieredTraceGuards) {
+                std::lock_guard profile_lock{tiered_profile_mutex_};
+                const auto profile = tiered_edge_profiles_.find(rip);
+                if (profile != tiered_edge_profiles_.end()) {
+                    constexpr std::uint64_t kMinimumInternalGuardSamples = 16;
+                    const auto stable_target =
+                        SelectStableInternalTieredTarget(
+                        profile->second, kMinimumInternalGuardSamples);
+                    if (stable_target) {
+                        dominant_target = *stable_target;
+                    }
+                }
+            }
+            const std::uint64_t fallthrough = terminator.guest_rip + terminator.length;
+            if (dominant_target != 0 &&
+                (dominant_target == direct_target || dominant_target == fallthrough) &&
+                direct_target != fallthrough) {
+                pending_guard = TieredGuardEmission{
                     .instruction_index =
                         plan.combined.instructions.size() - 1u,
+                    .source_block_rip = rip,
                     .hot_target = dominant_target,
                     .cold_target = dominant_target == direct_target
                         ? fallthrough
                         : direct_target,
                     .hot_path_is_taken =
                         dominant_target == direct_target,
-                });
+                };
                 can_fuse = true;
             }
         }
         if (!can_fuse) {
+            note_stop(
+                conditional_terminator
+                    ? (conditional_target_resolved
+                           ? "conditional_profile_not_dominant"
+                           : "conditional_target_unresolved")
+                    : "terminator_not_fusable",
+                rip);
+            break;
+        }
+        if (visited.contains(dominant_target)) {
+            // A trace initially queued from a forward edge can still discover
+            // a backedge after following several hot successors. Publishing
+            // that cycle as a straight-line trace creates a native self-chain
+            // with no periodic composite-witness safepoint. Promote an exact
+            // seed closure to the existing loop-OSR path; an internal cycle
+            // must be re-profiled and compiled from its real loop head.
+            if (dominant_target != seed_rip) {
+                return reject("internal_cycle_requires_loop_seed",
+                              dominant_target);
+            }
+            plan.loop_head_osr = true;
+            plan.combined.diagnostic = "tiered-loop-head-osr-trace";
             break;
         }
         const CachedTranslationRecord* const successor =
             block_results_.Find(dominant_target);
-        if (successor == nullptr || successor->decoded == nullptr ||
-            successor->decoded->start_rip != dominant_target) {
+        if (successor == nullptr) {
+            note_stop("successor_translation_missing", dominant_target);
             break;
+        }
+        if (successor->decoded == nullptr) {
+            note_stop("successor_decoded_region_missing", dominant_target);
+            break;
+        }
+        if (successor->witness == nullptr) {
+            note_stop("successor_published_witness_missing", dominant_target);
+            break;
+        }
+        if (successor->decoded->start_rip != dominant_target) {
+            note_stop("successor_start_rip_mismatch", dominant_target);
+            break;
+        }
+        if (!TranslationHasFeature(successor->block.flags,
+                                   TranslationFeature::NativeCode)) {
+            note_stop("successor_native_code_missing", dominant_target);
+            break;
+        }
+        if (!TranslationHasFeature(successor->block.flags,
+                                   TranslationFeature::DirectEntry)) {
+            note_stop("successor_direct_entry_missing", dominant_target);
+            break;
+        }
+        if (TranslationHasFeature(successor->block.flags,
+                                  TranslationFeature::DispatcherBoundary)) {
+            note_stop("successor_dispatcher_boundary", dominant_target);
+            break;
+        }
+        if (!successor->decoded->SupportsInitialNativeTier()) {
+            note_stop("successor_native_tier_unsupported", dominant_target);
+            break;
+        }
+        if (!GuestBytesMatchDecoded(*successor->decoded)) {
+            note_stop("successor_guest_bytes_changed", dominant_target);
+            break;
+        }
+        if (removable_direct_jump) {
+            // The selected path is unconditional, so the guest JMP has no
+            // architectural effect. Omitting it keeps native register caches
+            // live across what used to be a Tier-0 block boundary.
+            plan.combined.instructions.pop_back();
+        }
+        if (pending_guard) {
+            plan.guards.push_back(*pending_guard);
         }
         rip = dominant_target;
     }
-    if (plan.members.size() < 2 ||
-        plan.combined.instructions.empty()) {
-        return std::nullopt;
+    const std::size_t minimum_member_count =
+        plan.loop_head_osr ? 1u : 2u;
+    if (plan.members.size() < minimum_member_count) {
+        return reject("insufficient_members", seed_rip);
+    }
+    if (plan.combined.instructions.empty()) {
+        return reject("combined_instructions_empty", seed_rip);
+    }
+    if (plan.loop_head_osr) {
+        // Internal stable conditionals use explicit cold exits. The final
+        // closing branch remains ordinary loop control and is never converted
+        // into a guard, so both loop completion and the periodic composite
+        // witness safepoint stay reachable.
+        if (plan.members.front().guest_rip != seed_rip) {
+            return reject("loop_seed_mismatch",
+                          plan.members.front().guest_rip);
+        }
+        const LsxDecodedOp& terminator = plan.combined.instructions.back();
+        const auto mnemonic =
+            static_cast<X86Mnemonic>(terminator.mnemonic);
+        const bool counted_control =
+            mnemonic == X86_MNEMONIC_JCXZ ||
+            mnemonic == X86_MNEMONIC_JECXZ ||
+            mnemonic == X86_MNEMONIC_JRCXZ ||
+            mnemonic == X86_MNEMONIC_LOOP ||
+            mnemonic == X86_MNEMONIC_LOOPE ||
+             mnemonic == X86_MNEMONIC_LOOPNE;
+        std::uint64_t backedge_target = 0;
+        if (!IsConditionalBranchMnemonic(mnemonic)) {
+            return reject("loop_close_not_conditional",
+                          terminator.guest_rip);
+        }
+        if (counted_control) {
+            return reject("loop_close_counted_control",
+                          terminator.guest_rip);
+        }
+        if (!TryResolveBranchTarget(terminator, backedge_target)) {
+            return reject("loop_close_target_unresolved",
+                          terminator.guest_rip);
+        }
+        if (backedge_target != seed_rip) {
+            return reject("loop_close_target_mismatch",
+                          terminator.guest_rip);
+        }
+        // A one-instruction Jcc self-loop has terminator.guest_rip == seed_rip.
+        // The exact resolved target above proves closure; only an impossible
+        // terminator located before the trace seed is invalid.
+        if (terminator.guest_rip < seed_rip) {
+            return reject("loop_close_terminator_before_seed",
+                          terminator.guest_rip);
+        }
+        const bool unsafe_control = std::ranges::any_of(
+            plan.combined.instructions, [](const LsxDecodedOp& instruction) {
+                const auto instruction_mnemonic =
+                    static_cast<X86Mnemonic>(instruction.mnemonic);
+                return instruction_mnemonic == X86_MNEMONIC_CALL ||
+                       instruction_mnemonic == X86_MNEMONIC_RET ||
+                       instruction_mnemonic == X86_MNEMONIC_UD2 ||
+                       IsJitHleBridgeMarkerInstruction(instruction) ||
+                       IsIndirectPicTerminator(instruction);
+            });
+        if (unsafe_control) {
+            return reject("loop_unsafe_control", seed_rip);
+        }
     }
     return plan;
 }
@@ -7157,14 +9318,117 @@ void RetiringTranslationRuntime::CompileTieredTrace(
     };
     try {
         if (!JitTraceCompilationEnabled() ||
-            plan.members.size() < 2 ||
-            !plan.guards.empty() ||
+            TieredJitDiagnosticModeActive() ||
+            plan.members.empty() ||
+            (!plan.loop_head_osr && plan.members.size() < 2) ||
+            plan.guards.size() > kMaximumTieredTraceGuards ||
             BlockRequiresDispatcherBoundary(plan.combined) ||
             IsDirectHleBoundary(plan.seed_rip)) {
             reject();
             return;
         }
 
+        std::vector<std::unique_ptr<TieredGuardDeoptContext>>
+            guard_contexts;
+        guard_contexts.reserve(plan.guards.size());
+        std::size_t previous_guard_index =
+            std::numeric_limits<std::size_t>::max();
+        for (TieredGuardEmission& guard : plan.guards) {
+            if (guard.instruction_index >=
+                    plan.combined.instructions.size() ||
+                guard.instruction_index + 1u >=
+                    plan.combined.instructions.size() ||
+                (previous_guard_index !=
+                     std::numeric_limits<std::size_t>::max() &&
+                 guard.instruction_index <= previous_guard_index) ||
+                guard.source_block_rip == 0 ||
+                guard.hot_target == 0 || guard.cold_target == 0 ||
+                guard.hot_target == guard.cold_target) {
+                reject();
+                return;
+            }
+            const LsxDecodedOp& branch =
+                plan.combined.instructions[guard.instruction_index];
+            const auto branch_mnemonic =
+                static_cast<X86Mnemonic>(branch.mnemonic);
+            std::uint64_t taken_target = 0;
+            if (!IsConditionalBranchMnemonic(branch_mnemonic) ||
+                !NativeCondition::Supports(branch_mnemonic) ||
+                !TryResolveBranchTarget(branch, taken_target)) {
+                reject();
+                return;
+            }
+            const std::uint64_t fallthrough_target =
+                branch.guest_rip + branch.length;
+            const bool guard_targets_match =
+                ((guard.hot_target == taken_target &&
+                  guard.cold_target == fallthrough_target &&
+                  guard.hot_path_is_taken) ||
+                 (guard.hot_target == fallthrough_target &&
+                  guard.cold_target == taken_target &&
+                  !guard.hot_path_is_taken));
+            if (!guard_targets_match) {
+                reject();
+                return;
+            }
+            auto context = std::make_unique<TieredGuardDeoptContext>();
+            context->owner = this;
+            context->seed_rip = plan.seed_rip;
+            context->source_rip = guard.source_block_rip;
+            context->cold_target = guard.cold_target;
+            guard.deopt_context = context.get();
+            guard_contexts.push_back(std::move(context));
+            previous_guard_index = guard.instruction_index;
+        }
+
+        const bool faultable_trace =
+            BlockNeedsSynchronousFaultResume(plan.combined);
+        const bool read_only_poll_trace =
+            faultable_trace && plan.loop_head_osr &&
+            plan.members.size() >= 2 &&
+            std::ranges::any_of(
+                plan.combined.instructions,
+                [](const LsxDecodedOp& ir) {
+                    return std::ranges::any_of(
+                        std::span{ir.operands}.first(ir.operand_count),
+                        [](const LsxOperandRecord& operand) {
+                            return operand.type == X86_OPERAND_TYPE_MEMORY &&
+                                   (operand.actions &
+                                    X86_OPERAND_ACTION_MASK_READ) != 0;
+                        });
+                }) &&
+            std::ranges::all_of(
+                plan.combined.instructions,
+                [](const LsxDecodedOp& ir) {
+                    const auto mnemonic =
+                        static_cast<X86Mnemonic>(ir.mnemonic);
+                    if (IsConditionalBranchMnemonic(mnemonic) ||
+                        mnemonic == X86_MNEMONIC_NOP ||
+                        mnemonic == X86_MNEMONIC_PAUSE) {
+                        return true;
+                    }
+                    if (mnemonic != X86_MNEMONIC_CMP &&
+                        mnemonic != X86_MNEMONIC_TEST) {
+                        return false;
+                    }
+                    return std::ranges::none_of(
+                        std::span{ir.operands}.first(ir.operand_count),
+                        [](const LsxOperandRecord& operand) {
+                            return operand.type == X86_OPERAND_TYPE_MEMORY &&
+                                   (operand.actions &
+                                    X86_OPERAND_ACTION_MASK_WRITE) != 0;
+                        });
+                });
+        // The native emitter publishes per-instruction recovery descriptors
+        // for cached GPR/SIMD state. Admit bounded straight-line faultable
+        // traces, but keep faultable loops and internal guarded exits on the
+        // conservative baseline: their combined recovery/rollback path can
+        // otherwise observe a fault between cached-state handoffs.
+        if (faultable_trace && !read_only_poll_trace &&
+            (plan.loop_head_osr || !plan.guards.empty())) {
+            reject();
+            return;
+        }
         const LsxDecodedOp& terminator = plan.combined.instructions.back();
         const auto mnemonic = static_cast<X86Mnemonic>(terminator.mnemonic);
         if (mnemonic == X86_MNEMONIC_RET ||
@@ -7201,7 +9465,8 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             plan.guards.empty() ? nullptr : &plan.guards;
         Arm64BlockEntry external = native_depot_.EmitNativeControlFlowBlock(
             plan.combined, primary, &direct, secondary, nullptr, nullptr,
-            &chain_abi, &resident, tiered_guards);
+            &chain_abi, &resident, tiered_guards, plan.loop_head_osr,
+            LocalJitTier::Tier2);
         const auto compile_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - compile_started)
@@ -7220,10 +9485,13 @@ void RetiringTranslationRuntime::CompileTieredTrace(
                 reinterpret_cast<std::uint64_t>(entry));
             if (range && code_ranges.insert(range->base).second) {
                 generated_bytes += range->size;
+                RegisterJitHelperPerfSymbol(
+                    reinterpret_cast<const void*>(range->base),
+                    static_cast<std::size_t>(range->size), plan.combined);
             }
         }
         constexpr std::uint64_t kTieredCodeBudget =
-            32u * 1024u * 1024u;
+            128u * 1024u * 1024u;
         if (generated_bytes == 0 ||
             generated_bytes > kTieredCodeBudget ||
             tiered_active_code_bytes_.load(std::memory_order_acquire) >
@@ -7234,6 +9502,10 @@ void RetiringTranslationRuntime::CompileTieredTrace(
 
         auto artifact = std::make_unique<TieredTraceArtifact>();
         artifact->validation = std::make_unique<TraceValidationRecord>();
+        artifact->guard_contexts = std::move(guard_contexts);
+        for (const auto& context : artifact->guard_contexts) {
+            context->validation = artifact->validation.get();
+        }
         artifact->external_entry = external;
         artifact->resident_entry = resident;
         artifact->primary_outbound_edge = primary;
@@ -7281,6 +9553,14 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             published->resident_entry;
         artifact->validation->baseline_witness =
             published->code_witness;
+        if (primary != nullptr) {
+            primary->source_trace_validation.store(
+                artifact->validation.get(), std::memory_order_release);
+        }
+        if (secondary != nullptr) {
+            secondary->source_trace_validation.store(
+                artifact->validation.get(), std::memory_order_release);
+        }
         artifact->validation->active.store(true, std::memory_order_release);
         TieredTraceArtifact* const active = artifact.get();
         tiered_trace_artifacts_.push_back(std::move(artifact));
@@ -7293,6 +9573,14 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         tiered_active_code_bytes_.fetch_add(
             generated_bytes, std::memory_order_release);
         g_tiered_counts.compiled.fetch_add(1, std::memory_order_relaxed);
+        if (faultable_trace) {
+            g_tiered_counts.faultable_compiled.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        if (plan.loop_head_osr) {
+            g_tiered_counts.loop_osr_compiled.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         g_tiered_counts.active.fetch_add(1, std::memory_order_relaxed);
         g_tiered_counts.compile_time_us.fetch_add(
             static_cast<std::uint64_t>(std::max<std::int64_t>(compile_us, 0)),
@@ -7309,11 +9597,12 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             plan.guards.size(), std::memory_order_relaxed);
         JitLog(
             "[EXECUTOR_TIERED_TRACE_ACTIVE] seed=0x%llx blocks=%zu "
-            "instructions=%zu guards=%zu bytes=%llu compileUs=%lld "
-            "external=%p resident=%p",
+            "instructions=%zu guards=%zu faultable=%d loopOsr=%d bytes=%llu "
+            "compileUs=%lld external=%p resident=%p",
             static_cast<unsigned long long>(plan.seed_rip),
             plan.members.size(), plan.combined.instructions.size(),
-            plan.guards.size(),
+            plan.guards.size(), faultable_trace ? 1 : 0,
+            plan.loop_head_osr ? 1 : 0,
             static_cast<unsigned long long>(generated_bytes),
             static_cast<long long>(compile_us),
             reinterpret_cast<void*>(active->external_entry),
@@ -7328,49 +9617,540 @@ void RetiringTranslationRuntime::CompileTieredTrace(
     }
 }
 
+bool RetiringTranslationRuntime::DemoteTier1Locked(
+    CachedTranslationRecord& record, const std::uint64_t guest_rip,
+    const bool publish_tier0) noexcept {
+    if (record.tier != LocalJitTier::Tier1) {
+        return false;
+    }
+
+    record.block = record.tier0_block;
+    record.block.reserved_0c =
+        static_cast<std::uint32_t>(LocalJitTier::Tier0);
+    record.tier = LocalJitTier::Tier0;
+    record.tier1_state = Tier1PromotionState::Deoptimized;
+    if (record.witness != nullptr) {
+        record.witness->revision.fetch_add(
+            1, std::memory_order_release);
+    }
+
+    {
+        std::lock_guard edge_lock{edge_graph_mutex_};
+        if (publish_tier0 && record.tier0_published_external != nullptr &&
+            record.witness != nullptr && record.decoded != nullptr &&
+            GuestBytesMatchDecoded(*record.decoded)) {
+            edge_directory_.PublishAndConnect(
+                guest_rip,
+                {record.tier0_published_external,
+                 record.tier0_published_resident,
+                 record.witness, nullptr});
+        } else {
+            edge_directory_.WithdrawAndDisconnect(guest_rip);
+        }
+    }
+
+    SaturatingDecrement(g_tiered_counts.tier1_active);
+    if (record.block.entry != nullptr) {
+        g_tiered_counts.tier0_active.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    g_tiered_counts.tier1_deopts.fetch_add(
+        1, std::memory_order_relaxed);
+    return true;
+}
+
+void RetiringTranslationRuntime::CompileTier1Block(
+    const std::uint64_t guest_rip) noexcept {
+    struct CompileSnapshot {
+        const LsxDecodedRegion* decoded = nullptr;
+        PublishedCodeWitness* witness = nullptr;
+        std::uint32_t revision = 0;
+        TranslationRecord tier0_block{};
+        Arm64BlockEntry tier0_resident_entry = nullptr;
+        bool loop_osr_candidate = false;
+    } snapshot{};
+
+    const auto reject = [this, guest_rip, &snapshot](
+                            const char* const reason) {
+        {
+            std::lock_guard block_lock{block_cache_mutex_};
+            CachedTranslationRecord* const current =
+                block_results_.Find(guest_rip);
+            if (current != nullptr &&
+                (snapshot.witness == nullptr ||
+                 current->witness == snapshot.witness) &&
+                current->tier != LocalJitTier::Tier1) {
+                current->tier1_state =
+                    Tier1PromotionState::Deoptimized;
+            }
+        }
+        {
+            std::lock_guard profile_lock{tiered_profile_mutex_};
+            auto profile = tiered_edge_profiles_.find(guest_rip);
+            if (profile != tiered_edge_profiles_.end()) {
+                profile->second.tier1_queued = false;
+                profile->second.tier1_promoted = false;
+                if (reason != nullptr &&
+                    std::string_view{reason} == "no-static-cost-win") {
+                    // Emission is deterministic for a decoded block in this
+                    // process. Retrying a known-larger T1 body every 1024
+                    // samples only burns a background core and leaks rejected
+                    // code into the native arena; an SMC invalidation clears
+                    // this terminal decision.
+                    profile->second.tier1_permanently_rejected = true;
+                }
+                profile->second.tier1_retry_after_samples =
+                    std::max(profile->second.tier1_retry_after_samples,
+                             profile->second.total_samples + 1024u);
+            }
+        }
+        g_tiered_counts.tier1_rejected.fetch_add(
+            1, std::memory_order_relaxed);
+        static std::atomic<std::uint32_t> rejection_logs{0};
+        if (rejection_logs.fetch_add(
+                1, std::memory_order_relaxed) < 64) {
+            JitLog(
+                "[EXECUTOR_TIER1_REJECT] rip=0x%llx reason=%s",
+                static_cast<unsigned long long>(guest_rip),
+                reason != nullptr ? reason : "unknown");
+        }
+    };
+
+    try {
+        if (!TieredJitEnabled() || TieredJitDiagnosticModeActive() ||
+            !tiered_profile_accepting_samples_.load(
+                std::memory_order_acquire)) {
+            reject("disabled");
+            return;
+        }
+        bool queue_request_live = false;
+        {
+            std::lock_guard profile_lock{tiered_profile_mutex_};
+            const auto profile =
+                tiered_edge_profiles_.find(guest_rip);
+            queue_request_live =
+                profile != tiered_edge_profiles_.end() &&
+                profile->second.tier1_queued &&
+                !profile->second.tier1_promoted &&
+                !profile->second.tier1_permanently_rejected;
+        }
+        if (!queue_request_live) {
+            reject("stale-queue");
+            return;
+        }
+        bool tier0_eligible = false;
+        {
+            std::lock_guard block_lock{block_cache_mutex_};
+            CachedTranslationRecord* const current =
+                block_results_.Find(guest_rip);
+            tier0_eligible =
+                current != nullptr && current->decoded != nullptr &&
+                current->witness != nullptr &&
+                current->tier == LocalJitTier::Tier0 &&
+                current->block.entry != nullptr &&
+                TranslationHasFeature(
+                    current->block.flags,
+                    TranslationFeature::Executable) &&
+                TranslationHasFeature(
+                    current->block.flags,
+                    TranslationFeature::NativeCode) &&
+                TranslationHasFeature(
+                    current->block.flags,
+                    TranslationFeature::DirectEntry) &&
+                !TranslationHasFeature(
+                    current->block.flags,
+                    TranslationFeature::DispatcherBoundary) &&
+                current->tier0_published_external != nullptr &&
+                GuestBytesMatchDecoded(*current->decoded);
+            if (tier0_eligible) {
+                current->tier1_state =
+                    Tier1PromotionState::Queued;
+                snapshot.decoded = current->decoded;
+                snapshot.witness = current->witness;
+                snapshot.revision =
+                    current->witness->revision.load(
+                        std::memory_order_acquire);
+                snapshot.tier0_block = current->tier0_block;
+                snapshot.tier0_resident_entry =
+                    current->tier0_published_resident;
+                current->tier1_state =
+                    Tier1PromotionState::Compiling;
+            }
+        }
+        if (!tier0_eligible) {
+            reject("ineligible-tier0");
+            return;
+        }
+
+        StableDecodedBlock expanded =
+            DecodeStableBlock(
+                {guest_rip, kJitMaxInstructionsPerBlock});
+        std::unique_ptr<LsxDecodedRegion> tier1_decoded =
+            std::move(expanded.block);
+        if (tier1_decoded == nullptr ||
+            tier1_decoded->instructions.empty() ||
+            tier1_decoded->start_rip !=
+                snapshot.decoded->start_rip ||
+            tier1_decoded->end_rip !=
+                snapshot.decoded->end_rip ||
+            !tier1_decoded->SupportsInitialNativeTier() ||
+            !GuestBytesMatchDecoded(*tier1_decoded)) {
+            reject("tier1-redecode");
+            return;
+        }
+        const LsxDecodedOp& terminator =
+            tier1_decoded->instructions.back();
+        const auto mnemonic =
+            static_cast<X86Mnemonic>(terminator.mnemonic);
+        if (mnemonic == X86_MNEMONIC_RET ||
+            IsIndirectPicTerminator(terminator)) {
+            reject("indirect-control");
+            return;
+        }
+
+        OutboundEdgeState* primary = nullptr;
+        OutboundEdgeState* secondary = nullptr;
+        std::uint64_t static_target = 0;
+        if ((mnemonic == X86_MNEMONIC_JMP ||
+             mnemonic == X86_MNEMONIC_CALL) &&
+            TryResolveBranchTarget(terminator, static_target)) {
+            if (mnemonic == X86_MNEMONIC_CALL) {
+                JitLeafHlePltTarget leaf_target{};
+                if (TryResolveJitLeafHlePlt(
+                        static_target, leaf_target)) {
+                    reject("leaf-hle-boundary");
+                    return;
+                }
+            }
+            primary = CreateOutboundEdge(
+                static_target, guest_rip);
+            snapshot.loop_osr_candidate =
+                static_target <= guest_rip;
+        } else if (IsConditionalBranchMnemonic(mnemonic) &&
+                   TryResolveBranchTarget(
+                       terminator, static_target)) {
+            primary = CreateOutboundEdge(
+                static_target, guest_rip);
+            const std::uint64_t fallthrough =
+                terminator.guest_rip + terminator.length;
+            if (fallthrough != static_target) {
+                secondary = CreateOutboundEdge(
+                    fallthrough, guest_rip);
+            }
+            snapshot.loop_osr_candidate =
+                static_target <= guest_rip ||
+                fallthrough <= guest_rip;
+        } else if (!terminator.terminates_block) {
+            primary = CreateOutboundEdge(
+                tier1_decoded->end_rip, guest_rip);
+        }
+
+        const auto compile_started =
+            std::chrono::steady_clock::now();
+        Arm64BlockEntry direct = nullptr;
+        Arm64BlockEntry resident = nullptr;
+        bool chain_abi = false;
+        Arm64BlockEntry external =
+            native_depot_.EmitNativeControlFlowBlock(
+                *tier1_decoded, primary, &direct, secondary,
+                nullptr, nullptr, &chain_abi, &resident, nullptr,
+                false, LocalJitTier::Tier1);
+        const auto compile_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() -
+                compile_started).count();
+        if (external == nullptr || direct == nullptr) {
+            reject("native-emission");
+            return;
+        }
+        ConfigureOutboundEdgeEntryConvention(primary, chain_abi);
+        ConfigureOutboundEdgeEntryConvention(secondary, chain_abi);
+
+        // Tier-1 is an optional optimization, not merely a second spelling of
+        // T0.  On wide SIMD blocks its current residency allocator can trade
+        // state loads for even more register moves and writebacks.  Publishing
+        // such a block made several of Bloodborne's hottest loops 13-20%
+        // larger than their baseline versions.  Keep the known-good T0 entry
+        // unless the optimized body has a strictly smaller static footprint.
+        // This also prevents a cold background compiler from reducing steady
+        // state performance after gameplay has already started.
+        const auto tier0_body_range =
+            snapshot.tier0_resident_entry != nullptr
+                ? native_depot_.FindCodeRange(
+                      reinterpret_cast<std::uint64_t>(
+                          snapshot.tier0_resident_entry))
+                : std::nullopt;
+        const auto tier1_body_range =
+            resident != nullptr
+                ? native_depot_.FindCodeRange(
+                      reinterpret_cast<std::uint64_t>(resident))
+                : std::nullopt;
+        if (tier0_body_range && tier1_body_range &&
+            tier1_body_range->size >= tier0_body_range->size) {
+            reject("no-static-cost-win");
+            return;
+        }
+
+        std::uint64_t generated_bytes = 0;
+        std::unordered_set<std::uint64_t> code_ranges;
+        for (const auto entry : {external, direct, resident}) {
+            const auto range = native_depot_.FindCodeRange(
+                reinterpret_cast<std::uint64_t>(entry));
+            if (range && code_ranges.insert(range->base).second) {
+                generated_bytes += range->size;
+                RegisterJitHelperPerfSymbol(
+                    reinterpret_cast<const void*>(range->base),
+                    static_cast<std::size_t>(range->size), *tier1_decoded);
+            }
+        }
+        // Bloodborne reaches the old 32 MiB ceiling at roughly 350 promoted
+        // blocks while the title still spends most CPU time in guest threads.
+        // T1 remains opt-in and fully deoptimizable; raising only its arena
+        // budget allows the already validated hot-block policy to keep working.
+        constexpr std::uint64_t kTier1CodeBudget =
+            128u * 1024u * 1024u;
+        std::uint64_t used =
+            tier1_generated_code_bytes_.load(
+                std::memory_order_acquire);
+        while (generated_bytes != 0 &&
+               used <= kTier1CodeBudget &&
+               generated_bytes <= kTier1CodeBudget - used &&
+               !tier1_generated_code_bytes_.compare_exchange_weak(
+                   used, used + generated_bytes,
+                   std::memory_order_acq_rel,
+                   std::memory_order_acquire)) {
+        }
+        if (generated_bytes == 0 || used > kTier1CodeBudget ||
+            generated_bytes > kTier1CodeBudget - used) {
+            reject("code-budget");
+            return;
+        }
+        g_tiered_counts.tier1_generated_bytes.fetch_add(
+            generated_bytes, std::memory_order_relaxed);
+
+        const char* publication_reject = nullptr;
+        {
+            std::unique_lock block_lock{block_cache_mutex_};
+            CachedTranslationRecord* const current =
+                block_results_.Find(guest_rip);
+            if (!TieredJitEnabled() || current == nullptr ||
+                current->tier != LocalJitTier::Tier0 ||
+                current->tier1_state !=
+                    Tier1PromotionState::Compiling ||
+                current->witness != snapshot.witness ||
+                snapshot.witness->revision.load(
+                    std::memory_order_acquire) !=
+                    snapshot.revision ||
+                current->decoded != snapshot.decoded ||
+                !GuestBytesMatchDecoded(*snapshot.decoded) ||
+                !GuestBytesMatchDecoded(*tier1_decoded)) {
+                publication_reject = "stale-publication";
+            } else {
+                std::lock_guard edge_lock{edge_graph_mutex_};
+                const bool overlaps_active_tier2 =
+                    std::ranges::any_of(
+                        active_tiered_traces_,
+                        [&snapshot](const auto& item) {
+                            const TieredTraceArtifact* const artifact =
+                                item.second;
+                            return artifact != nullptr &&
+                                artifact->validation &&
+                                std::ranges::any_of(
+                                    artifact->validation->members,
+                                    [&snapshot](
+                                        const TraceValidationMember& member) {
+                                        return member.witness ==
+                                               snapshot.witness;
+                                    });
+                        });
+                if (overlaps_active_tier2) {
+                    publication_reject = "tier2-active";
+                } else {
+                    TranslationRecord promoted = current->block;
+                    promoted.entry = external;
+                    promoted.reserved_0c =
+                        static_cast<std::uint32_t>(
+                            LocalJitTier::Tier1);
+                    promoted.reserved_1c =
+                        snapshot.revision + 1u;
+                    current->block = promoted;
+                    current->tier1_published_external =
+                        chain_abi ? external : direct;
+                    current->tier1_published_resident =
+                        chain_abi ? resident : nullptr;
+                    current->tier = LocalJitTier::Tier1;
+                    current->tier1_state =
+                        Tier1PromotionState::Active;
+                    snapshot.witness->revision.fetch_add(
+                        1, std::memory_order_release);
+                    edge_directory_.PublishAndConnect(
+                        guest_rip,
+                        {current->tier1_published_external,
+                         current->tier1_published_resident,
+                         current->witness, nullptr});
+                }
+            }
+        }
+        if (publication_reject != nullptr) {
+            reject(publication_reject);
+            return;
+        }
+
+        {
+            std::lock_guard profile_lock{tiered_profile_mutex_};
+            TieredEdgeProfile& profile =
+                tiered_edge_profiles_[guest_rip];
+            profile.tier1_queued = false;
+            profile.tier1_promoted = true;
+        }
+        SaturatingDecrement(g_tiered_counts.tier0_active);
+        g_tiered_counts.tier1_compiled.fetch_add(
+            1, std::memory_order_relaxed);
+        g_tiered_counts.tier1_active.fetch_add(
+            1, std::memory_order_relaxed);
+        g_tiered_counts.tier1_promotions.fetch_add(
+            1, std::memory_order_relaxed);
+        g_tiered_counts.tier1_safe_handoffs.fetch_add(
+            1, std::memory_order_relaxed);
+        if (snapshot.loop_osr_candidate) {
+            g_tiered_counts.tier1_loop_osr_handoffs.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        g_tiered_counts.tier1_compile_time_us.fetch_add(
+            static_cast<std::uint64_t>(
+                std::max<std::int64_t>(compile_us, 0)),
+            std::memory_order_relaxed);
+        JitLog(
+            "[EXECUTOR_TIER1_ACTIVE] rip=0x%llx tier0=%p "
+            "tier1=%p resident=%p loopOsr=%d bytes=%llu "
+            "compileUs=%lld revision=%u",
+            static_cast<unsigned long long>(guest_rip),
+            reinterpret_cast<void*>(snapshot.tier0_block.entry),
+            reinterpret_cast<void*>(external),
+            reinterpret_cast<void*>(resident),
+            snapshot.loop_osr_candidate ? 1 : 0,
+            static_cast<unsigned long long>(generated_bytes),
+            static_cast<long long>(compile_us),
+            snapshot.revision + 1u);
+    } catch (const std::exception& exception) {
+        reject(exception.what());
+    } catch (...) {
+        reject("unknown");
+    }
+}
+
 void RetiringTranslationRuntime::TieredWorkerMain(
     const std::stop_token stop_token) noexcept {
 #ifdef __ANDROID__
-    pthread_setname_np(pthread_self(), "Jit:Tier2");
+    pthread_setname_np(pthread_self(), "Jit:Tiered");
     (void)setpriority(PRIO_PROCESS, 0, 10);
 #endif
     while (!stop_token.stop_requested()) {
+        std::uint64_t tier1_rip = 0;
         std::uint64_t seed = 0;
+        bool require_loop_closure = false;
+        bool flush_profile = false;
         {
             std::unique_lock lock{tiered_profile_mutex_};
             tiered_worker_cv_.wait_for(
                 lock, std::chrono::milliseconds(100), [&] {
                     return stop_token.stop_requested() ||
-                           !tiered_compile_queue_.empty();
+                           !tier1_compile_queue_.empty() ||
+                           !tiered_compile_queue_.empty() ||
+                           tiered_profile_flush_requested_.load(
+                               std::memory_order_acquire);
                 });
             if (stop_token.stop_requested()) {
                 break;
             }
-            if (tiered_compile_queue_.empty()) {
-                continue;
+            flush_profile = tiered_profile_flush_requested_.exchange(
+                false, std::memory_order_acq_rel);
+            if (!tier1_compile_queue_.empty()) {
+                tier1_rip = tier1_compile_queue_.front();
+                tier1_compile_queue_.pop_front();
+            } else if (!tiered_compile_queue_.empty()) {
+                seed = tiered_compile_queue_.front();
+                tiered_compile_queue_.pop_front();
+                require_loop_closure =
+                    tiered_loop_seed_requests_.erase(seed) != 0;
             }
-            seed = tiered_compile_queue_.front();
-            tiered_compile_queue_.pop_front();
+        }
+        if (flush_profile) {
+            FlushTieredEdgeProfile();
+        }
+        if (tier1_rip != 0) {
+            CompileTier1Block(tier1_rip);
+            continue;
+        }
+        if (seed == 0) {
+            continue;
         }
         if (!JitTraceCompilationEnabled()) {
             std::lock_guard lock{tiered_profile_mutex_};
             tiered_edge_profiles_[seed].queued = false;
             continue;
         }
-        auto plan = BuildTieredTracePlan(seed);
+        TieredTracePlanDiagnostic diagnostic{};
+        auto plan =
+            BuildTieredTracePlan(seed, require_loop_closure, &diagnostic);
         if (!plan) {
             g_tiered_counts.rejected.fetch_add(
                 1, std::memory_order_relaxed);
+            const bool discovered_internal_loop =
+                !require_loop_closure &&
+                diagnostic.reason != nullptr &&
+                std::strcmp(
+                    diagnostic.reason,
+                    "internal_cycle_requires_loop_seed") == 0 &&
+                diagnostic.guest_rip != 0;
             static std::atomic<std::uint32_t> rejected_plan_logs{0};
             if (rejected_plan_logs.fetch_add(
                     1, std::memory_order_relaxed) < 64) {
+#ifdef __ANDROID__
+                char host_thread_name[16] = "unknown";
+                (void)pthread_getname_np(
+                    pthread_self(), host_thread_name,
+                    sizeof(host_thread_name));
+#else
+                constexpr const char* host_thread_name = "host";
+#endif
                 JitLog(
                     "[EXECUTOR_TIERED_TRACE_REJECT] seed=0x%llx "
-                    "reason=no_safe_multiblock_plan",
-                    static_cast<unsigned long long>(seed));
+                    "loopOsr=%d reason=%s rejectRip=0x%llx "
+                    "members=%zu thread=%s",
+                    static_cast<unsigned long long>(seed),
+                    require_loop_closure ? 1 : 0,
+                    diagnostic.reason != nullptr
+                        ? diagnostic.reason
+                        : "unknown",
+                    static_cast<unsigned long long>(
+                        diagnostic.guest_rip),
+                    diagnostic.member_count, host_thread_name);
             }
-            std::lock_guard lock{tiered_profile_mutex_};
-            tiered_edge_profiles_[seed].queued = false;
+            bool queued_discovered_loop = false;
+            {
+                std::lock_guard lock{tiered_profile_mutex_};
+                tiered_edge_profiles_[seed].queued = false;
+                if (discovered_internal_loop) {
+                    TieredEdgeProfile& loop_profile =
+                        tiered_edge_profiles_[diagnostic.guest_rip];
+                    if (!loop_profile.queued) {
+                        loop_profile.queued = true;
+                        tiered_loop_seed_requests_.insert(
+                            diagnostic.guest_rip);
+                        tiered_compile_queue_.push_back(
+                            diagnostic.guest_rip);
+                        queued_discovered_loop = true;
+                    }
+                }
+            }
+            if (queued_discovered_loop) {
+                g_tiered_counts.queued.fetch_add(
+                    1, std::memory_order_relaxed);
+                g_tiered_counts.loop_osr_queued.fetch_add(
+                    1, std::memory_order_relaxed);
+                tiered_worker_cv_.notify_one();
+            }
             continue;
         }
         CompileTieredTrace(std::move(*plan));
@@ -7414,7 +10194,153 @@ void RetiringTranslationRuntime::RetirePublishedDestination(
     }
 }
 
+std::uint64_t RetiringTranslationRuntime::HandleTieredGuardDeopt(
+    TieredGuardDeoptContext& context) noexcept {
+    const std::uint64_t seed_rip = context.seed_rip;
+    const std::uint64_t source_rip = context.source_rip;
+    const std::uint64_t cold_target = context.cold_target;
+    TraceValidationRecord* const trace_validation = context.validation;
+    const std::uint64_t exits =
+        context.exits.fetch_add(1, std::memory_order_relaxed) + 1u;
+    g_tiered_counts.guard_deopts.fetch_add(1, std::memory_order_relaxed);
+    RecordTieredEdge(source_rip, cold_target);
+
+    // Absolute exit counts eventually retired every long-lived trace even
+    // when its guarded edge stayed overwhelmingly hot. Use a minimum sample
+    // window and retire only after a sustained path change. A side exit is
+    // correctness-safe: it immediately resumes in the baseline tier.
+    if (JitTraceCompilationEnabled()) {
+        constexpr std::uint64_t kMinimumGuardExitSamples = 4096;
+        constexpr std::uint64_t kMinimumTraceAttempts = 16384;
+        constexpr std::uint64_t kRollbackExitPercent = 25;
+        const std::uint64_t hot_entries =
+            trace_validation != nullptr
+                ? trace_validation->estimated_entries.load(
+                      std::memory_order_relaxed)
+                : 0;
+        const std::uint64_t attempts = hot_entries + exits;
+        if (exits < kMinimumGuardExitSamples ||
+            attempts < kMinimumTraceAttempts ||
+            exits * 100u <= attempts * kRollbackExitPercent) {
+            return cold_target;
+        }
+    }
+    bool expected = false;
+    if (!context.rollback_requested.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+        return cold_target;
+    }
+
+    bool retired = false;
+    std::uint64_t hot_entries = 0;
+    {
+        std::lock_guard edge_lock{edge_graph_mutex_};
+        const auto active = active_tiered_traces_.find(seed_rip);
+        if (active != active_tiered_traces_.end() &&
+            active->second != nullptr &&
+            active->second->validation.get() == trace_validation) {
+            TieredTraceArtifact& artifact = *active->second;
+            TraceValidationRecord& validation = *artifact.validation;
+            hot_entries = validation.estimated_entries.load(
+                std::memory_order_relaxed);
+            const std::uint64_t generated_bytes = artifact.generated_bytes;
+            const Arm64BlockEntry baseline_external_entry =
+                validation.baseline_external_entry;
+            const Arm64BlockEntry baseline_resident_entry =
+                validation.baseline_resident_entry;
+            const PublishedCodeWitness* const baseline_witness =
+                validation.baseline_witness;
+            validation.active.store(false, std::memory_order_release);
+            active_tiered_traces_.erase(active);
+            tiered_active_code_bytes_.fetch_sub(
+                generated_bytes, std::memory_order_release);
+            g_tiered_counts.active.fetch_sub(
+                1, std::memory_order_relaxed);
+            g_tiered_counts.retired.fetch_add(
+                1, std::memory_order_relaxed);
+            g_tiered_counts.guard_rollbacks.fetch_add(
+                1, std::memory_order_relaxed);
+            if (baseline_witness != nullptr &&
+                baseline_witness->decoded != nullptr &&
+                GuestBytesMatchDecoded(
+                    *baseline_witness->decoded)) {
+                edge_directory_.PublishAndConnect(
+                    seed_rip,
+                    {baseline_external_entry,
+                     baseline_resident_entry,
+                     baseline_witness, nullptr});
+            } else {
+                edge_directory_.WithdrawAndDisconnect(seed_rip);
+            }
+            retired = true;
+        }
+    }
+    if (retired) {
+        std::lock_guard profile_lock{tiered_profile_mutex_};
+        auto& profile = tiered_edge_profiles_[seed_rip];
+        profile.queued = false;
+        profile.trace_rollback_count = static_cast<std::uint8_t>(
+            std::min<std::uint32_t>(
+                static_cast<std::uint32_t>(profile.trace_rollback_count) + 1u,
+                8u));
+        const std::uint64_t attempts = hot_entries + exits;
+        const bool trace_never_became_hot =
+            hot_entries == 0 || exits * 2u >= attempts;
+        constexpr std::uint64_t kBaseRollbackCooldown = 16u * 1024u;
+        constexpr std::uint64_t kMaximumRollbackCooldown = 1u << 20;
+        const std::uint32_t cooldown_shift = std::min<std::uint32_t>(
+            profile.trace_rollback_count - 1u, 6u);
+        std::uint64_t cooldown =
+            std::min(kMaximumRollbackCooldown,
+                     kBaseRollbackCooldown << cooldown_shift);
+        if (trace_never_became_hot) {
+            cooldown = kMaximumRollbackCooldown;
+        }
+        profile.retry_after_samples =
+            std::max(profile.retry_after_samples,
+                     profile.total_samples + cooldown);
+        JitLog(
+            "[EXECUTOR_TIERED_TRACE_DEOPT] seed=0x%llx source=0x%llx "
+            "target=0x%llx exits=%llu hotEntries=%llu rollback=1 "
+            "rollbackCount=%u cooldownSamples=%llu",
+            static_cast<unsigned long long>(seed_rip),
+            static_cast<unsigned long long>(source_rip),
+            static_cast<unsigned long long>(cold_target),
+            static_cast<unsigned long long>(exits),
+            static_cast<unsigned long long>(hot_entries),
+            static_cast<unsigned>(profile.trace_rollback_count),
+            static_cast<unsigned long long>(cooldown));
+    }
+    return cold_target;
+}
+
+std::uint64_t ExecuteTieredGuardDeopt(
+    LsxMachineImage* const state,
+    TieredGuardDeoptContext* const context) noexcept {
+    if (context == nullptr || context->cold_target == 0) {
+        return kRunStopMarker;
+    }
+    if (state != nullptr) {
+        state->rip_or_exit = context->cold_target;
+    }
+    if (context->owner == nullptr) {
+        return context->cold_target;
+    }
+    return context->owner->HandleTieredGuardDeopt(*context);
+}
+
 RetiringTranslationRuntime g_translation_runtime{};
+
+void ConfigureTieredJitState(const bool enabled,
+                             const bool trace_compilation_enabled) noexcept {
+    const bool trace_enabled = enabled && trace_compilation_enabled;
+    g_tiered_jit_enabled.store(enabled, std::memory_order_release);
+    g_jit_trace_compilation_enabled.store(trace_enabled,
+                                           std::memory_order_release);
+    g_translation_runtime.ApplyTieredConfiguration(enabled, trace_enabled);
+}
+
 thread_local LsxStackReservoir g_lsx_stack_reservoir{};
 constexpr std::uintptr_t kGuestMachineBindingSalt =
     static_cast<std::uintptr_t>(0x6c73'7834'a55a'19e3ull);
@@ -7485,8 +10411,8 @@ OutboundEdgeState* BindIndirectEdgeFanout(IndirectEdgeFanout* site,
 
     OutboundEdgeState* resolved = nullptr;
     try {
-        resolved =
-            site->owner->CreateOutboundEdge(guest_target, site->source_rip);
+        resolved = site->owner->CreateOutboundEdge(
+            guest_target, site->source_rip, site->resident_frame);
     } catch (...) {
         return nullptr;
     }
@@ -7512,7 +10438,8 @@ OutboundEdgeState* BindIndirectEdgeFanout(IndirectEdgeFanout* site,
     }
 
     const std::uint32_t replacement =
-        site->replacement.fetch_add(1, std::memory_order_relaxed) & (way_count - 1u);
+        site->replacement.fetch_add(1, std::memory_order_relaxed) &
+        (way_count - 1u);
     site->ways[replacement].store(resolved, std::memory_order_release);
     return resolved;
 }
@@ -7554,6 +10481,9 @@ NativeSegmentDepot::~NativeSegmentDepot() {
 #ifdef __ANDROID__
     for (const auto& slab : executable_slabs_) {
         if (slab && slab->base != nullptr && slab->size != 0) {
+#if defined(__aarch64__)
+            WithdrawSignalSafeJitSlab(slab->signal_slot);
+#endif
             munmap(slab->base, slab->size);
         }
     }
@@ -7566,6 +10496,47 @@ NativeDescriptorBundle* NativeSegmentDepot::CreateDescriptorBundle() {
     std::lock_guard lock{auxiliary_fault_descriptors_mutex_};
     native_descriptor_bundles_.push_back(std::move(bundle));
     return result;
+}
+
+void NativeSegmentDepot::RegisterPersistentDescriptorRelocation(
+    const LsxDecodedOp* const descriptor, const LsxDecodedRegion& owner,
+    const LsxDecodedOp& source) {
+    if (descriptor == nullptr || owner.instructions.empty()) {
+        return;
+    }
+    const LsxDecodedOp* const begin = owner.instructions.data();
+    const LsxDecodedOp* const end = begin + owner.instructions.size();
+    if (std::addressof(source) < begin || std::addressof(source) >= end) {
+        return;
+    }
+    const std::size_t instruction_index =
+        static_cast<std::size_t>(std::addressof(source) - begin);
+    if (instruction_index > std::numeric_limits<std::uint32_t>::max()) {
+        return;
+    }
+    std::lock_guard lock{persistent_descriptor_relocations_mutex_};
+    persistent_descriptor_relocations_.insert_or_assign(
+        reinterpret_cast<std::uint64_t>(descriptor),
+        PersistentDescriptorRelocationTarget{
+            .owner = std::addressof(owner),
+            .instruction_index = static_cast<std::uint32_t>(instruction_index),
+        });
+}
+
+bool NativeSegmentDepot::ClassifyPersistentDescriptorRelocation(
+    const std::uint64_t value, const LsxDecodedRegion& owner,
+    JitNativeRelocation& relocation) const {
+    std::lock_guard lock{persistent_descriptor_relocations_mutex_};
+    const auto target = persistent_descriptor_relocations_.find(value);
+    if (target == persistent_descriptor_relocations_.end() ||
+        target->second.owner != std::addressof(owner) ||
+        target->second.instruction_index >= owner.instructions.size()) {
+        return false;
+    }
+    relocation.kind = JitNativeRelocationKind::IrInstruction;
+    relocation.target_index = target->second.instruction_index;
+    relocation.addend = 0;
+    return true;
 }
 
 #ifdef __ANDROID__
@@ -7611,8 +10582,14 @@ std::uint8_t* NativeSegmentDepot::AllocateCommittedCode(const std::size_t size) 
         if (mapping == MAP_FAILED) {
             throw std::bad_alloc{};
         }
+        const std::size_t signal_slot =
+#if defined(__aarch64__)
+            PublishSignalSafeJitSlab(mapping, slab_size);
+#else
+            0;
+#endif
         auto slab = std::make_unique<ExecutableSlab>(
-            static_cast<std::uint8_t*>(mapping), slab_size);
+            static_cast<std::uint8_t*>(mapping), slab_size, signal_slot);
         ExecutableSlab* const published = slab.get();
         executable_slabs_.push_back(std::move(slab));
         active_executable_slab_.store(published, std::memory_order_release);
@@ -7641,6 +10618,8 @@ Arm64BlockEntry NativeSegmentDepot::CommitCode(
     {
         std::lock_guard range_lock{code_ranges_mutex_};
         code_ranges_.push_back({committed, code_size});
+        code_ranges_by_base_.emplace(
+            reinterpret_cast<std::uintptr_t>(committed), code_size);
     }
     return reinterpret_cast<Arm64BlockEntry>(committed);
 #else
@@ -7648,24 +10627,27 @@ Arm64BlockEntry NativeSegmentDepot::CommitCode(
     {
         std::lock_guard range_lock{code_ranges_mutex_};
         code_ranges_.push_back({committed, code_size});
+        code_ranges_by_base_.emplace(
+            reinterpret_cast<std::uintptr_t>(committed), code_size);
     }
     owned_blocks_.push_back(std::move(code));
     return reinterpret_cast<Arm64BlockEntry>(committed);
 #endif
 }
 
-const NativeSegmentDepot::CommittedCodeRange*
+std::optional<NativeSegmentDepot::CommittedCodeRange>
 NativeSegmentDepot::FindCommittedCodeRange(const Arm64BlockEntry entry) const {
     if (entry == nullptr) {
-        return nullptr;
+        return std::nullopt;
     }
-    const auto* address = reinterpret_cast<const std::uint8_t*>(entry);
-    for (auto it = code_ranges_.rbegin(); it != code_ranges_.rend(); ++it) {
-        if (it->base == address) {
-            return &*it;
-        }
+    auto* const address = reinterpret_cast<std::uint8_t*>(entry);
+    const std::lock_guard range_lock{code_ranges_mutex_};
+    const auto indexed = code_ranges_by_base_.find(
+        reinterpret_cast<std::uintptr_t>(address));
+    if (indexed != code_ranges_by_base_.end()) {
+        return CommittedCodeRange{address, indexed->second};
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 bool NativeSegmentDepot::CapturePersistentNativeBlock(
@@ -7683,29 +10665,32 @@ bool NativeSegmentDepot::CapturePersistentNativeBlock(
         return false;
     }
 
-    const CommittedCodeRange* entry_range = FindCommittedCodeRange(entry);
-    const CommittedCodeRange* direct_range =
-        direct != nullptr ? FindCommittedCodeRange(direct) : nullptr;
-    if (entry_range == nullptr || entry_range->size == 0 ||
+    const std::optional<CommittedCodeRange> entry_range =
+        FindCommittedCodeRange(entry);
+    const std::optional<CommittedCodeRange> direct_range =
+        direct != nullptr ? FindCommittedCodeRange(direct) : std::nullopt;
+    if (!entry_range || entry_range->size == 0 ||
         (entry_range->size & 3u) != 0 ||
         (direct != nullptr &&
-         (direct_range == nullptr || direct_range->size == 0 ||
+         (!direct_range || direct_range->size == 0 ||
           (direct_range->size & 3u) != 0))) {
         return false;
     }
 
-    std::vector<const CommittedCodeRange*> ranges;
-    if (direct_range != nullptr) {
-        ranges.push_back(direct_range);
+    // Keep an immutable by-value snapshot. Background T2 compilation may
+    // append to code_ranges_ while relocation discovery scans these bytes.
+    std::vector<CommittedCodeRange> ranges;
+    if (direct_range) {
+        ranges.push_back(*direct_range);
         direct_segment_index = 0;
-        if (entry_range == direct_range) {
+        if (entry_range->base == direct_range->base) {
             entry_segment_index = direct_segment_index;
         } else {
-            ranges.push_back(entry_range);
+            ranges.push_back(*entry_range);
             entry_segment_index = 1;
         }
     } else {
-        ranges.push_back(entry_range);
+        ranges.push_back(*entry_range);
         entry_segment_index = 0;
     }
 
@@ -7713,7 +10698,6 @@ bool NativeSegmentDepot::CapturePersistentNativeBlock(
     if (module_base == 0) {
         return false;
     }
-
     const std::uint64_t block_address = reinterpret_cast<std::uint64_t>(&block);
     const std::uint64_t instruction_base = block.instructions.empty()
         ? 0
@@ -7767,16 +10751,25 @@ bool NativeSegmentDepot::CapturePersistentNativeBlock(
         }
         for (std::size_t index = 0; index < ranges.size(); ++index) {
             const std::uint64_t range_base =
-                reinterpret_cast<std::uint64_t>(ranges[index]->base);
-            if (value >= range_base && value - range_base < ranges[index]->size) {
+                reinterpret_cast<std::uint64_t>(ranges[index].base);
+            if (value >= range_base && value - range_base < ranges[index].size) {
                 relocation.kind = JitNativeRelocationKind::SegmentAddress;
                 relocation.target_index = static_cast<std::uint32_t>(index);
                 relocation.addend = static_cast<std::int64_t>(value - range_base);
                 return true;
             }
         }
+        if (ClassifyPersistentDescriptorRelocation(value, block, relocation)) {
+            return true;
+        }
         if (ClassifyJitStableExternal(value, relocation)) {
             return true;
+        }
+        if (JitAddressInOwnLoadSegment(value, module_base)) {
+            // Raw module offsets are Build-ID dependent. Reject this block
+            // instead of invalidating every portable JIT artifact whenever
+            // unrelated code changes the final shared-object layout.
+            return false;
         }
         return false;
     };
@@ -7788,14 +10781,14 @@ bool NativeSegmentDepot::CapturePersistentNativeBlock(
     };
 
     segments.reserve(ranges.size());
-    for (const CommittedCodeRange* range : ranges) {
+    for (const CommittedCodeRange& range : ranges) {
         JitNativeSegment segment{};
-        segment.bytes.assign(range->base, range->base + range->size);
-        std::vector<bool> relocated_instruction(range->size / 4u, false);
-        const std::span<const std::uint8_t> original_bytes{range->base, range->size};
+        segment.bytes.assign(range.base, range.base + range.size);
+        std::vector<bool> relocated_instruction(range.size / 4u, false);
+        const std::span<const std::uint8_t> original_bytes{range.base, range.size};
 
         for (std::size_t offset = 0;
-             offset + kJitNativePointerPatchBytes <= range->size; offset += 4u) {
+             offset + kJitNativePointerPatchBytes <= range.size; offset += 4u) {
             std::uint8_t register_index = 0;
             std::uint64_t value = 0;
             if (!DecodeJitRelocatablePointer(original_bytes, offset, register_index,
@@ -7820,12 +10813,12 @@ bool NativeSegmentDepot::CapturePersistentNativeBlock(
             offset += kJitNativePointerPatchBytes - 4u;
         }
 
-        for (std::size_t offset = 0; offset + 4u <= range->size; offset += 4u) {
+        for (std::size_t offset = 0; offset + 4u <= range.size; offset += 4u) {
             if (relocated_instruction[offset / 4u]) {
                 continue;
             }
             std::uint32_t first = 0;
-            std::memcpy(&first, range->base + offset, sizeof(first));
+            std::memcpy(&first, range.base + offset, sizeof(first));
             if ((first & kAarch64MovWideOpcodeMask) != kAarch64MovzXOpcode) {
                 continue;
             }
@@ -7834,9 +10827,9 @@ bool NativeSegmentDepot::CapturePersistentNativeBlock(
             std::uint64_t value = static_cast<std::uint64_t>((first >> 5u) & 0xffffu)
                                   << (first_hw * 16u);
             std::size_t cursor = offset + 4u;
-            while (cursor + 4u <= range->size && cursor - offset < 16u) {
+            while (cursor + 4u <= range.size && cursor - offset < 16u) {
                 std::uint32_t next = 0;
-                std::memcpy(&next, range->base + cursor, sizeof(next));
+                std::memcpy(&next, range.base + cursor, sizeof(next));
                 if ((next & kAarch64MovWideOpcodeMask) != kAarch64MovkXOpcode ||
                     (next & 31u) != rd) {
                     break;
@@ -7896,7 +10889,18 @@ bool NativeSegmentDepot::RestorePersistentNativeBlock(
                 return false;
             }
             switch (relocation.kind) {
-            case JitNativeRelocationKind::ModuleRelative:
+            case JitNativeRelocationKind::ModuleRelative: {
+                std::uint64_t target = 0;
+                if (relocation.target_index != 0 ||
+                    relocation.addend < 0 ||
+                    !AddJitNativeRelocationAddend(
+                        module_base, relocation.addend, target) ||
+                    !JitAddressInOwnLoadSegment(
+                        target, module_base)) {
+                    return false;
+                }
+                break;
+            }
             case JitNativeRelocationKind::BackendRelative:
                 return false;
             case JitNativeRelocationKind::IrBlock:
@@ -7935,7 +10939,8 @@ bool NativeSegmentDepot::RestorePersistentNativeBlock(
                 std::uint64_t target = 0;
                 if (relocation.addend != 0 ||
                     !ResolveJitStableExternal(relocation.target_index, target) ||
-                    !JitAddressInOwnLoadSegment(target, module_base)) {
+                    !ValidateJitStableExternal(
+                        relocation.target_index, target, module_base)) {
                     return false;
                 }
                 break;
@@ -7992,6 +10997,8 @@ bool NativeSegmentDepot::RestorePersistentNativeBlock(
             std::uint64_t target = 0;
             switch (relocation.kind) {
             case JitNativeRelocationKind::ModuleRelative:
+                target = module_base;
+                break;
             case JitNativeRelocationKind::BackendRelative:
                 return false;
             case JitNativeRelocationKind::IrBlock:
@@ -8035,6 +11042,17 @@ bool NativeSegmentDepot::RestorePersistentNativeBlock(
             std::uint8_t* base = committed_segments[index];
             const std::size_t size = segments[index].bytes.size();
             code_ranges_.push_back({base, size});
+            code_ranges_by_base_.emplace(
+                reinterpret_cast<std::uintptr_t>(base), size);
+        }
+    }
+    // Persistent-native prewarm bypasses the normal block installation path.
+    // Emit its diagnostic symbols from the already-known segment addresses;
+    // using FindCodeRange() here would turn a full warm-cache map into O(n^2).
+    if (JitHelperPerfMapEnabled()) {
+        for (std::size_t index = 0; index < segments.size(); ++index) {
+            RegisterJitHelperPerfSymbol(
+                committed_segments[index], segments[index].bytes.size(), block);
         }
     }
     entry = reinterpret_cast<Arm64BlockEntry>(committed_segments[entry_segment_index]);
@@ -8056,6 +11074,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitReturnImmediateBlock(const std::uint64_t
 Arm64BlockEntry NativeSegmentDepot::EmitSharedChainReturnImmediateBlock(
     const std::uint64_t value) {
     auto code = NewNativeCodeBuffer();
+    code->str(
+        code->w28,
+        Xbyak_aarch64::ptr(
+            code->x19, static_cast<std::uint32_t>(
+                           offsetof(LsxMachineImage, native_edge_phase))));
     NativeCondition::EmitSharedFrameReturn(
         *code, value, kGenericSharedChainFrameSize);
     code->ready();
@@ -8073,6 +11096,12 @@ NativeSegmentDepot::FindCodeRange(const std::uint64_t host_pc) const {
         return std::nullopt;
     }
     const std::lock_guard range_lock{code_ranges_mutex_};
+    const auto exact = code_ranges_by_base_.find(
+        static_cast<std::uintptr_t>(host_pc));
+    if (exact != code_ranges_by_base_.end()) {
+        return HostCodeRange{static_cast<std::uintptr_t>(host_pc),
+                             exact->second};
+    }
     const auto contains_pc = [host_pc](const CommittedCodeRange& block) {
         const auto base = reinterpret_cast<std::uintptr_t>(block.base);
         return base != 0 && block.size != 0 && host_pc >= base &&
@@ -8308,10 +11337,35 @@ executor_jit_defer_synchronous_guest_fault(
     const std::int32_t native_sig, const std::int32_t si_code,
     const std::int32_t si_errno, const std::int32_t source_pid,
     const std::uint32_t source_uid, const std::uint64_t fault_addr,
-    const std::int32_t is_write) {
+    const std::int32_t is_write, const void* const raw_context) {
 #if defined(__ANDROID__) && defined(__aarch64__)
     auto* frame = ActiveSynchronousFaultFrame();
     if (frame == nullptr) {
+        return 0;
+    }
+    if (SignalContextPcIsGeneratedCode(raw_context)) {
+        if (raw_context == nullptr) {
+            return 0;
+        }
+        const auto* const context =
+            static_cast<const ucontext_t*>(raw_context);
+        const std::uint64_t descriptor =
+            context->uc_mcontext.regs[21];
+        if (descriptor == 0) {
+            return 0;
+        }
+        const std::uint64_t legacy_slot =
+            reinterpret_cast<std::uint64_t>(
+                std::addressof(frame->state->native_fault_ir));
+        if (descriptor != legacy_slot) {
+            frame->state->native_fault_ir = descriptor;
+        }
+        frame->state->native_edge_phase =
+            static_cast<std::uint32_t>(
+                context->uc_mcontext.regs[28]);
+    }
+    if (!RestoreTieredFaultRegisterCaches(
+            *frame->state, raw_context)) {
         return 0;
     }
 
@@ -8322,6 +11376,7 @@ executor_jit_defer_synchronous_guest_fault(
     g_jit_deferred_guest_fault.source_pid = source_pid;
     g_jit_deferred_guest_fault.source_uid = source_uid;
     g_jit_deferred_guest_fault.fault_addr = fault_addr;
+    MaterializeDeferredFlags(*frame->state);
     const auto fault_ir = CurrentPublishedFaultInstruction();
     g_jit_deferred_guest_fault.guest_rip =
         fault_ir ? fault_ir.guest_rip : frame->state->rip_or_exit;
@@ -8339,6 +11394,7 @@ extern "C" __attribute__((visibility("default"), used)) int
 executor_jit_resume_synchronous_guest_fault() {
 #if defined(__ANDROID__) && defined(__aarch64__)
     if (auto* frame = ActiveSynchronousFaultFrame(); frame != nullptr) {
+        MaterializeDeferredFlags(*frame->state);
         JumpToSynchronousFaultResume(*frame);
     }
 #endif
@@ -8346,10 +11402,28 @@ executor_jit_resume_synchronous_guest_fault() {
 }
 
 extern "C" __attribute__((visibility("default"), used)) int
-executor_jit_has_synchronous_guest_fault_frame() {
+executor_jit_has_synchronous_guest_fault_frame(
+    const void* const raw_context) {
 #if defined(__ANDROID__) && defined(__aarch64__)
-    return ActiveSynchronousFaultFrame() != nullptr ? 1 : 0;
+    auto* const frame = ActiveSynchronousFaultFrame();
+    if (frame == nullptr) {
+        return 0;
+    }
+    // The Android SIGSEGV/SIGBUS route calls this before deferring a hardware
+    // fault. Helpers still publish through the machine image. Direct generated
+    // memory accesses keep the exact descriptor in x21 so the hot path avoids
+    // a state store before every load/store.
+    if (SignalContextPcIsGeneratedCode(raw_context) &&
+        raw_context != nullptr) {
+        const auto* const context =
+            static_cast<const ucontext_t*>(raw_context);
+        if (context->uc_mcontext.regs[21] != 0) {
+            return 1;
+        }
+    }
+    return CurrentPublishedFaultInstruction() ? 1 : 0;
 #else
+    (void)raw_context;
     return 0;
 #endif
 }
@@ -8482,6 +11556,22 @@ enum class DirectTargetAudit : std::uint8_t {
     Safepoint,
 };
 
+constexpr std::uint32_t kNativeEdgeSchedulePeriod = 4096;
+constexpr std::uint32_t kTieredLoopSafepointPeriod = 1024;
+constexpr std::uint32_t kTieredPollingLoopSafepointPeriod = 64;
+// A period of one forced a full witness byte audit and shared Tiered-PGO
+// merge on every T0 loop iteration. Structural vector loops are already
+// queued immediately and ordinary loops still reach the 32-sample promotion
+// threshold quickly at this cadence. SMC writes invalidate their witness
+// independently, so the bounded audit remains a fallback rather than the
+// primary coherence mechanism.
+constexpr std::uint32_t kTier0PromotionLoopSamplePeriod = 64;
+// T1 may reduce loop-safepoint overhead, but a long period starves another
+// emulated guest thread when the promoted block is a spin/scheduler loop.
+// Keep the latency within 2x of T0; 16384 caused Bloodborne's loading handoff
+// to stop all guest draw/submit progress on mobile ARM.
+constexpr std::uint32_t kTier1LoopSafepointPeriod = 2048;
+
 struct DirectTargetCheck {
     std::uint32_t guest_size{};
     bool matches{};
@@ -8575,31 +11665,67 @@ Arm64BlockEntry ValidateObservedDirectTarget(OutboundEdgeState* slot,
     return AuditDirectTarget<DirectTargetAudit::Scheduled>(slot, observed);
 }
 
-Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(OutboundEdgeState* slot,
-                                                        Arm64BlockEntry observed) noexcept {
+Arm64BlockEntry ValidateObservedDirectTargetAtSafepointPeriod(
+    OutboundEdgeState* slot, Arm64BlockEntry observed,
+    const std::uint64_t sample_period) noexcept {
+    // Page-protection invalidation clears the published target immediately.
+    // Use the same first-use plus sparse byte witness audit as ordinary
+    // scheduled edges instead of memcmp'ing immutable guest bytes at every
+    // loop boundary. The target equality check still runs on every call.
     Arm64BlockEntry validated =
-        AuditDirectTarget<DirectTargetAudit::Safepoint>(slot, observed);
+        AuditDirectTarget<DirectTargetAudit::Scheduled>(slot, observed);
     if (validated != nullptr && slot != nullptr && slot->owner != nullptr &&
         TieredJitEnabled()) {
-        slot->owner->RecordTieredEdge(
-            slot->source_rip, slot->guest_rip);
-        if (const TraceValidationRecord* const trace =
-                slot->trace_validation.load(std::memory_order_acquire);
-            trace != nullptr) {
-            constexpr std::uint64_t kSamplePeriod = 4096;
+        const TraceValidationRecord* const trace =
+            slot->source_trace_validation.load(std::memory_order_acquire);
+        if (trace == nullptr) {
+            // Baseline/T1 paths still need samples for promotion and path
+            // changes. An active trace's hot exit is already the selected
+            // path, however; continually feeding it back into PGO only
+            // saturates the shared profile and disk flush threshold. Its cold
+            // guard exits are recorded separately by HandleTieredGuardDeopt.
+            slot->owner->RecordTieredEdge(
+                slot->source_rip, slot->guest_rip);
+        } else {
+            trace->estimated_entries.fetch_add(
+                sample_period, std::memory_order_relaxed);
             g_tiered_counts.entries.fetch_add(
-                kSamplePeriod, std::memory_order_relaxed);
+                sample_period, std::memory_order_relaxed);
             if (trace->members.size() > 1) {
                 g_tiered_counts.internal_edges.fetch_add(
-                    kSamplePeriod * (trace->members.size() - 1u),
+                    sample_period * (trace->members.size() - 1u),
                     std::memory_order_relaxed);
                 g_tiered_counts.boundary_operations_avoided.fetch_add(
-                    kSamplePeriod * (trace->members.size() - 1u),
+                    sample_period * (trace->members.size() - 1u),
                     std::memory_order_relaxed);
             }
         }
     }
     return validated;
+}
+
+Arm64BlockEntry ValidateObservedDirectTargetAtSafepoint(
+    OutboundEdgeState* slot, Arm64BlockEntry observed) noexcept {
+    return ValidateObservedDirectTargetAtSafepointPeriod(
+        slot, observed, kNativeEdgeSchedulePeriod);
+}
+
+Arm64BlockEntry ValidateObservedDirectTargetAtLoopSafepoint(
+    OutboundEdgeState* slot, Arm64BlockEntry observed) noexcept {
+    return ValidateObservedDirectTargetAtSafepointPeriod(
+        slot, observed, kTieredLoopSafepointPeriod);
+}
+
+Arm64BlockEntry ValidateObservedDirectTargetAtPollingLoopSafepoint(
+    OutboundEdgeState* slot, Arm64BlockEntry observed) noexcept {
+    // A read-only polling loop has made no guest-visible progress. Android's
+    // sched_yield keeps large guest worker pools runnable, so park for one
+    // short quantum and release the core to the producer/Game:Main. The
+    // 50-us bound is below an audio callback quantum while removing millions
+    // of idle x86->ARM iterations per second.
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+    return ValidateObservedDirectTargetAtSafepointPeriod(
+        slot, observed, kTieredPollingLoopSafepointPeriod);
 }
 
 std::uint64_t ExecuteCheckedNativeBlock(LsxMachineImage* state, CheckedNativeBlockContext* context) {
@@ -8863,7 +11989,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     Arm64BlockEntry* direct_target_out, OutboundEdgeState* secondary_outbound_edge,
     IndirectEdgeFanout* indirect_edge_fanout, bool* indirect_pic_used_out,
     bool* chain_abi_out, Arm64BlockEntry* resident_entry_out,
-    const std::vector<TieredGuardEmission>* const tiered_guards) {
+    const std::vector<TieredGuardEmission>* const tiered_guards,
+    const bool force_local_loop_dispatch_safepoint,
+    const LocalJitTier compilation_tier) {
     if (direct_target_out != nullptr) {
         *direct_target_out = nullptr;
     }
@@ -8917,6 +12045,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         bundle->faults.push_back(descriptor);
         const NativeFaultDescriptor* const copy =
             std::addressof(bundle->faults.back());
+        RegisterPersistentDescriptorRelocation(copy, block, instruction);
         if (fault_descriptor_count < fault_descriptor_sources.size()) {
             fault_descriptor_sources[fault_descriptor_count] =
                 std::addressof(instruction);
@@ -8945,6 +12074,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         bundle->semantics.push_back(instruction);
         const LsxDecodedOp* const copy =
             std::addressof(bundle->semantics.back());
+        RegisterPersistentDescriptorRelocation(copy, block, instruction);
         if (semantic_descriptor_count < semantic_descriptor_sources.size()) {
             semantic_descriptor_sources[semantic_descriptor_count] =
                 std::addressof(instruction);
@@ -8977,11 +12107,16 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     constexpr std::uint32_t kStateRflagsOffset = offsetof(LsxMachineImage, rflags);
     constexpr std::uint32_t kStateNativeEdgePhaseOffset =
         offsetof(LsxMachineImage, native_edge_phase);
-    constexpr std::uint32_t kNativeEdgeSchedulePeriod = 4096;
     constexpr std::uint32_t kStateFaultIrSlotOffset =
         offsetof(LsxMachineImage, fault_ir_slot);
     constexpr std::uint32_t kStateNativeFaultIrOffset =
         offsetof(LsxMachineImage, native_fault_ir);
+    constexpr std::uint32_t kStateDeferredFlagsLhsOffset =
+        offsetof(LsxMachineImage, deferred_flags_lhs);
+    constexpr std::uint32_t kStateDeferredFlagsMetaOffset =
+        offsetof(LsxMachineImage, deferred_flags_meta);
+    constexpr std::uint32_t kStateDeferredFlagsRhsOffset =
+        offsetof(LsxMachineImage, deferred_flags_rhs);
     constexpr std::uint32_t kStateRaxOffset = gpr_state_offset(LsxGpr::Rax);
     constexpr std::uint32_t kStateRbxOffset = gpr_state_offset(LsxGpr::Rbx);
     constexpr std::uint32_t kStateRcxOffset = gpr_state_offset(LsxGpr::Rcx);
@@ -9015,6 +12150,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                   kStateFaultIrSlotOffset);
     static_assert(offsetof(LsxMachineImage, native_fault_ir) ==
                   kStateNativeFaultIrOffset);
+    static_assert(offsetof(LsxMachineImage, deferred_flags_lhs) ==
+                  kStateDeferredFlagsLhsOffset);
+    static_assert(offsetof(LsxMachineImage, deferred_flags_meta) ==
+                  kStateDeferredFlagsMetaOffset);
+    static_assert(offsetof(LsxMachineImage, deferred_flags_rhs) ==
+                  kStateDeferredFlagsRhsOffset);
 
     const auto register_state_offset = [](const LsxRegisterCode reg,
                                            std::uint32_t& state_offset,
@@ -13240,11 +16381,25 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             return false;
         }
     };
+    const auto tiered_guard_for_instruction =
+        [&](const std::size_t index) -> const TieredGuardEmission* {
+        if (tiered_guards == nullptr) {
+            return nullptr;
+        }
+        const auto guard = std::ranges::find(
+            *tiered_guards, index,
+            &TieredGuardEmission::instruction_index);
+        return guard == tiered_guards->end()
+            ? nullptr
+            : std::addressof(*guard);
+    };
     std::vector<std::uint8_t> generic_elide_status_flags(block.instructions.size(), 0);
     for (std::size_t instruction_index = 0;
-         tiered_guards == nullptr &&
          instruction_index < generic_scalar_instruction_count;
          ++instruction_index) {
+        if (tiered_guard_for_instruction(instruction_index) != nullptr) {
+            continue;
+        }
         const auto& candidate = block.instructions[instruction_index];
         const auto candidate_mnemonic = static_cast<X86Mnemonic>(candidate.mnemonic);
         std::uint64_t flags_still_live = 0;
@@ -13259,13 +16414,30 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                    candidate_mnemonic == X86_MNEMONIC_OR ||
                    candidate_mnemonic == X86_MNEMONIC_XOR ||
                    candidate_mnemonic == X86_MNEMONIC_ANDN ||
+                   candidate_mnemonic == X86_MNEMONIC_NEG ||
                    register_count_scalar_shift(candidate)) {
             flags_still_live = kArithmeticStatusBits;
+        } else if (
+            compilation_tier != LocalJitTier::Tier0 &&
+            (candidate_mnemonic == X86_MNEMONIC_INC ||
+             candidate_mnemonic == X86_MNEMONIC_DEC)) {
+            // INC/DEC preserve CF, but all status bits they do write are dead
+            // when a later full flag writer is reached without a faulting or
+            // flag-consuming instruction in between. This pattern is common
+            // in audio/physics ring-buffer indexing (DEC; AND) and otherwise
+            // expands one x86 instruction into a full parity/AF/OF synthesis.
+            flags_still_live =
+                kArithmeticStatusBits & ~Lsx4::Translation::CarryFlag;
         } else {
             continue;
         }
         for (std::size_t next_index = instruction_index + 1;
              next_index < generic_scalar_instruction_count; ++next_index) {
+            // A tiered guard consumes the status produced by the hot-prefix
+            // instructions. Never prove flags dead across its side exit.
+            if (tiered_guard_for_instruction(next_index) != nullptr) {
+                break;
+            }
             const auto& next = block.instructions[next_index];
             if (instruction_has_faultable_memory_access(next)) {
                 break;
@@ -13284,6 +16456,195 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             }
         }
     }
+    // Keep exact flag inputs in the machine image while crossing a potentially
+    // faulting memory operation.  A real fault materializes the recipe; on the
+    // normal hot path a later unconditional writer simply replaces it.
+    //
+    // Keep this path compiled but inactive until the deferred recipe has a
+    // proven unwind/RET contract on every guest worker. It did not improve the
+    // Bloodborne frame time and a long run exposed a null continuation after a
+    // faultable epilogue, so the ordinary exact inline flags are the safe fast
+    // path for now.
+    constexpr bool kEnableDeferredFaultFlagRecipes = false;
+    std::vector<std::uint8_t> generic_defer_fault_status_flags(
+        block.instructions.size(), 0);
+    for (std::size_t instruction_index = 0;
+         instruction_index < generic_scalar_instruction_count;
+         ++instruction_index) {
+        if (tiered_guard_for_instruction(instruction_index) != nullptr) {
+            continue;
+        }
+        const auto& candidate = block.instructions[instruction_index];
+        const auto candidate_mnemonic =
+            static_cast<X86Mnemonic>(candidate.mnemonic);
+        DeferredFlagKind recipe_kind = DeferredFlagKind::None;
+        std::uint64_t flags_still_live = 0;
+        switch (candidate_mnemonic) {
+        case X86_MNEMONIC_ADD:
+            recipe_kind = DeferredFlagKind::Addition;
+            flags_still_live = kArithmeticStatusBits;
+            break;
+        case X86_MNEMONIC_SUB:
+            recipe_kind = DeferredFlagKind::Subtraction;
+            flags_still_live = kArithmeticStatusBits;
+            break;
+        case X86_MNEMONIC_AND:
+        case X86_MNEMONIC_OR:
+        case X86_MNEMONIC_XOR:
+        case X86_MNEMONIC_ANDN:
+            recipe_kind = DeferredFlagKind::Logical;
+            flags_still_live = kArithmeticStatusBits;
+            break;
+        case X86_MNEMONIC_IMUL:
+            if (candidate.operand_count == 2 || candidate.operand_count == 3) {
+                recipe_kind = DeferredFlagKind::ImulOverflow;
+                flags_still_live = kImulDefinedFlagMaskValue;
+            }
+            break;
+        default:
+            break;
+        }
+        if (recipe_kind == DeferredFlagKind::None) {
+            continue;
+        }
+        bool crossed_faultable_memory = false;
+        for (std::size_t next_index = instruction_index + 1;
+             next_index < generic_scalar_instruction_count; ++next_index) {
+            if (tiered_guard_for_instruction(next_index) != nullptr) {
+                break;
+            }
+            const auto& next = block.instructions[next_index];
+            crossed_faultable_memory |=
+                instruction_has_faultable_memory_access(next);
+            const std::uint64_t killed =
+                unconditional_status_flag_kill_mask(next);
+            if (killed != 0) {
+                flags_still_live &= ~killed;
+                if (flags_still_live == 0) {
+                    if (kEnableDeferredFaultFlagRecipes &&
+                        crossed_faultable_memory) {
+                        generic_defer_fault_status_flags[instruction_index] =
+                            static_cast<std::uint8_t>(recipe_kind);
+                    }
+                    break;
+                }
+                continue;
+            }
+            if (!status_flag_transparent_instruction(next)) {
+                break;
+            }
+        }
+    }
+    const bool generic_has_deferred_fault_flags =
+        std::ranges::any_of(
+            generic_defer_fault_status_flags,
+            [](const std::uint8_t recipe) { return recipe != 0; });
+    const auto direct_compare_branch_supported =
+        [](const X86Mnemonic mnemonic) {
+        switch (mnemonic) {
+        case X86_MNEMONIC_JB:
+        case X86_MNEMONIC_JBE:
+        case X86_MNEMONIC_JL:
+        case X86_MNEMONIC_JLE:
+        case X86_MNEMONIC_JNB:
+        case X86_MNEMONIC_JNBE:
+        case X86_MNEMONIC_JNL:
+        case X86_MNEMONIC_JNLE:
+        case X86_MNEMONIC_JNO:
+        case X86_MNEMONIC_JNS:
+        case X86_MNEMONIC_JNZ:
+        case X86_MNEMONIC_JO:
+        case X86_MNEMONIC_JS:
+        case X86_MNEMONIC_JZ:
+            return true;
+        default:
+            return false;
+        }
+    };
+    // 1 = trace-internal guard, 2 = trace-local backedge terminator.
+    //
+    // A common console wait primitive is a read-only CMP/TEST + Jcc ring.
+    // Keeping it as independent blocks expands every poll into full x86 flag
+    // synthesis and two linked-edge safepoints. In a Tier-2 loop trace, the
+    // following compare unconditionally replaces those flags; keep only the
+    // compact deferred recipe so a synchronous read fault can still
+    // materialize the exact architectural state.
+    const bool generic_read_only_poll_body =
+        std::ranges::any_of(block.instructions, [](const LsxDecodedOp& ir) {
+            return std::ranges::any_of(
+                std::span{ir.operands}.first(ir.operand_count),
+                [](const LsxOperandRecord& operand) {
+                    return operand.type == X86_OPERAND_TYPE_MEMORY &&
+                           (operand.actions &
+                            X86_OPERAND_ACTION_MASK_READ) != 0;
+                });
+        }) &&
+        std::ranges::all_of(block.instructions, [](const LsxDecodedOp& ir) {
+            const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
+            if (IsConditionalBranchMnemonic(mnemonic) ||
+                mnemonic == X86_MNEMONIC_NOP ||
+                mnemonic == X86_MNEMONIC_PAUSE) {
+                return true;
+            }
+            if (mnemonic != X86_MNEMONIC_CMP &&
+                mnemonic != X86_MNEMONIC_TEST) {
+                return false;
+            }
+            for (std::uint8_t operand_index = 0;
+                 operand_index < ir.operand_count; ++operand_index) {
+                const auto& operand = ir.operands[operand_index];
+                if (operand.type == X86_OPERAND_TYPE_MEMORY &&
+                    (operand.actions &
+                     X86_OPERAND_ACTION_MASK_WRITE) != 0) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    const bool tiered_read_only_poll_trace =
+        compilation_tier == LocalJitTier::Tier2 &&
+        tiered_guards != nullptr &&
+        generic_read_only_poll_body;
+    const bool kEnableDirectCompareBranchFusion =
+        tiered_read_only_poll_trace;
+    std::vector<std::uint8_t> generic_fused_compare_branch(
+        block.instructions.size(), 0);
+    for (std::size_t instruction_index = 0;
+         instruction_index + 1 < generic_scalar_instruction_count;
+         ++instruction_index) {
+        const auto& candidate = block.instructions[instruction_index];
+        const auto candidate_mnemonic =
+            static_cast<X86Mnemonic>(candidate.mnemonic);
+        const TieredGuardEmission* const guard =
+            tiered_guard_for_instruction(instruction_index + 1);
+        if (!kEnableDirectCompareBranchFusion ||
+            (candidate_mnemonic != X86_MNEMONIC_CMP &&
+             candidate_mnemonic != X86_MNEMONIC_TEST) ||
+            candidate.operand_count < 2 || guard == nullptr ||
+            !direct_compare_branch_supported(static_cast<X86Mnemonic>(
+                block.instructions[instruction_index + 1].mnemonic))) {
+            continue;
+        }
+        bool reaches_full_writer = false;
+        for (std::size_t next_index = instruction_index + 2;
+             next_index < generic_scalar_instruction_count; ++next_index) {
+            if (tiered_guard_for_instruction(next_index) != nullptr) {
+                break;
+            }
+            const auto& next = block.instructions[next_index];
+            if (unconditional_status_flag_kill_mask(next) ==
+                kArithmeticStatusBits) {
+                reaches_full_writer = true;
+                break;
+            }
+            if (!status_flag_transparent_instruction(next)) {
+                break;
+            }
+        }
+        if (reaches_full_writer) {
+            generic_fused_compare_branch[instruction_index] = 1;
+        }
+    }
     const bool generic_has_guest_memory_write =
         block_has_guest_memory_write() || block_has_implicit_stack_memory_write() ||
         generic_has_dynamic_control_terminator;
@@ -13298,18 +16659,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
          generic_has_dynamic_control_terminator ||
          (generic_has_ret_terminator && indirect_edge_fanout != nullptr)) &&
         (!generic_has_guest_memory_write || generic_memory_writes_are_direct_safe)) {
-        const auto tiered_guard_for_instruction =
-            [&](const std::size_t index) -> const TieredGuardEmission* {
-            if (tiered_guards == nullptr) {
-                return nullptr;
-            }
-            const auto guard = std::ranges::find(
-                *tiered_guards, index,
-                &TieredGuardEmission::instruction_index);
-            return guard == tiered_guards->end()
-                ? nullptr
-                : std::addressof(*guard);
-        };
         std::size_t instruction_index = 0;
         const bool can_emit_native = std::ranges::all_of(
             block.instructions, [&](const LsxDecodedOp& candidate) {
@@ -13360,6 +16709,53 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 }
                 const bool generic_has_local_backedge =
                     generic_local_backedge_index.has_value();
+                // Idle waits are common in console audio/job systems. Tier-2
+                // can fuse a multi-block poll ring, but a single-block T0/T1
+                // CMP/TEST backedge is already sufficient proof that no
+                // guest-visible work is performed. Treat it as a bounded
+                // polling loop too, so idle guest workers park instead of
+                // occupying mobile cores needed by Game:Main.
+                const bool generic_read_only_poll_loop =
+                    generic_has_local_backedge &&
+                    generic_read_only_poll_body;
+                if (generic_has_local_backedge &&
+                    generic_scalar_instruction_count != 0 &&
+                    direct_compare_branch_supported(generic_last_mnemonic)) {
+                    const std::size_t candidate_index =
+                        generic_scalar_instruction_count - 1u;
+                    const auto candidate_mnemonic =
+                        static_cast<X86Mnemonic>(
+                            block.instructions[candidate_index].mnemonic);
+                    if ((candidate_mnemonic == X86_MNEMONIC_CMP ||
+                         candidate_mnemonic == X86_MNEMONIC_TEST) &&
+                        block.instructions[candidate_index].operand_count >= 2) {
+                        bool reaches_full_writer = false;
+                        for (std::size_t next_index =
+                                 *generic_local_backedge_index;
+                             next_index < candidate_index; ++next_index) {
+                            const auto& next =
+                                block.instructions[next_index];
+                            if (unconditional_status_flag_kill_mask(next) ==
+                                kArithmeticStatusBits) {
+                                reaches_full_writer = true;
+                                break;
+                            }
+                            if (!status_flag_transparent_instruction(next)) {
+                                break;
+                            }
+                        }
+                        if (reaches_full_writer) {
+                            generic_fused_compare_branch[candidate_index] = 2;
+                        }
+                    }
+                }
+                const bool generic_has_deferred_compare_flags =
+                    std::ranges::any_of(
+                        generic_fused_compare_branch,
+                        [](const std::uint8_t fused) { return fused != 0; });
+                const bool generic_has_deferred_status_flags =
+                    generic_has_deferred_fault_flags ||
+                    generic_has_deferred_compare_flags;
                 JitLeafHlePltTarget generic_leaf_hle_target{};
                 const bool generic_has_leaf_hle_call =
                     generic_has_call_terminator &&
@@ -13369,7 +16765,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 constexpr std::uint32_t kNoCachedGprOffset =
                     std::numeric_limits<std::uint32_t>::max();
                 constexpr std::array<std::uint32_t, 8>
-                    kGenericCachedGprHostRegisters{23, 24, 25, 26, 27, 6, 7, 8};
+                    kGenericCachedGprHostRegisters{23, 24, 25, 26, 4, 6, 7, 8};
+                constexpr bool generic_fault_write_through = false;
                 std::array<std::uint32_t, 8> generic_cached_gpr_offsets{};
                 generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                 std::array<bool, 8> generic_cached_gpr_dirty{};
@@ -13377,21 +16774,31 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     !generic_has_dynamic_control_terminator &&
                     !generic_has_call_terminator && !generic_has_ret_terminator &&
                     !generic_has_counted_terminator &&
-                    !JitLiveCheckedNativeEnabled() &&
-                    tiered_guards == nullptr;
+                    !JitLiveCheckedNativeEnabled();
+                bool generic_gpr_cache_shape_rejected = false;
                 std::array<std::uint32_t, 16> generic_gpr_access_count{};
                 std::array<bool, 16> generic_gpr_written{};
                 const auto account_cached_gpr = [&](const LsxRegisterCode reg,
                                                     const bool read,
                                                     const bool write) {
-                    const auto location = resolve_register_location(reg);
-                    if (!location ||
-                        location->offset >= 16u * sizeof(std::uint64_t)) {
+                    std::uint32_t state_offset = 0;
+                    if (is_high8_gpr(reg)) {
+                        state_offset = gpr_state_offset(static_cast<LsxGpr>(
+                            reg - X86_REGISTER_AH));
+                    } else {
+                        const auto location = resolve_register_location(reg);
+                        if (!location) {
+                            generic_gpr_cache_eligible = false;
+                            return;
+                        }
+                        state_offset = location->offset;
+                    }
+                    if (state_offset >= 16u * sizeof(std::uint64_t)) {
                         generic_gpr_cache_eligible = false;
                         return;
                     }
                     const std::size_t slot =
-                        location->offset / sizeof(std::uint64_t);
+                        state_offset / sizeof(std::uint64_t);
                     generic_gpr_access_count[slot] +=
                         static_cast<std::uint32_t>(read) +
                         static_cast<std::uint32_t>(write);
@@ -13404,6 +16811,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                      ++instruction_index) {
                     const LsxDecodedOp& candidate =
                         block.instructions[instruction_index];
+                    if (tiered_guard_for_instruction(instruction_index) != nullptr) {
+                        continue;
+                    }
                     const auto candidate_mnemonic =
                         static_cast<X86Mnemonic>(candidate.mnemonic);
                     switch (candidate_mnemonic) {
@@ -13429,8 +16839,39 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_BEXTR:
                     case X86_MNEMONIC_BLSI:
                     case X86_MNEMONIC_BLSR:
+                    case X86_MNEMONIC_SHLX:
+                    case X86_MNEMONIC_SHRX:
+                    case X86_MNEMONIC_SARX:
+                    case X86_MNEMONIC_RORX:
+                    case X86_MNEMONIC_SHL:
+                    case X86_MNEMONIC_SHR:
+                    case X86_MNEMONIC_SAR:
+                    case X86_MNEMONIC_MOVSS:
+                    case X86_MNEMONIC_MOVSD:
+                    case X86_MNEMONIC_VMOVSS:
+                    case X86_MNEMONIC_VMOVSD:
+                    case X86_MNEMONIC_ADDSS:
+                    case X86_MNEMONIC_SUBSS:
+                    case X86_MNEMONIC_MULSS:
+                    case X86_MNEMONIC_VADDSS:
+                    case X86_MNEMONIC_VSUBSS:
+                    case X86_MNEMONIC_VMULSS:
+                        if (compilation_tier == LocalJitTier::Tier0 &&
+                            (!FastGuestMemoryEnabled() ||
+                             generic_has_faultable_memory_access)) {
+                            generic_gpr_cache_shape_rejected = true;
+                            generic_gpr_cache_eligible = false;
+                            continue;
+                        }
                         break;
+                    case X86_MNEMONIC_IMUL:
+                        if (candidate.operand_count == 2 ||
+                            candidate.operand_count == 3) {
+                            break;
+                        }
+                        [[fallthrough]];
                     default:
+                        generic_gpr_cache_shape_rejected = true;
                         generic_gpr_cache_eligible = false;
                         continue;
                     }
@@ -13446,7 +16887,16 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             const bool write =
                                 (operand.actions &
                                  X86_OPERAND_ACTION_MASK_WRITE) != 0;
-                            account_cached_gpr(operand.reg.value, read, write);
+                            std::uint32_t vector_offset = 0;
+                            std::uint32_t vector_width = 0;
+                            if (is_high8_gpr(operand.reg.value) ||
+                                resolve_register_location(operand.reg.value)) {
+                                account_cached_gpr(operand.reg.value, read, write);
+                            } else if (!vector_register_state_offset(
+                                           operand.reg.value, vector_offset,
+                                           vector_width)) {
+                                generic_gpr_cache_eligible = false;
+                            }
                         } else if (operand.type == X86_OPERAND_TYPE_MEMORY) {
                             if (operand.mem.base != X86_REGISTER_NONE &&
                                 operand.mem.base != X86_REGISTER_RIP &&
@@ -13499,10 +16949,18 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     std::size_t candidate_count = 0;
                     for (std::size_t slot = 0;
                          slot < generic_gpr_access_count.size(); ++slot) {
+                        // A trace-local loop pays its cache fill once and can
+                        // reuse a read-only guest register for every polling
+                        // iteration.  Treating that fill like a per-block
+                        // access prevented single-use loop operands (the
+                        // common CMP [reg],reg shape) from becoming resident.
                         const std::uint32_t cost =
-                            1u + static_cast<std::uint32_t>(
+                            static_cast<std::uint32_t>(
+                                !generic_has_local_backedge) +
+                            static_cast<std::uint32_t>(
                                      generic_gpr_written[slot]) +
-                            (generic_gpr_written[slot]
+                            (generic_gpr_written[slot] &&
+                                     compilation_tier == LocalJitTier::Tier0
                                  ? generic_fault_publication_count
                                  : 0u);
                         if (generic_gpr_access_count[slot] <= cost) {
@@ -13533,12 +16991,29 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         generic_cached_gpr_dirty[cache_index] =
                             candidates[cache_index].dirty;
                     }
+                    if (cached_count != 0) {
+                        std::uint64_t saved_accesses = 0;
+                        for (std::size_t cache_index = 0;
+                             cache_index < cached_count; ++cache_index) {
+                            saved_accesses +=
+                                candidates[cache_index].saved_accesses;
+                        }
+                        g_jit_native_scalar_gpr_cached_blocks.fetch_add(
+                            1, std::memory_order_relaxed);
+                        g_jit_native_scalar_gpr_cached_registers.fetch_add(
+                            cached_count, std::memory_order_relaxed);
+                        g_jit_native_scalar_gpr_saved_accesses.fetch_add(
+                            saved_accesses, std::memory_order_relaxed);
+                    }
+                } else if (generic_gpr_cache_shape_rejected) {
+                    g_jit_native_scalar_gpr_shape_rejections.fetch_add(
+                        1, std::memory_order_relaxed);
                 }
                 constexpr std::uint32_t kNoCachedVectorHalfOffset =
                     std::numeric_limits<std::uint32_t>::max();
-                std::array<std::uint32_t, 8> generic_cached_vector_half_offsets{};
+                std::array<std::uint32_t, 14> generic_cached_vector_half_offsets{};
                 generic_cached_vector_half_offsets.fill(kNoCachedVectorHalfOffset);
-                std::array<bool, 8> generic_cached_vector_half_dirty{};
+                std::array<bool, 14> generic_cached_vector_half_dirty{};
                 std::array<std::uint32_t, 32> generic_vector_half_reads{};
                 std::array<std::uint32_t, 32> generic_vector_half_writes{};
                 std::array<bool, 32> generic_vector_half_blocked{};
@@ -13546,23 +17021,44 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 InitializeUnwrittenVectorLanes(
                     generic_vector_half_first_write);
                 bool generic_vector_cache_eligible =
-                    !generic_has_call_terminator && tiered_guards == nullptr;
+                    !generic_has_call_terminator;
                 bool generic_vector_writeback_enabled =
                     !generic_has_dynamic_control_terminator &&
                     !generic_has_call_terminator && !generic_has_ret_terminator &&
                     !generic_has_counted_terminator &&
                     !JitLiveCheckedNativeEnabled();
+                const bool tiered_vector_residency =
+                    compilation_tier != LocalJitTier::Tier0;
                 const auto is_vector_cache_pair_instruction =
                     [&](const LsxDecodedOp& candidate) {
                     const auto mnemonic =
                         static_cast<X86Mnemonic>(candidate.mnemonic);
+                    const bool native_pshufd =
+                        is_native_pshufd(mnemonic) &&
+                        candidate.operand_count == 3 &&
+                        IsXmmOperand(candidate.operands[0]) &&
+                        (IsXmmOperand(candidate.operands[1]) ||
+                         (candidate.operands[1].type ==
+                              X86_OPERAND_TYPE_MEMORY &&
+                          (candidate.operands[1].size == 128 ||
+                           candidate.operands[1].size == 256))) &&
+                        candidate.operands[2].type ==
+                            X86_OPERAND_TYPE_IMMEDIATE;
                     return IsWholeVectorTransferMnemonic(mnemonic) ||
                            is_native_vector_bitwise(mnemonic) ||
                            is_native_vector_unpack(mnemonic) ||
                            is_native_vector_align_right(mnemonic) ||
                            is_native_packed_sad_byte(mnemonic) ||
                            is_native_packed_saturating_add_sub(mnemonic) ||
-                           is_native_packed_add_sub(mnemonic);
+                           is_native_packed_add_sub(mnemonic) ||
+                           (tiered_vector_residency &&
+                             (is_native_scalar_vector_move(mnemonic) ||
+                              is_native_scalar_float_add_sub_mul(candidate) ||
+                              is_native_packed_float_arith(candidate) ||
+                              is_native_shufps(candidate) ||
+                              is_native_packed_float_compare(candidate) ||
+                              is_native_packed_float_minmax(candidate) ||
+                              native_pshufd));
                 };
                 const auto is_vector_cache_nonsemantic_instruction =
                     [&](const LsxDecodedOp& candidate) {
@@ -13610,17 +17106,163 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_BEXTR:
                     case X86_MNEMONIC_BLSI:
                     case X86_MNEMONIC_BLSR:
+                    case X86_MNEMONIC_SHLX:
+                    case X86_MNEMONIC_SHRX:
+                    case X86_MNEMONIC_SARX:
+                    case X86_MNEMONIC_RORX:
+                    case X86_MNEMONIC_SHL:
+                    case X86_MNEMONIC_SHR:
+                    case X86_MNEMONIC_SAR:
+                        return true;
+                    case X86_MNEMONIC_IMUL:
+                        return candidate.operand_count == 2 ||
+                               candidate.operand_count == 3;
+                    default:
+                        return false;
+                    }
+                };
+                constexpr std::size_t kNoDeferredLoopFlagInstruction =
+                    std::numeric_limits<std::size_t>::max();
+                std::size_t generic_deferred_loop_dec_index =
+                    kNoDeferredLoopFlagInstruction;
+                std::uint32_t generic_deferred_loop_dec_state_offset = 0;
+                std::uint32_t generic_deferred_loop_dec_width = 0;
+                std::vector<std::uint8_t>
+                    generic_deferred_addsub_immediate_flags(
+                        block.instructions.size(), 0);
+                const auto is_deferred_loop_flag_safe =
+                    [&](const LsxDecodedOp& candidate) {
+                    if (is_vector_cache_pair_instruction(candidate) ||
+                        status_flag_transparent_instruction(candidate)) {
+                        return true;
+                    }
+                    switch (static_cast<X86Mnemonic>(candidate.mnemonic)) {
+                    case X86_MNEMONIC_NOP:
+                    case X86_MNEMONIC_PREFETCH:
+                    case X86_MNEMONIC_PREFETCHIT0:
+                    case X86_MNEMONIC_PREFETCHIT1:
+                    case X86_MNEMONIC_PREFETCHNTA:
+                    case X86_MNEMONIC_PREFETCHT0:
+                    case X86_MNEMONIC_PREFETCHT1:
+                    case X86_MNEMONIC_PREFETCHT2:
+                    case X86_MNEMONIC_PREFETCHW:
+                    case X86_MNEMONIC_PREFETCHWT1:
+                    case X86_MNEMONIC_PAUSE:
+                    case X86_MNEMONIC_LFENCE:
+                    case X86_MNEMONIC_MFENCE:
+                    case X86_MNEMONIC_SFENCE:
+                    case X86_MNEMONIC_CLFLUSH:
+                    case X86_MNEMONIC_CLFLUSHOPT:
+                    case X86_MNEMONIC_ADD:
+                    case X86_MNEMONIC_SUB:
+                    case X86_MNEMONIC_AND:
+                    case X86_MNEMONIC_OR:
+                    case X86_MNEMONIC_XOR:
+                    case X86_MNEMONIC_ANDN:
+                    case X86_MNEMONIC_CMP:
+                    case X86_MNEMONIC_TEST:
+                    case X86_MNEMONIC_INC:
+                    case X86_MNEMONIC_DEC:
+                    case X86_MNEMONIC_NEG:
+                    case X86_MNEMONIC_SHL:
+                    case X86_MNEMONIC_SHR:
+                    case X86_MNEMONIC_SAR:
                         return true;
                     default:
                         return false;
                     }
                 };
+                if (tiered_vector_residency && generic_has_local_backedge &&
+                    tiered_guards == nullptr &&
+                    generic_scalar_instruction_count != 0 &&
+                    (generic_last_mnemonic == X86_MNEMONIC_JNZ ||
+                     generic_last_mnemonic == X86_MNEMONIC_JZ)) {
+                    const std::size_t dec_index =
+                        generic_scalar_instruction_count - 1u;
+                    const auto& decrement = block.instructions[dec_index];
+                    bool eligible =
+                        static_cast<X86Mnemonic>(decrement.mnemonic) ==
+                            X86_MNEMONIC_DEC &&
+                        decrement.operand_count == 1 &&
+                        decrement.operands[0].type ==
+                            X86_OPERAND_TYPE_REGISTER &&
+                        register_state_offset(
+                            decrement.operands[0].reg.value,
+                            generic_deferred_loop_dec_state_offset,
+                            generic_deferred_loop_dec_width) &&
+                        (generic_deferred_loop_dec_width == 8 ||
+                         generic_deferred_loop_dec_width == 16 ||
+                         generic_deferred_loop_dec_width == 32 ||
+                         generic_deferred_loop_dec_width == 64);
+                    const std::size_t loop_begin =
+                        *generic_local_backedge_index;
+                    for (std::size_t instruction_index = loop_begin;
+                         eligible && instruction_index < dec_index;
+                         ++instruction_index) {
+                        eligible =
+                            tiered_guard_for_instruction(instruction_index) ==
+                                nullptr &&
+                            is_deferred_loop_flag_safe(
+                                block.instructions[instruction_index]);
+                    }
+                    if (eligible) {
+                        generic_deferred_loop_dec_index = dec_index;
+                        for (std::size_t instruction_index = loop_begin;
+                             instruction_index < dec_index;
+                             ++instruction_index) {
+                            const auto& candidate =
+                                block.instructions[instruction_index];
+                            const auto candidate_mnemonic =
+                                static_cast<X86Mnemonic>(
+                                    candidate.mnemonic);
+                            if ((candidate_mnemonic != X86_MNEMONIC_ADD &&
+                                 candidate_mnemonic != X86_MNEMONIC_SUB) ||
+                                candidate.operand_count != 2 ||
+                                candidate.operands[0].type !=
+                                    X86_OPERAND_TYPE_REGISTER ||
+                                candidate.operands[1].type !=
+                                    X86_OPERAND_TYPE_IMMEDIATE ||
+                                (candidate.operands[0].size != 32 &&
+                                 candidate.operands[0].size != 64)) {
+                                continue;
+                            }
+                            std::uint32_t ignored_offset = 0;
+                            std::uint32_t ignored_width = 0;
+                            if (!register_state_offset(
+                                    candidate.operands[0].reg.value,
+                                    ignored_offset, ignored_width)) {
+                                continue;
+                            }
+                            const std::int64_t immediate =
+                                candidate.operands[1].imm.is_signed
+                                    ? candidate.operands[1].imm.value.s
+                                    : static_cast<std::int64_t>(
+                                          candidate.operands[1].imm.value.u);
+                            constexpr std::int64_t kMinPackedImmediate =
+                                -(INT64_C(1) << 47);
+                            constexpr std::int64_t kMaxPackedImmediate =
+                                (INT64_C(1) << 47) - 1;
+                            if (immediate < kMinPackedImmediate ||
+                                immediate > kMaxPackedImmediate) {
+                                continue;
+                            }
+                            generic_deferred_addsub_immediate_flags[
+                                instruction_index] =
+                                candidate_mnemonic == X86_MNEMONIC_ADD
+                                    ? 1
+                                    : 2;
+                        }
+                    }
+                }
                 for (std::size_t instruction_index = 0;
                      generic_vector_cache_eligible &&
                      instruction_index < generic_scalar_instruction_count;
                      ++instruction_index) {
                     const LsxDecodedOp& candidate =
                         block.instructions[instruction_index];
+                    if (tiered_guard_for_instruction(instruction_index) != nullptr) {
+                        continue;
+                    }
                     if (!is_vector_cache_nonsemantic_instruction(candidate)) {
                         generic_vector_cache_eligible = false;
                         break;
@@ -13741,7 +17383,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 : 0u;
                         const std::uint32_t writeback_cost =
                             2u +
-                            generic_vector_half_fault_publications[slot];
+                            (compilation_tier == LocalJitTier::Tier0
+                                 ? generic_vector_half_fault_publications[slot]
+                                 : 0u);
                         const std::uint32_t writeback_accesses =
                             generic_vector_half_reads[slot] +
                             generic_vector_half_writes[slot];
@@ -13785,8 +17429,169 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         generic_cached_vector_half_dirty[cache_index] =
                             candidates[cache_index].dirty;
                     }
+                    if (cached_count != 0) {
+                        std::uint64_t saved_accesses = 0;
+                        for (std::size_t cache_index = 0;
+                             cache_index < cached_count; ++cache_index) {
+                            saved_accesses +=
+                                candidates[cache_index].saved_state_accesses;
+                        }
+                        g_jit_native_simd_cached_blocks.fetch_add(
+                            1, std::memory_order_relaxed);
+                        g_jit_native_simd_cached_halves.fetch_add(
+                            cached_count, std::memory_order_relaxed);
+                        g_jit_native_simd_saved_accesses.fetch_add(
+                            saved_accesses, std::memory_order_relaxed);
+                    }
                 }
                 const bool generic_chain_abi = !JitLiveCheckedNativeEnabled();
+                const bool generic_strong_memory_sequence =
+                    FastGuestMemoryEnabled();
+                const bool generic_strong_memory_sequence_has_write =
+                    generic_strong_memory_sequence &&
+                    (block_has_guest_memory_write() ||
+                     block_has_implicit_stack_memory_write());
+                std::array<const NativeFaultDescriptor*, 2>
+                    generic_poll_fault_descriptors{};
+                std::size_t generic_poll_fault_descriptor_count = 0;
+                // Direct memory accesses publish their descriptor through x21.
+                // Preloading two descriptor pointers into cache registers no
+                // longer saves an instruction and only reduces the GPR cache.
+                constexpr bool generic_poll_fault_descriptor_cache_enabled =
+                    false;
+                if (generic_poll_fault_descriptor_cache_enabled) {
+                    for (const auto& instruction : block.instructions) {
+                        if (!instruction_has_faultable_memory_access(
+                                instruction)) {
+                            continue;
+                        }
+                        const NativeFaultDescriptor* const descriptor =
+                            preserve_fault_descriptor(instruction);
+                        const bool already_cached = std::ranges::find(
+                            generic_poll_fault_descriptors.begin(),
+                            generic_poll_fault_descriptors.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    generic_poll_fault_descriptor_count),
+                            descriptor) !=
+                            generic_poll_fault_descriptors.begin() +
+                                static_cast<std::ptrdiff_t>(
+                                    generic_poll_fault_descriptor_count);
+                        if (already_cached) {
+                            continue;
+                        }
+                        if (generic_poll_fault_descriptor_count ==
+                            generic_poll_fault_descriptors.size()) {
+                            generic_poll_fault_descriptor_count = 0;
+                            break;
+                        }
+                        generic_poll_fault_descriptors[
+                            generic_poll_fault_descriptor_count++] =
+                            descriptor;
+                    }
+                }
+                const bool generic_fault_cache_recovery_enabled =
+                    compilation_tier != LocalJitTier::Tier0 &&
+                    (std::ranges::any_of(
+                         generic_cached_gpr_dirty,
+                         [](const bool dirty) { return dirty; }) ||
+                     std::ranges::any_of(
+                         generic_cached_vector_half_dirty,
+                         [](const bool dirty) { return dirty; }));
+                NativeFaultRecoveryDescriptor*
+                    generic_fault_recovery_base = nullptr;
+                if (generic_fault_cache_recovery_enabled) {
+                    auto* const bundle = acquire_descriptor_bundle();
+                    bundle->recoverable_faults.reserve(
+                        block.instructions.size());
+                    generic_fault_recovery_base =
+                        bundle->recoverable_faults.data();
+                }
+                NativeFaultDescriptor* generic_fault_descriptor_base = nullptr;
+                if (!generic_fault_cache_recovery_enabled &&
+                    generic_has_faultable_memory_access) {
+                    auto* const bundle = acquire_descriptor_bundle();
+                    if (bundle->faults.capacity() == 0) {
+                        bundle->faults.reserve(block.instructions.size());
+                    }
+                    generic_fault_descriptor_base = bundle->faults.data();
+                }
+                const void* const generic_fault_publication_base =
+                    generic_fault_cache_recovery_enabled
+                        ? static_cast<const void*>(generic_fault_recovery_base)
+                        : static_cast<const void*>(generic_fault_descriptor_base);
+                const bool generic_relative_fault_publication_enabled =
+                    generic_fault_publication_base != nullptr;
+                std::array<const LsxDecodedOp*, kJitMaxTraceInstructions>
+                    generic_fault_recovery_sources{};
+                std::array<const NativeFaultRecoveryDescriptor*,
+                           kJitMaxTraceInstructions>
+                    generic_fault_recovery_copies{};
+                std::size_t generic_fault_recovery_count = 0;
+                const auto preserve_fault_recovery_descriptor =
+                    [&](const LsxDecodedOp& instruction) {
+                    for (std::size_t index = 0;
+                         index < generic_fault_recovery_count; ++index) {
+                        if (generic_fault_recovery_sources[index] ==
+                            std::addressof(instruction)) {
+                            return generic_fault_recovery_copies[index];
+                        }
+                    }
+                    auto* const bundle = acquire_descriptor_bundle();
+                    assert(bundle->recoverable_faults.size() <
+                           bundle->recoverable_faults.capacity());
+                    bundle->recoverable_faults.emplace_back();
+                    NativeFaultRecoveryDescriptor& recovery =
+                        bundle->recoverable_faults.back();
+                    recovery.instruction =
+                        *preserve_fault_descriptor(instruction);
+                    for (std::size_t cache_index = 0;
+                         cache_index < generic_cached_gpr_offsets.size();
+                         ++cache_index) {
+                        const std::uint32_t state_offset =
+                            generic_cached_gpr_offsets[cache_index];
+                        if (state_offset == kNoCachedGprOffset ||
+                            !generic_cached_gpr_dirty[cache_index]) {
+                            continue;
+                        }
+                        assert(recovery.gpr_count < recovery.gpr.size());
+                        recovery.gpr[recovery.gpr_count++] = {
+                            static_cast<std::uint16_t>(state_offset),
+                            static_cast<std::uint8_t>(
+                                kGenericCachedGprHostRegisters[cache_index]),
+                            0,
+                        };
+                    }
+                    for (std::size_t cache_index = 0;
+                         cache_index <
+                         generic_cached_vector_half_offsets.size();
+                         ++cache_index) {
+                        const std::uint32_t state_offset =
+                            generic_cached_vector_half_offsets[cache_index];
+                        if (state_offset == kNoCachedVectorHalfOffset ||
+                            !generic_cached_vector_half_dirty[cache_index]) {
+                            continue;
+                        }
+                        assert(recovery.vector_count <
+                               recovery.vector.size());
+                        recovery.vector[recovery.vector_count++] = {
+                            static_cast<std::uint16_t>(state_offset),
+                            static_cast<std::uint8_t>(16u + cache_index),
+                            0,
+                        };
+                    }
+                    const NativeFaultRecoveryDescriptor* const copy =
+                        std::addressof(recovery);
+                    if (generic_fault_recovery_count <
+                        generic_fault_recovery_sources.size()) {
+                        generic_fault_recovery_sources[
+                            generic_fault_recovery_count] =
+                            std::addressof(instruction);
+                        generic_fault_recovery_copies[
+                            generic_fault_recovery_count] = copy;
+                        ++generic_fault_recovery_count;
+                    }
+                    return copy;
+                };
                 const std::size_t generic_code_capacity = std::max<std::size_t>(
                     8192u, 4096u + block.instructions.size() * 512u);
                 auto code = open_code_draft(generic_code_capacity);
@@ -13815,7 +17620,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->strh(source,
                                    Xbyak_aarch64::ptr(code->x19, offset));
                     };
+                std::array<bool, 32> generic_vector_half_known_zero{};
                 const auto clear_vector_scratch = [&] {
+                    // q31 is shared by many SIMD lowering paths.  Keeping a
+                    // linear "known zero" fact for it is unsafe because those
+                    // paths can overwrite q31 without going through this
+                    // helper.  The architectural upper-half fact below is
+                    // still profitable; only materialize a trustworthy zero
+                    // whenever an actual upper-half clear is required.
                     code->movi(code->v31.b16, 0);
                 };
                 const auto clear_vector_result = [&] {
@@ -13830,6 +17642,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     generic_has_local_backedge;
                 const bool generic_frame_preserves_extended_gpr_cache =
                     generic_chain_abi ||
+                    (generic_relative_fault_publication_enabled &&
+                     generic_has_local_backedge) ||
                     [&]() {
                         for (std::size_t cache_index = 0;
                              cache_index < generic_cached_gpr_offsets.size();
@@ -13891,8 +17705,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 };
                 const auto cached_vector_half_is_writeback =
                     [&](const int host_index) {
-                    if (!generic_vector_writeback_enabled ||
-                        host_index < 16 || host_index >= 24) {
+                    if (generic_fault_write_through ||
+                        !generic_vector_writeback_enabled ||
+                        host_index < 16 || host_index >= 30) {
                         return false;
                     }
                     return generic_cached_vector_half_dirty[
@@ -13986,12 +17801,94 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     [&](const bool after_abi_call = false) {
                     emit_reload_gpr_cache(after_abi_call);
                     emit_reload_vector_cache();
+                    generic_vector_half_known_zero.fill(false);
+                };
+                // The shared-chain ABI reserves w28 for the edge safepoint
+                // countdown. Keep memory authoritative at every observable
+                // exit, ABI call, and synchronous-fault publication.
+                const auto emit_sync_native_edge_phase = [&]() {
+                    if (generic_chain_abi) {
+                        code->str(
+                            code->w28,
+                            Xbyak_aarch64::ptr(
+                                code->x19, kStateNativeEdgePhaseOffset));
+                    }
+                };
+                const auto emit_relative_fault_descriptor =
+                    [&](const std::uintptr_t encoded_offset) {
+                    const XReg& base = generic_has_local_backedge
+                        ? code->x27
+                        : code->x22;
+                    if (encoded_offset <= 4095u) {
+                        code->add(code->x21, base,
+                                  static_cast<std::uint32_t>(
+                                      encoded_offset));
+                    } else {
+                        assert(
+                            encoded_offset <=
+                            std::numeric_limits<std::uint32_t>::max());
+                        code->mov(code->w9,
+                                  static_cast<std::uint32_t>(
+                                      encoded_offset));
+                        code->add(code->x21, base, code->x9);
+                    }
+                };
+                const auto emit_load_plain_fault_descriptor =
+                    [&](const LsxDecodedOp& ir) {
+                    const NativeFaultDescriptor* const descriptor =
+                        preserve_fault_descriptor(ir);
+                    if (generic_relative_fault_publication_enabled &&
+                        !generic_fault_cache_recovery_enabled) {
+                        const std::uintptr_t offset =
+                            reinterpret_cast<std::uintptr_t>(descriptor) -
+                            reinterpret_cast<std::uintptr_t>(
+                                generic_fault_descriptor_base);
+                        emit_relative_fault_descriptor(offset);
+                    } else {
+                        EmitJitRelocatablePointer(
+                            *code, code->x21,
+                            reinterpret_cast<std::uint64_t>(descriptor));
+                    }
+                };
+                const auto emit_reload_native_edge_phase = [&]() {
+                    if (generic_chain_abi) {
+                        code->ldr(
+                            code->w28,
+                            Xbyak_aarch64::ptr(
+                                code->x19, kStateNativeEdgePhaseOffset));
+                    }
+                };
+                const bool generic_deferred_loop_flags =
+                    generic_deferred_loop_dec_index !=
+                    kNoDeferredLoopFlagInstruction;
+                const auto emit_materialize_deferred_flags =
+                    [&](const bool force = false) {
+                    if (!force && !generic_deferred_loop_flags) {
+                        return;
+                    }
+                    emit_flush_register_caches();
+                    emit_sync_native_edge_phase();
+                    code->mov(code->x0, code->x19);
+                    EmitJitRelocatablePointer(
+                        *code, code->x16,
+                        reinterpret_cast<std::uint64_t>(
+                            &MaterializeDeferredFlags));
+                    code->blr(code->x16);
+                    emit_reload_native_edge_phase();
+                    emit_reload_register_caches();
                 };
                 const auto emit_epilogue_restore = [&]() {
+                    if (generic_strong_memory_sequence_has_write) {
+                        code->dmb(Xbyak_aarch64::ISHST);
+                    }
                     emit_flush_register_caches();
+                    emit_sync_native_edge_phase();
                     if (generic_has_faultable_memory_access) {
                         code->mov(code->x9, 0);
-                        code->str(code->x9, Xbyak_aarch64::ptr(code->x21));
+                        code->str(
+                            code->x9,
+                            Xbyak_aarch64::ptr(
+                                code->x19, kStateNativeFaultIrOffset));
                     }
                     EmitNativeFrameExit(*code, generic_frame_layout);
                 };
@@ -14007,7 +17904,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->mov(code->x0, target);
                     emit_epilogue_exit();
                 };
-                const auto emit_static_edge_tail = [&](const std::uint64_t target) {
+                const auto emit_static_edge_tail =
+                    [&](const std::uint64_t target,
+                        const bool force_validation = false) {
                     OutboundEdgeState* edge_slot = nullptr;
                     if (primary_outbound_edge != nullptr &&
                         primary_outbound_edge->guest_rip == target) {
@@ -14029,18 +17928,29 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->ldar(code->x16, Xbyak_aarch64::ptr(code->x9));
                     code->cbz(code->x16, fallback);
 
-                    code->ldr(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateNativeEdgePhaseOffset));
-                    code->cbz(code->w11, refill_chain_budget);
-                    code->subs(code->w11, code->w11, 1);
-                    code->str(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateNativeEdgePhaseOffset));
+                    if (force_validation) {
+                        code->b(validate);
+                    }
+                    if (generic_chain_abi) {
+                        code->cbz(code->w28, refill_chain_budget);
+                        code->subs(code->w28, code->w28, 1);
+                    } else {
+                        code->ldr(code->w11,
+                                  Xbyak_aarch64::ptr(
+                                      code->x19,
+                                      kStateNativeEdgePhaseOffset));
+                        code->cbz(code->w11, refill_chain_budget);
+                        code->subs(code->w11, code->w11, 1);
+                        code->str(code->w11,
+                                  Xbyak_aarch64::ptr(
+                                      code->x19,
+                                      kStateNativeEdgePhaseOffset));
+                    }
                     code->bne(chain);
 
                     code->L(validate);
                     emit_flush_register_caches();
+                    emit_sync_native_edge_phase();
                     EmitJitRelocatablePointer(
                         *code, code->x0,
                         reinterpret_cast<std::uint64_t>(edge_slot));
@@ -14048,27 +17958,44 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     EmitJitRelocatablePointer(
                         *code, code->x17,
                         reinterpret_cast<std::uint64_t>(
-                            &ValidateObservedDirectTargetAtSafepoint));
+                            force_validation
+                                ? (generic_read_only_poll_loop
+                                       ? &ValidateObservedDirectTargetAtPollingLoopSafepoint
+                                       : &ValidateObservedDirectTargetAtLoopSafepoint)
+                                : &ValidateObservedDirectTargetAtSafepoint));
                     code->blr(code->x17);
+                    emit_reload_native_edge_phase();
                     emit_reload_register_caches(true);
                     code->mov(code->x16, code->x0);
                     code->cbz(code->x16, fallback);
                     code->b(fallback);
                     code->L(refill_chain_budget);
-                    code->mov(code->w11, kNativeEdgeSchedulePeriod - 1u);
-                    code->str(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateNativeEdgePhaseOffset));
+                    if (generic_chain_abi) {
+                        code->mov(code->w28, kNativeEdgeSchedulePeriod - 1u);
+                    } else {
+                        code->mov(code->w11, kNativeEdgeSchedulePeriod - 1u);
+                        code->str(code->w11,
+                                  Xbyak_aarch64::ptr(
+                                      code->x19,
+                                      kStateNativeEdgePhaseOffset));
+                    }
                     code->L(chain);
                     EmitCallArgument(*code, 0, code->x19);
                     EmitCallArgument(*code, 9, target);
                     code->str(code->x9,
                               Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
                     if (generic_chain_abi) {
+                        if (generic_strong_memory_sequence_has_write) {
+                            code->dmb(Xbyak_aarch64::ISHST);
+                        }
                         emit_flush_register_caches();
                         if (generic_has_faultable_memory_access) {
                             code->mov(code->x9, 0);
-                            code->str(code->x9, Xbyak_aarch64::ptr(code->x21));
+                            code->str(
+                                code->x9,
+                                Xbyak_aarch64::ptr(
+                                    code->x19,
+                                    kStateNativeFaultIrOffset));
                         }
                     } else {
                         emit_epilogue_restore();
@@ -14116,6 +18043,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             code->x9,
                             static_cast<std::uint32_t>(
                                 offsetof(IndirectEdgeFanout, way_count))));
+
                     code->L(search_way);
                     code->ldar(code->x13, Xbyak_aarch64::ptr(code->x12));
                     code->cbz(code->x13, next_way);
@@ -14136,12 +18064,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
 
                     code->L(bind);
                     emit_flush_register_caches();
+                    emit_sync_native_edge_phase();
                     code->mov(code->x0, code->x9);
                     code->mov(code->x1, code->x20);
                     EmitJitRelocatablePointer(
                         *code, code->x16,
                         reinterpret_cast<std::uint64_t>(&BindIndirectEdgeFanout));
                     code->blr(code->x16);
+                    emit_reload_native_edge_phase();
                     emit_reload_register_caches(true);
                     code->mov(code->x13, code->x0);
                     code->cbz(code->x13, fallback);
@@ -14150,18 +18080,26 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->ldar(code->x16, Xbyak_aarch64::ptr(code->x13));
                     code->cbz(code->x16, fallback);
 
-                    code->ldr(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateNativeEdgePhaseOffset));
-                    code->cbz(code->w11, refill_chain_budget);
-                    code->subs(code->w11, code->w11, 1);
-                    code->str(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateNativeEdgePhaseOffset));
+                    if (generic_chain_abi) {
+                        code->cbz(code->w28, refill_chain_budget);
+                        code->subs(code->w28, code->w28, 1);
+                    } else {
+                        code->ldr(code->w11,
+                                  Xbyak_aarch64::ptr(
+                                      code->x19,
+                                      kStateNativeEdgePhaseOffset));
+                        code->cbz(code->w11, refill_chain_budget);
+                        code->subs(code->w11, code->w11, 1);
+                        code->str(code->w11,
+                                  Xbyak_aarch64::ptr(
+                                      code->x19,
+                                      kStateNativeEdgePhaseOffset));
+                    }
                     code->bne(chain);
 
                     code->L(validate);
                     emit_flush_register_caches();
+                    emit_sync_native_edge_phase();
                     code->mov(code->x0, code->x13);
                     code->mov(code->x1, code->x16);
                     EmitJitRelocatablePointer(
@@ -14169,14 +18107,20 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         reinterpret_cast<std::uint64_t>(
                             &ValidateObservedDirectTargetAtSafepoint));
                     code->blr(code->x17);
+                    emit_reload_native_edge_phase();
                     emit_reload_register_caches(true);
                     code->b(fallback);
 
                     code->L(refill_chain_budget);
-                    code->mov(code->w11, kNativeEdgeSchedulePeriod - 1u);
-                    code->str(code->w11,
-                              Xbyak_aarch64::ptr(code->x19,
-                                                kStateNativeEdgePhaseOffset));
+                    if (generic_chain_abi) {
+                        code->mov(code->w28, kNativeEdgeSchedulePeriod - 1u);
+                    } else {
+                        code->mov(code->w11, kNativeEdgeSchedulePeriod - 1u);
+                        code->str(code->w11,
+                                  Xbyak_aarch64::ptr(
+                                      code->x19,
+                                      kStateNativeEdgePhaseOffset));
+                    }
                     code->L(chain);
                     EmitJitRelocatablePointer(
                         *code, code->x9,
@@ -14189,7 +18133,33 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->mov(code->x0, code->x19);
                     code->str(code->x20,
                               Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
-                    emit_epilogue_restore();
+                    if (generic_chain_abi) {
+                        Xbyak_aarch64::Label resident_target;
+                        code->ldrb(
+                            code->w17,
+                            Xbyak_aarch64::ptr(
+                                code->x13,
+                                static_cast<std::uint32_t>(
+                                    offsetof(OutboundEdgeState,
+                                             enters_resident_frame))));
+                        code->cbnz(code->w17, resident_target);
+                        emit_epilogue_restore();
+                        code->br(code->x16);
+                        code->L(resident_target);
+                        if (generic_strong_memory_sequence_has_write) {
+                            code->dmb(Xbyak_aarch64::ISHST);
+                        }
+                        emit_flush_register_caches();
+                        if (generic_has_faultable_memory_access) {
+                            code->mov(code->x9, 0);
+                            code->str(code->x9,
+                                      Xbyak_aarch64::ptr(
+                                          code->x19,
+                                          kStateNativeFaultIrOffset));
+                        }
+                    } else {
+                        emit_epilogue_restore();
+                    }
                     code->br(code->x16);
 
                     code->L(fallback);
@@ -14204,8 +18174,21 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             return false;
                         }
                         state_offset =
-                            static_cast<std::uint32_t>(reg - X86_REGISTER_AH) *
-                            sizeof(std::uint64_t);
+                            gpr_state_offset(static_cast<LsxGpr>(
+                                reg - X86_REGISTER_AH));
+                        const int cached_host_index =
+                            cached_gpr_host_index(state_offset);
+                        if (cached_host_index >= 0) {
+                            code->ubfx(
+                                dst,
+                                XReg(static_cast<std::uint32_t>(
+                                    cached_host_index)),
+                                8, 8);
+                            if (g_jit_selftest_differential_active) {
+                                ++g_jit_selftest_high8_cached_access_emissions;
+                            }
+                            return true;
+                        }
                         code->ldrb(WReg(dst.getIdx()),
                                    Xbyak_aarch64::ptr(code->x19, state_offset + 1));
                         return true;
@@ -14341,10 +18324,45 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         segment_state_offset);
                     return true;
                 };
-                const auto emit_publish_fault_ir = [&](const LsxDecodedOp& ir) {
+                const auto emit_publish_fault_ir_fast =
+                    [&](const LsxDecodedOp& ir) {
+                    if (generic_fault_cache_recovery_enabled) {
+                        const NativeFaultRecoveryDescriptor* const descriptor =
+                            preserve_fault_recovery_descriptor(ir);
+                        if (generic_relative_fault_publication_enabled) {
+                            const std::uintptr_t offset =
+                                reinterpret_cast<std::uintptr_t>(descriptor) -
+                                reinterpret_cast<std::uintptr_t>(
+                                    generic_fault_recovery_base);
+                            assert(
+                                offset <
+                                std::numeric_limits<std::uint32_t>::max());
+                            emit_relative_fault_descriptor(
+                                offset | kNativeFaultRecoveryTag);
+                        } else {
+                            const std::uintptr_t tagged =
+                                reinterpret_cast<std::uintptr_t>(descriptor) |
+                                kNativeFaultRecoveryTag;
+                            EmitJitRelocatablePointer(
+                                *code, code->x21, tagged);
+                        }
+                        return;
+                    }
                     emit_flush_register_caches();
-                    EmitPublishFaultDescriptor(
-                        *code, *preserve_fault_descriptor(ir), code->x21);
+                    emit_load_plain_fault_descriptor(ir);
+                };
+                const auto emit_publish_fault_ir =
+                    [&](const LsxDecodedOp& ir) {
+                    // Helpers observe the machine image and may clobber
+                    // caller-saved cache registers.  Make dirty write-back
+                    // caches authoritative before entering an ABI boundary.
+                    emit_flush_register_caches();
+                    emit_sync_native_edge_phase();
+                    emit_load_plain_fault_descriptor(ir);
+                    code->str(
+                        code->x21,
+                        Xbyak_aarch64::ptr(
+                            code->x19, kStateNativeFaultIrOffset));
                 };
                 const auto emit_faultable_memory_address =
                     [&](const LsxDecodedOp& ir,
@@ -14354,7 +18372,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     if (!resolved) {
                         return false;
                     }
-                    emit_publish_fault_ir(ir);
+                    emit_publish_fault_ir_fast(ir);
                     return true;
                 };
                 const auto emit_diagnostic_store_watch =
@@ -14427,7 +18445,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         EmitJitRelocatablePointer(
                             *code, code->x16,
                             reinterpret_cast<std::uint64_t>(&JitReportWatchedStore));
+                        emit_sync_native_edge_phase();
                         code->blr(code->x16);
+                        emit_reload_native_edge_phase();
                         code->ldp(code->x9, code->x10,
                                   Xbyak_aarch64::ptr(code->sp, 0));
                         code->ldp(code->x11, code->x12,
@@ -14531,8 +18551,30 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                         code->dmb(Xbyak_aarch64::ISH);
                         code->L(done);
-                        return true;
-                    };
+                    return true;
+                };
+                const auto emit_scalar_load = [&](const std::uint32_t size_bits,
+                                                  const XReg& address,
+                                                  const XReg& value) {
+                    const auto word = WReg(value.getIdx());
+                    switch (size_bits) {
+                    case 8:
+                        code->ldrb(word, Xbyak_aarch64::ptr(address));
+                        break;
+                    case 16:
+                        code->ldrh(word, Xbyak_aarch64::ptr(address));
+                        break;
+                    case 32:
+                        code->ldr(word, Xbyak_aarch64::ptr(address));
+                        break;
+                    case 64:
+                        code->ldr(value, Xbyak_aarch64::ptr(address));
+                        break;
+                    default:
+                        return false;
+                    }
+                    return true;
+                };
                 const auto emit_scalar_store = [&](const std::uint32_t size_bits,
                                                    const XReg& address,
                                                    const XReg& value) {
@@ -14555,6 +18597,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                     return true;
                 };
+                const auto use_strong_memory_sequence_access =
+                    [&](const LsxOperandRecord& operand) {
+                    return generic_strong_memory_sequence &&
+                           operand.type == X86_OPERAND_TYPE_MEMORY;
+                };
                 const auto emit_read_operand = [&](const LsxDecodedOp& ir,
                                                    const LsxOperandRecord& operand,
                                                    const XReg& dst) {
@@ -14569,6 +18616,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (!emit_faultable_memory_address(ir, operand)) {
                             return false;
                         }
+                        if (use_strong_memory_sequence_access(operand)) {
+                            return emit_scalar_load(
+                                operand.size, code->x14, dst);
+                        }
                         return emit_tso_scalar_load(operand.size, code->x14, dst);
                     }
                     return false;
@@ -14582,9 +18633,39 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 return false;
                             }
                             const auto state_offset =
-                                static_cast<std::uint32_t>(
-                                    operand.reg.value - X86_REGISTER_AH) *
-                                sizeof(std::uint64_t);
+                                gpr_state_offset(static_cast<LsxGpr>(
+                                    operand.reg.value - X86_REGISTER_AH));
+                            const int cached_host_index =
+                                cached_gpr_host_index(state_offset);
+                            if (cached_host_index >= 0) {
+                                const int cache_index =
+                                    cached_gpr_cache_index(state_offset);
+                                if (cache_index >= 0 &&
+                                    generic_cached_gpr_dirty[
+                                        static_cast<std::size_t>(
+                                            cache_index)] &&
+                                    !generic_fault_write_through) {
+                                    generic_gpr_cache_written_mask |=
+                                        std::uint32_t{1} <<
+                                        static_cast<std::uint32_t>(
+                                            cache_index);
+                                }
+                                code->bfi(
+                                    XReg(static_cast<std::uint32_t>(
+                                        cached_host_index)),
+                                    src, 8, 8);
+                                if (generic_fault_write_through) {
+                                    code->str(
+                                        XReg(static_cast<std::uint32_t>(
+                                            cached_host_index)),
+                                        Xbyak_aarch64::ptr(
+                                            code->x19, state_offset));
+                                }
+                                if (g_jit_selftest_differential_active) {
+                                    ++g_jit_selftest_high8_cached_access_emissions;
+                                }
+                                return true;
+                            }
                             code->strb(
                                 WReg(src.getIdx()),
                                 Xbyak_aarch64::ptr(
@@ -14607,7 +18688,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 cached_gpr_cache_index(state_offset);
                             if (cache_index >= 0 &&
                                 generic_cached_gpr_dirty[
-                                    static_cast<std::size_t>(cache_index)]) {
+                                    static_cast<std::size_t>(cache_index)] &&
+                                !generic_fault_write_through) {
                                 generic_gpr_cache_written_mask |=
                                     std::uint32_t{1} <<
                                     static_cast<std::uint32_t>(cache_index);
@@ -14624,6 +18706,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 code->mov(cached, src);
                             } else {
                                 return false;
+                            }
+                            if (generic_fault_write_through) {
+                                code->str(
+                                    cached,
+                                    Xbyak_aarch64::ptr(
+                                        code->x19, state_offset));
                             }
                             return true;
                         }
@@ -14650,7 +18738,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (!emit_faultable_memory_address(ir, operand)) {
                             return false;
                         }
-                        if (!emit_tso_scalar_store(operand.size, code->x14, src)) {
+                        const bool stored =
+                            use_strong_memory_sequence_access(operand)
+                                ? emit_scalar_store(
+                                      operand.size, code->x14, src)
+                                : emit_tso_scalar_store(
+                                      operand.size, code->x14, src);
+                        if (!stored) {
                             return false;
                         }
                         emit_diagnostic_store_watch(ir, operand.size / 8);
@@ -14694,7 +18788,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (!emit_faultable_memory_address(ir, operand)) {
                             return false;
                         }
-                        return emit_tso_scalar_load(64, code->x14, dst);
+                        return generic_strong_memory_sequence
+                                   ? emit_scalar_load(64, code->x14, dst)
+                                   : emit_tso_scalar_load(64, code->x14, dst);
                     }
                     return false;
                 };
@@ -14742,7 +18838,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         return false;
                     }
                     width_bytes = operand.size == 256 ? 32u : 16u;
-                    emit_publish_fault_ir(ir);
+                    emit_publish_fault_ir_fast(ir);
                     code->ldr(low, Xbyak_aarch64::ptr(code->x14));
                     if (width_bytes == 32) {
                         code->ldr(high, Xbyak_aarch64::ptr(code->x14, 16));
@@ -14763,6 +18859,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                         const int low_cache =
                             cached_vector_half_host_index(state_offset);
+                        generic_vector_half_known_zero[
+                            (state_offset - kStateYmm0Offset) / 16u] = false;
                         if (!cached_vector_half_is_writeback(low_cache)) {
                             code->str(low,
                                       Xbyak_aarch64::ptr(code->x19, state_offset));
@@ -14774,6 +18872,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             mark_cached_vector_half_written(low_cache);
                         }
                         if (width_bytes == 32) {
+                            generic_vector_half_known_zero[
+                                (state_offset + 16u -
+                                 kStateYmm0Offset) /
+                                16u] = false;
                             const int high_cache =
                                 cached_vector_half_host_index(state_offset + 16);
                             if (!cached_vector_half_is_writeback(high_cache)) {
@@ -14792,6 +18894,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         } else if (ir.decoded.encoding == X86_INSTRUCTION_ENCODING_VEX ||
                                    ir.decoded.encoding == X86_INSTRUCTION_ENCODING_EVEX ||
                                    ir.decoded.encoding == X86_INSTRUCTION_ENCODING_XOP) {
+                            const std::size_t upper_slot =
+                                (state_offset + 16u -
+                                 kStateYmm0Offset) /
+                                16u;
+                            if (generic_vector_half_known_zero[upper_slot]) {
+                                return true;
+                            }
                             clear_vector_scratch();
                             const int high_cache =
                                 cached_vector_half_host_index(state_offset + 16);
@@ -14807,6 +18916,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     code->v31.b16, code->v31.b16);
                                 mark_cached_vector_half_written(high_cache);
                             }
+                            generic_vector_half_known_zero[upper_slot] = true;
                         }
                         return true;
                     }
@@ -14816,13 +18926,42 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         !emit_memory_address(ir, operand, code->x14)) {
                         return false;
                     }
-                    emit_publish_fault_ir(ir);
+                    emit_publish_fault_ir_fast(ir);
                     code->str(low, Xbyak_aarch64::ptr(code->x14));
                     if (width_bytes == 32) {
                         code->str(high, Xbyak_aarch64::ptr(code->x14, 16));
                     }
                     emit_diagnostic_store_watch(ir, width_bytes);
                     return true;
+                };
+                const auto emit_zero_vector_upper_half =
+                    [&](const std::uint32_t destination_offset) {
+                    const std::uint32_t upper_offset =
+                        destination_offset + 16u;
+                    const std::size_t upper_slot =
+                        (upper_offset - kStateYmm0Offset) / 16u;
+                    if (upper_slot >=
+                            generic_vector_half_known_zero.size() ||
+                        generic_vector_half_known_zero[upper_slot]) {
+                        return;
+                    }
+                    clear_vector_scratch();
+                    const int upper_cache =
+                        cached_vector_half_host_index(upper_offset);
+                    if (!cached_vector_half_is_writeback(upper_cache)) {
+                        code->str(
+                            code->q31,
+                            Xbyak_aarch64::ptr(
+                                code->x19, upper_offset));
+                    }
+                    if (upper_cache >= 0) {
+                        code->orr(
+                            VReg16B{static_cast<std::uint32_t>(
+                                upper_cache)},
+                            code->v31.b16, code->v31.b16);
+                        mark_cached_vector_half_written(upper_cache);
+                    }
+                    generic_vector_half_known_zero[upper_slot] = true;
                 };
                 bool generic_rflags_live_in_x9 = false;
                 const auto publish_inline_status = [&](const std::uint64_t affected_bits) {
@@ -14831,6 +18970,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->bic(code->x9, code->x9, code->x17);
                     code->orr(code->x9, code->x9, code->x13);
                     store_machine_word(code->x9, kStateRflagsOffset);
+                    if (generic_deferred_loop_flags ||
+                        generic_has_deferred_status_flags) {
+                        code->mov(code->x17, 0);
+                        store_machine_word(
+                            code->x17, kStateDeferredFlagsMetaOffset);
+                    }
                     generic_rflags_live_in_x9 = true;
                 };
                 const auto emit_inline_flags_addsub = [&](const bool is_sub,
@@ -14867,21 +19012,20 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                     }
 
-                    code->cset(code->x13,
-                               is_sub ? Xbyak_aarch64::CC : Xbyak_aarch64::CS);
-                    code->cset(code->x14, Xbyak_aarch64::EQ);
-                    code->cset(code->x15, Xbyak_aarch64::MI);
-                    code->cset(code->x17, Xbyak_aarch64::VS);
-
                     if (preserve_cf) {
                         code->mov(code->x13, 0);
+                    } else {
+                        code->cset(
+                            code->x13,
+                            is_sub ? Xbyak_aarch64::CC
+                                   : Xbyak_aarch64::CS);
                     }
-                    EmitAppendStatusBit(
-                        *code, code->x13, code->x14, kZfBit);
-                    EmitAppendStatusBit(
-                        *code, code->x13, code->x15, kSfBit);
-                    EmitAppendStatusBit(
-                        *code, code->x13, code->x17, kOfBit);
+                    code->cset(code->x14, Xbyak_aarch64::EQ);
+                    code->bfi(code->x13, code->x14, kZfBit, 1);
+                    code->cset(code->x14, Xbyak_aarch64::MI);
+                    code->bfi(code->x13, code->x14, kSfBit, 1);
+                    code->cset(code->x14, Xbyak_aarch64::VS);
+                    code->bfi(code->x13, code->x14, kOfBit, 1);
 
                     code->eor(code->x14, code->x10, code->x11);
                     code->eor(code->x14, code->x14, code->x12);
@@ -14889,15 +19033,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->lsl(code->x14, code->x14, kAfBit);
                     code->orr(code->x13, code->x13, code->x14);
 
-                    code->lsr(code->x17, code->x12, 4);
-                    code->eor(code->x15, code->x12, code->x17);
-                    code->lsr(code->x17, code->x15, 2);
-                    code->eor(code->x15, code->x15, code->x17);
-                    code->lsr(code->x17, code->x15, 1);
-                    code->eor(code->x15, code->x15, code->x17);
-                    code->ubfx(code->x15, code->x15, 0, 1);
-                    code->mov(code->x17, 1);
-                    code->eor(code->x15, code->x15, code->x17);
+                    code->eor(
+                        code->w15, code->w12, code->w12,
+                        Xbyak_aarch64::LSR, 4);
+                    code->and_(code->w15, code->w15, 0xf);
+                    code->mov(code->w17, 0x9669);
+                    code->lsrv(code->w15, code->w17, code->w15);
+                    code->and_(code->w15, code->w15, 1);
                     code->lsl(code->x15, code->x15, kPfBit);
                     code->orr(code->x13, code->x13, code->x15);
 
@@ -14905,6 +19047,93 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         ? kArithmeticStatusBits & ~(std::uint64_t{1} << kCfBit)
                         : kArithmeticStatusBits;
                     publish_inline_status(affected_bits);
+                };
+                const auto emit_deferred_addsub_immediate_flags =
+                    [&](const LsxDecodedOp& ir, const bool is_sub) {
+                    const std::uint32_t size_bits = ir.operands[0].size;
+                    if (size_bits == 32) {
+                        if (is_sub) {
+                            code->subs(code->w17, code->w10, code->w11);
+                        } else {
+                            code->adds(code->w17, code->w10, code->w11);
+                        }
+                    } else {
+                        if (is_sub) {
+                            code->subs(code->x17, code->x10, code->x11);
+                        } else {
+                            code->adds(code->x17, code->x10, code->x11);
+                        }
+                    }
+                    code->cset(
+                        code->x13,
+                        is_sub ? Xbyak_aarch64::CC : Xbyak_aarch64::CS);
+                    load_machine_word(code->x14, kStateRflagsOffset);
+                    code->mov(code->x17, std::uint64_t{1} << kCfBit);
+                    code->bic(code->x14, code->x14, code->x17);
+                    code->orr(code->x14, code->x14, code->x13);
+                    store_machine_word(code->x14, kStateRflagsOffset);
+
+                    store_machine_word(code->x10, kStateDeferredFlagsLhsOffset);
+                    const std::int64_t immediate =
+                        ir.operands[1].imm.is_signed
+                            ? ir.operands[1].imm.value.s
+                            : static_cast<std::int64_t>(
+                                  ir.operands[1].imm.value.u);
+                    code->mov(
+                        code->x13,
+                        PackDeferredFlagMeta(
+                            is_sub ? DeferredFlagKind::SubtractImmediate
+                                   : DeferredFlagKind::AddImmediate,
+                            size_bits, immediate));
+                    store_machine_word(
+                        code->x13, kStateDeferredFlagsMetaOffset);
+                    generic_rflags_live_in_x9 = false;
+                };
+                const auto emit_deferred_fault_addsub_flags =
+                    [&](const bool is_sub, const std::uint32_t size_bits) {
+                    store_machine_word(code->x10, kStateDeferredFlagsLhsOffset);
+                    store_machine_word(code->x11, kStateDeferredFlagsRhsOffset);
+                    code->mov(
+                        code->x13,
+                        PackDeferredFlagMeta(
+                            is_sub ? DeferredFlagKind::Subtraction
+                                   : DeferredFlagKind::Addition,
+                            size_bits));
+                    store_machine_word(
+                        code->x13, kStateDeferredFlagsMetaOffset);
+                    generic_rflags_live_in_x9 = false;
+                };
+                const auto emit_deferred_fault_logic_flags =
+                    [&](const std::uint32_t size_bits) {
+                    store_machine_word(code->x12, kStateDeferredFlagsLhsOffset);
+                    code->mov(
+                        code->x13,
+                        PackDeferredFlagMeta(
+                            DeferredFlagKind::Logical, size_bits));
+                    store_machine_word(
+                        code->x13, kStateDeferredFlagsMetaOffset);
+                    generic_rflags_live_in_x9 = false;
+                };
+                const auto emit_deferred_fused_compare_flags =
+                    [&](const LsxDecodedOp& compare) {
+                    if (static_cast<X86Mnemonic>(compare.mnemonic) ==
+                        X86_MNEMONIC_CMP) {
+                        emit_deferred_fault_addsub_flags(
+                            true, compare.operands[0].size);
+                    } else {
+                        emit_deferred_fault_logic_flags(
+                            compare.operands[0].size);
+                    }
+                };
+                const auto emit_deferred_fault_imul_flags = [&]() {
+                    store_machine_word(code->x14, kStateDeferredFlagsLhsOffset);
+                    code->mov(
+                        code->x13,
+                        PackDeferredFlagMeta(
+                            DeferredFlagKind::ImulOverflow, 0));
+                    store_machine_word(
+                        code->x13, kStateDeferredFlagsMetaOffset);
+                    generic_rflags_live_in_x9 = false;
                 };
                 const auto emit_inline_flags_logic = [&](const std::uint32_t size_bits,
                                                          const bool post_memory_write = false) {
@@ -14926,18 +19155,15 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->cset(code->x13, Xbyak_aarch64::EQ);
                     code->cset(code->x14, Xbyak_aarch64::MI);
                     code->lsl(code->x13, code->x13, kZfBit);
-                    code->lsl(code->x14, code->x14, kSfBit);
-                    code->orr(code->x13, code->x13, code->x14);
+                    code->bfi(code->x13, code->x14, kSfBit, 1);
 
-                    code->lsr(code->x17, code->x12, 4);
-                    code->eor(code->x15, code->x12, code->x17);
-                    code->lsr(code->x17, code->x15, 2);
-                    code->eor(code->x15, code->x15, code->x17);
-                    code->lsr(code->x17, code->x15, 1);
-                    code->eor(code->x15, code->x15, code->x17);
-                    code->ubfx(code->x15, code->x15, 0, 1);
-                    code->mov(code->x17, 1);
-                    code->eor(code->x15, code->x15, code->x17);
+                    code->eor(
+                        code->w15, code->w12, code->w12,
+                        Xbyak_aarch64::LSR, 4);
+                    code->and_(code->w15, code->w15, 0xf);
+                    code->mov(code->w17, 0x9669);
+                    code->lsrv(code->w15, code->w17, code->w15);
+                    code->and_(code->w15, code->w15, 1);
                     code->lsl(code->x15, code->x15, kPfBit);
                     code->orr(code->x13, code->x13, code->x15);
 
@@ -14958,17 +19184,132 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         *code, mnemonic, code->x9, code->x12, code->x10,
                         code->x11);
                 };
+                const auto emit_fused_compare_condition =
+                    [&](const X86Mnemonic branch_mnemonic,
+                        const LsxDecodedOp& compare,
+                        Xbyak_aarch64::Cond& condition) {
+                    const std::uint32_t width = compare.operands[0].size;
+                    if (width != 8 && width != 16 &&
+                        width != 32 && width != 64) {
+                        return false;
+                    }
+                    const bool logical =
+                        static_cast<X86Mnemonic>(compare.mnemonic) ==
+                        X86_MNEMONIC_TEST;
+                    if (logical) {
+                        if (width == 8 || width == 16) {
+                            code->lsl(code->w13, code->w12, 32u - width);
+                            code->cmp(code->w13, 0);
+                        } else if (width == 32) {
+                            code->cmp(code->w12, 0);
+                        } else {
+                            code->cmp(code->x12, 0);
+                        }
+                    } else if (width == 8 || width == 16) {
+                        code->lsl(code->w13, code->w10, 32u - width);
+                        code->lsl(code->w14, code->w11, 32u - width);
+                        code->cmp(code->w13, code->w14);
+                    } else if (width == 32) {
+                        code->cmp(code->w10, code->w11);
+                    } else {
+                        code->cmp(code->x10, code->x11);
+                    }
+
+                    condition = Xbyak_aarch64::EQ;
+                    switch (branch_mnemonic) {
+                    case X86_MNEMONIC_JB:
+                        condition = Xbyak_aarch64::CC;
+                        break;
+                    case X86_MNEMONIC_JBE:
+                        condition = Xbyak_aarch64::LS;
+                        break;
+                    case X86_MNEMONIC_JL:
+                        condition = Xbyak_aarch64::LT;
+                        break;
+                    case X86_MNEMONIC_JLE:
+                        condition = Xbyak_aarch64::LE;
+                        break;
+                    case X86_MNEMONIC_JNB:
+                        condition = Xbyak_aarch64::CS;
+                        break;
+                    case X86_MNEMONIC_JNBE:
+                        condition = Xbyak_aarch64::HI;
+                        break;
+                    case X86_MNEMONIC_JNL:
+                        condition = Xbyak_aarch64::GE;
+                        break;
+                    case X86_MNEMONIC_JNLE:
+                        condition = Xbyak_aarch64::GT;
+                        break;
+                    case X86_MNEMONIC_JNO:
+                        condition = Xbyak_aarch64::VC;
+                        break;
+                    case X86_MNEMONIC_JNS:
+                        condition = Xbyak_aarch64::PL;
+                        break;
+                    case X86_MNEMONIC_JNZ:
+                        condition = Xbyak_aarch64::NE;
+                        break;
+                    case X86_MNEMONIC_JO:
+                        condition = Xbyak_aarch64::VS;
+                        break;
+                    case X86_MNEMONIC_JS:
+                        condition = Xbyak_aarch64::MI;
+                        break;
+                    case X86_MNEMONIC_JZ:
+                        condition = Xbyak_aarch64::EQ;
+                        break;
+                    default:
+                        return false;
+                    }
+                    return true;
+                };
+                const auto inverted_condition =
+                    [](const Xbyak_aarch64::Cond condition) {
+                    return static_cast<Xbyak_aarch64::Cond>(
+                        static_cast<std::uint32_t>(condition) ^ 1u);
+                };
 
                 if (!generic_chain_abi) {
                     EmitNativeFrameEntry(*code, generic_frame_layout);
                 }
-                if (generic_has_faultable_memory_access) {
-                    code->add(code->x21, code->x19,
-                              kStateNativeFaultIrOffset);
+                // x21 is the async-signal-safe current fault descriptor.
+                // Every direct faultable access replaces it immediately before
+                // touching guest memory.
+                code->mov(code->x21, 0);
+                if (generic_relative_fault_publication_enabled) {
+                    EmitJitRelocatablePointer(
+                        *code,
+                        generic_has_local_backedge ? code->x27 : code->x22,
+                        reinterpret_cast<std::uint64_t>(
+                            generic_fault_publication_base));
                 }
                 emit_reload_register_caches();
+                for (std::size_t descriptor_index = 0;
+                     descriptor_index < generic_poll_fault_descriptor_count;
+                     ++descriptor_index) {
+                    EmitJitRelocatablePointer(
+                        *code,
+                        XReg(static_cast<std::uint32_t>(
+                            25u + descriptor_index)),
+                        reinterpret_cast<std::uint64_t>(
+                            generic_poll_fault_descriptors[
+                                descriptor_index]));
+                }
                 if (generic_has_local_backedge) {
-                    code->mov(code->x22, 1024);
+                    const std::uint32_t loop_safepoint_period =
+                        generic_read_only_poll_loop
+                            ? kTieredPollingLoopSafepointPeriod
+                            : compilation_tier == LocalJitTier::Tier1
+                            ? kTier1LoopSafepointPeriod
+                            : (compilation_tier == LocalJitTier::Tier0 &&
+                                       TieredJitEnabled()
+                                   ? kTier0PromotionLoopSamplePeriod
+                                   : kTieredLoopSafepointPeriod);
+                    code->mov(code->x22, loop_safepoint_period);
+                }
+                if (generic_strong_memory_sequence_has_write) {
+                    code->dmb(Xbyak_aarch64::ISHST);
                 }
                 bool emitted = true;
                 std::uint64_t emitted_simd_fast = 0;
@@ -14997,7 +19338,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         *code, code->x16,
                         reinterpret_cast<std::uint64_t>(
                             &ExecuteNativeScalarSemanticInstruction));
+                    emit_sync_native_edge_phase();
                     code->blr(code->x16);
+                    emit_reload_native_edge_phase();
                     emit_reload_register_caches();
                     Xbyak_aarch64::Label semantic_continue;
                     code->cbz(code->x0, semantic_continue);
@@ -15012,6 +19355,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                      emitted && i < generic_scalar_instruction_count; ++i) {
                     if (generic_local_backedge_index == i) {
                         code->L(local_loop_body);
+                        generic_vector_half_known_zero.fill(false);
                     }
                     const LsxDecodedOp& ir = block.instructions[i];
                     const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
@@ -15019,17 +19363,66 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     if (const TieredGuardEmission* const guard =
                             tiered_guard_for_instruction(i);
                         guard != nullptr) {
-                        emitted = emit_condition_value(mnemonic);
+                        const bool fused_compare =
+                            i != 0 &&
+                            generic_fused_compare_branch[i - 1u] == 1;
+                        Xbyak_aarch64::Label hot_path;
+                        if (fused_compare) {
+                            Xbyak_aarch64::Cond condition =
+                                Xbyak_aarch64::EQ;
+                            emitted = emit_fused_compare_condition(
+                                mnemonic, block.instructions[i - 1u],
+                                condition);
+                            if (emitted) {
+                                code->b(
+                                    guard->hot_path_is_taken
+                                        ? condition
+                                        : inverted_condition(condition),
+                                    hot_path);
+                            }
+                        } else {
+                            emitted = emit_condition_value(mnemonic);
+                            if (emitted) {
+                                if (guard->hot_path_is_taken) {
+                                    code->cbnz(code->x12, hot_path);
+                                } else {
+                                    code->cbz(code->x12, hot_path);
+                                }
+                            }
+                        }
                         if (!emitted) {
                             continue;
                         }
-                        Xbyak_aarch64::Label hot_path;
-                        if (guard->hot_path_is_taken) {
-                            code->cbnz(code->x12, hot_path);
-                        } else {
-                            code->cbz(code->x12, hot_path);
+                        if (fused_compare) {
+                            emit_deferred_fused_compare_flags(
+                                block.instructions[i - 1u]);
+                            emit_materialize_deferred_flags(true);
                         }
-                        emit_epilogue_return(guard->cold_target);
+                        if (guard->deopt_context == nullptr) {
+                            emit_epilogue_return(guard->cold_target);
+                        } else {
+                            // A cold guard is an explicit deoptimization
+                            // boundary. Publish every dirty architectural
+                            // register before the runtime observes it, then
+                            // restore caller-clobbered caches so the common
+                            // epilogue cannot write stale host registers back.
+                            emit_flush_register_caches();
+                            emit_sync_native_edge_phase();
+                            code->mov(code->x0, code->x19);
+                            EmitJitRelocatablePointer(
+                                *code, code->x1,
+                                reinterpret_cast<std::uint64_t>(
+                                    guard->deopt_context));
+                            EmitJitRelocatablePointer(
+                                *code, code->x16,
+                                reinterpret_cast<std::uint64_t>(
+                                    &ExecuteTieredGuardDeopt));
+                            code->blr(code->x16);
+                            emit_reload_native_edge_phase();
+                            emit_reload_register_caches(true);
+                            code->mov(code->x20, code->x0);
+                            emit_epilogue_return_reg(code->x20);
+                        }
                         code->L(hot_path);
                         continue;
                     }
@@ -15407,7 +19800,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 reinterpret_cast<std::uint64_t>(
                                     locked_memory ? &DispatchCompareExchangeAtomicAbi
                                                   : &DispatchCompareExchangeValueAbi));
+                            emit_sync_native_edge_phase();
                             code->blr(code->x16);
+                            emit_reload_native_edge_phase();
                             emit_reload_register_caches();
                         }
                         continue;
@@ -15595,27 +19990,232 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         const std::uint32_t scalar_bytes = is_double ? 8u : 4u;
                         const bool store_form = ir.operand_count >= 2 &&
                             ir.operands[0].type == X86_OPERAND_TYPE_MEMORY;
-                        if (store_form) {
+                        if (tiered_vector_residency && store_form &&
+                            ir.operand_count == 2) {
                             std::uint32_t source_offset = 0;
                             std::uint32_t source_width = 0;
-                            emitted = ir.operand_count == 2 &&
-                                      vector_register_state_offset(
-                                          ir.operands[1].reg.value, source_offset,
-                                          source_width) && source_width == 16 &&
-                                      emit_memory_address(ir, ir.operands[0], code->x14);
-                            if (emitted) {
-                                emit_publish_fault_ir(ir);
-                                EmitMachineScalarToGuest(
-                                    *code, code->x19, source_offset,
-                                    code->x14, scalar_bytes);
+                            bool direct_ready =
+                                vector_register_state_offset(
+                                    ir.operands[1].reg.value,
+                                    source_offset, source_width) &&
+                                source_width == 16;
+                            const int source_cache =
+                                direct_ready
+                                    ? cached_vector_half_host_index(
+                                          source_offset)
+                                    : -1;
+                            direct_ready =
+                                direct_ready && source_cache >= 0;
+                            if (direct_ready) {
+                                direct_ready = emit_memory_address(
+                                    ir, ir.operands[0], code->x14);
                             }
-                        } else {
+                            if (direct_ready) {
+                                emit_publish_fault_ir_fast(ir);
+                                if (is_double) {
+                                    code->str(
+                                        DReg{static_cast<std::uint32_t>(
+                                            source_cache)},
+                                        Xbyak_aarch64::ptr(code->x14));
+                                } else {
+                                    code->str(
+                                        SReg{static_cast<std::uint32_t>(
+                                            source_cache)},
+                                        Xbyak_aarch64::ptr(code->x14));
+                                }
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+                        }
+                        if (tiered_vector_residency && !store_form &&
+                            ir.operand_count >= 2 &&
+                            IsXmmOperand(ir.operands[0])) {
                             std::uint32_t destination_offset = 0;
                             std::uint32_t destination_width = 0;
+                            bool direct_ready =
+                                vector_register_state_offset(
+                                    ir.operands[0].reg.value,
+                                    destination_offset,
+                                    destination_width) &&
+                                destination_width == 16;
+                            const int destination_cache =
+                                direct_ready
+                                    ? cached_vector_half_host_index(
+                                          destination_offset)
+                                    : -1;
+                            direct_ready =
+                                direct_ready && destination_cache >= 0;
+
+                            const bool vex_memory_zero_merge =
+                                vex_form && ir.operand_count == 2;
+                            int merge_cache = -1;
+                            if (direct_ready &&
+                                !vex_memory_zero_merge) {
+                                const auto& merge_operand =
+                                    vex_form ? ir.operands[1]
+                                             : ir.operands[0];
+                                std::uint32_t merge_offset = 0;
+                                std::uint32_t merge_width = 0;
+                                direct_ready =
+                                    merge_operand.type ==
+                                        X86_OPERAND_TYPE_REGISTER &&
+                                    vector_register_state_offset(
+                                        merge_operand.reg.value,
+                                        merge_offset, merge_width) &&
+                                    merge_width == 16;
+                                merge_cache =
+                                    direct_ready
+                                        ? cached_vector_half_host_index(
+                                              merge_offset)
+                                        : -1;
+                                direct_ready =
+                                    direct_ready && merge_cache >= 0;
+                            }
+
+                            const LsxOperandRecord& scalar_source =
+                                ir.operands[ir.operand_count - 1];
+                            int source_cache = -1;
+                            bool source_memory = false;
+                            if (direct_ready &&
+                                scalar_source.type ==
+                                    X86_OPERAND_TYPE_REGISTER) {
+                                std::uint32_t source_offset = 0;
+                                std::uint32_t source_width = 0;
+                                direct_ready =
+                                    vector_register_state_offset(
+                                        scalar_source.reg.value,
+                                        source_offset, source_width) &&
+                                    source_width == 16;
+                                source_cache =
+                                    direct_ready
+                                        ? cached_vector_half_host_index(
+                                              source_offset)
+                                        : -1;
+                                direct_ready =
+                                    direct_ready && source_cache >= 0;
+                            } else if (direct_ready) {
+                                source_memory =
+                                    scalar_source.type ==
+                                        X86_OPERAND_TYPE_MEMORY &&
+                                    scalar_source.size ==
+                                        (is_double ? 64u : 32u);
+                                direct_ready = source_memory;
+                            }
+                            if (direct_ready && source_memory) {
+                                direct_ready = emit_memory_address(
+                                    ir, scalar_source, code->x14);
+                                if (direct_ready) {
+                                    emit_publish_fault_ir_fast(ir);
+                                    if (is_double) {
+                                        code->ldr(
+                                            code->d0,
+                                            Xbyak_aarch64::ptr(code->x14));
+                                    } else {
+                                        code->ldr(
+                                            code->s0,
+                                            Xbyak_aarch64::ptr(code->x14));
+                                    }
+                                }
+                            } else if (direct_ready) {
+                                code->orr(
+                                    code->v0.b16,
+                                    VReg16B{
+                                        static_cast<std::uint32_t>(
+                                            source_cache)},
+                                    VReg16B{
+                                        static_cast<std::uint32_t>(
+                                            source_cache)});
+                            }
+                            if (direct_ready) {
+                                const std::uint32_t destination_host =
+                                    static_cast<std::uint32_t>(
+                                        destination_cache);
+                                if (vex_memory_zero_merge) {
+                                    code->movi(
+                                        VReg16B{destination_host}, 0);
+                                } else if (
+                                    destination_cache != merge_cache) {
+                                    code->orr(
+                                        VReg16B{destination_host},
+                                        VReg16B{
+                                            static_cast<std::uint32_t>(
+                                                merge_cache)},
+                                        VReg16B{
+                                            static_cast<std::uint32_t>(
+                                                merge_cache)});
+                                }
+                                if (is_double) {
+                                    code->ins(
+                                        VReg2D{destination_host}[0],
+                                        code->v0.d2[0]);
+                                } else {
+                                    code->ins(
+                                        VReg4S{destination_host}[0],
+                                        code->v0.s4[0]);
+                                }
+                                if (!cached_vector_half_is_writeback(
+                                        destination_cache)) {
+                                    code->str(
+                                        QReg{destination_host},
+                                        Xbyak_aarch64::ptr(
+                                            code->x19,
+                                            destination_offset));
+                                }
+                                mark_cached_vector_half_written(
+                                    destination_cache);
+                                if (vex_form) {
+                                    emit_zero_vector_upper_half(
+                                        destination_offset);
+                                }
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+                        }
+                        if (store_form) {
+                            std::uint32_t source_width = 0;
+                            emitted = ir.operand_count == 2 &&
+                                      emit_vector_load_pair(
+                                          ir, ir.operands[1], code->q0,
+                                          code->q1, source_width) &&
+                                      source_width == 16 &&
+                                      emit_memory_address(ir, ir.operands[0], code->x14);
+                            if (emitted) {
+                                emit_publish_fault_ir_fast(ir);
+                                if (is_double) {
+                                    code->umov(code->x10, code->v0.d2[0]);
+                                    code->str(
+                                        code->x10,
+                                        Xbyak_aarch64::ptr(code->x14));
+                                } else {
+                                    code->umov(code->w10, code->v0.s4[0]);
+                                    code->str(
+                                        code->w10,
+                                        Xbyak_aarch64::ptr(code->x14));
+                                }
+                            }
+                        } else {
                             emitted = ir.operand_count >= 2 &&
-                                      vector_register_state_offset(
-                                          ir.operands[0].reg.value, destination_offset,
-                                          destination_width) && destination_width == 16;
+                                      IsXmmOperand(ir.operands[0]);
+                            if (!emitted) {
+                                continue;
+                            }
+                            std::uint32_t merge_width = 0;
+                            if (vex_form && ir.operand_count == 3) {
+                                emitted = emit_vector_load_pair(
+                                              ir, ir.operands[1], code->q4,
+                                              code->q5, merge_width) &&
+                                          merge_width == 16;
+                            } else if (vex_form) {
+                                clear_vector_result();
+                                code->orr(
+                                    code->v4.b16, code->v0.b16,
+                                    code->v0.b16);
+                            } else {
+                                emitted = emit_vector_load_pair(
+                                              ir, ir.operands[0], code->q4,
+                                              code->q5, merge_width) &&
+                                          merge_width == 16;
+                            }
                             if (!emitted) {
                                 continue;
                             }
@@ -15624,61 +20224,36 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             if (scalar_source.type == X86_OPERAND_TYPE_MEMORY) {
                                 emitted = emit_memory_address(ir, scalar_source, code->x14);
                                 if (emitted) {
-                                    emit_publish_fault_ir(ir);
-                                    EmitLoadScalarWord(
-                                        *code, code->x14, scalar_bytes);
-                                    clear_vector_scratch();
-                                    code->str(code->q31,
-                                              Xbyak_aarch64::ptr(code->x19,
-                                                                destination_offset));
-                                }
-                            } else {
-                                std::uint32_t scalar_source_offset = 0;
-                                std::uint32_t scalar_source_width = 0;
-                                emitted = vector_register_state_offset(
-                                              scalar_source.reg.value,
-                                              scalar_source_offset,
-                                              scalar_source_width) &&
-                                          scalar_source_width == 16;
-                                if (emitted) {
-                                    code->add(code->x15, code->x19,
-                                              scalar_source_offset);
-                                    EmitLoadScalarWord(
-                                        *code, code->x15, scalar_bytes);
-                                    if (vex_form && ir.operand_count == 3) {
-                                        std::uint32_t merge_offset = 0;
-                                        std::uint32_t merge_width = 0;
-                                        emitted = vector_register_state_offset(
-                                                      ir.operands[1].reg.value,
-                                                      merge_offset, merge_width) &&
-                                                  merge_width == 16;
-                                        if (emitted) {
-                                            code->ldr(code->q0,
-                                                      Xbyak_aarch64::ptr(code->x19,
-                                                                        merge_offset));
-                                            code->str(code->q0,
-                                                      Xbyak_aarch64::ptr(code->x19,
-                                                                        destination_offset));
-                                        }
+                                    emit_publish_fault_ir_fast(ir);
+                                    if (is_double) {
+                                        code->ldr(
+                                            code->d0,
+                                            Xbyak_aarch64::ptr(code->x14));
+                                    } else {
+                                        code->ldr(
+                                            code->s0,
+                                            Xbyak_aarch64::ptr(code->x14));
                                     }
                                 }
+                            } else {
+                                std::uint32_t scalar_source_width = 0;
+                                emitted = emit_vector_load_pair(
+                                              ir, scalar_source, code->q0,
+                                              code->q1,
+                                              scalar_source_width) &&
+                                          scalar_source_width == 16;
                             }
                             if (emitted) {
-                                if (scalar_bytes == 4) {
-                                    code->str(code->w10,
-                                              Xbyak_aarch64::ptr(code->x19,
-                                                                destination_offset));
+                                if (is_double) {
+                                    code->ins(
+                                        code->v4.d2[0], code->v0.d2[0]);
                                 } else {
-                                    code->str(code->x10,
-                                              Xbyak_aarch64::ptr(code->x19,
-                                                                destination_offset));
+                                    code->ins(
+                                        code->v4.s4[0], code->v0.s4[0]);
                                 }
-                                if (vex_form) {
-                                    clear_vector_scratch();
-                                    code->str(code->q31,
-                                              Xbyak_aarch64::ptr(code->x19,
-                                                                destination_offset + 16));
-                                }
+                                emitted = emit_vector_store_pair(
+                                    ir, ir.operands[0], code->q4,
+                                    code->q5, 16);
                             }
                         }
                         emitted_simd_fast += emitted ? 1u : 0u;
@@ -15702,6 +20277,170 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                       lhs_width) &&
                                   destination_width == 16 && lhs_width == 16;
                         if (!emitted) {
+                            continue;
+                        }
+
+                        if (tiered_vector_residency) {
+                            const int destination_cache =
+                                cached_vector_half_host_index(
+                                    destination_offset);
+                            const int lhs_cache =
+                                cached_vector_half_host_index(lhs_offset);
+                            const auto& tiered_rhs =
+                                ir.operands[rhs_index];
+                            int rhs_cache = -1;
+                            bool rhs_memory = false;
+                            bool direct_ready =
+                                destination_cache >= 0 && lhs_cache >= 0;
+                            if (direct_ready &&
+                                tiered_rhs.type ==
+                                    X86_OPERAND_TYPE_REGISTER) {
+                                std::uint32_t rhs_offset = 0;
+                                std::uint32_t rhs_width = 0;
+                                direct_ready =
+                                    vector_register_state_offset(
+                                        tiered_rhs.reg.value, rhs_offset,
+                                        rhs_width) &&
+                                    rhs_width == 16;
+                                rhs_cache =
+                                    direct_ready
+                                        ? cached_vector_half_host_index(
+                                              rhs_offset)
+                                        : -1;
+                                direct_ready = rhs_cache >= 0;
+                            } else if (direct_ready) {
+                                rhs_memory =
+                                    tiered_rhs.type ==
+                                        X86_OPERAND_TYPE_MEMORY &&
+                                    tiered_rhs.size == 32;
+                                direct_ready = rhs_memory;
+                            }
+                            if (direct_ready && rhs_memory) {
+                                direct_ready = emit_memory_address(
+                                    ir, tiered_rhs, code->x14);
+                                if (direct_ready) {
+                                    emit_publish_fault_ir_fast(ir);
+                                    code->ldr(
+                                        code->s2,
+                                        Xbyak_aarch64::ptr(code->x14));
+                                }
+                            }
+                            if (direct_ready) {
+                                const std::uint32_t destination_host =
+                                    static_cast<std::uint32_t>(
+                                        destination_cache);
+                                const std::uint32_t lhs_host =
+                                    static_cast<std::uint32_t>(lhs_cache);
+                                const std::uint32_t rhs_host =
+                                    rhs_cache >= 0
+                                        ? static_cast<std::uint32_t>(
+                                              rhs_cache)
+                                        : 2u;
+                                const auto emit_operation =
+                                    [&](const SReg& destination,
+                                        const SReg& lhs,
+                                        const SReg& rhs) {
+                                        if (mnemonic ==
+                                                X86_MNEMONIC_ADDSS ||
+                                            mnemonic ==
+                                                X86_MNEMONIC_VADDSS) {
+                                            code->fadd(
+                                                destination, lhs, rhs);
+                                        } else if (
+                                            mnemonic ==
+                                                X86_MNEMONIC_SUBSS ||
+                                            mnemonic ==
+                                                X86_MNEMONIC_VSUBSS) {
+                                            code->fsub(
+                                                destination, lhs, rhs);
+                                        } else {
+                                            code->fmul(
+                                                destination, lhs, rhs);
+                                        }
+                                    };
+                                emit_operation(
+                                    code->s0, SReg{lhs_host},
+                                    SReg{rhs_host});
+                                if (destination_host != lhs_host) {
+                                    code->orr(
+                                        VReg16B{destination_host},
+                                        VReg16B{lhs_host},
+                                        VReg16B{lhs_host});
+                                }
+                                // AArch64 scalar FP writes do not provide
+                                // the x86 scalar-SIMD merge semantics.  Keep
+                                // lanes 1..3 from the VEX merge source (or
+                                // the legacy destination) and replace only
+                                // lane zero.
+                                code->ins(
+                                    VReg4S{destination_host}[0],
+                                    code->v0.s4[0]);
+                                if (!cached_vector_half_is_writeback(
+                                        destination_cache)) {
+                                    code->str(
+                                        QReg{destination_host},
+                                        Xbyak_aarch64::ptr(
+                                            code->x19,
+                                            destination_offset));
+                                }
+                                mark_cached_vector_half_written(
+                                    destination_cache);
+                                if (vex) {
+                                    emit_zero_vector_upper_half(
+                                        destination_offset);
+                                }
+                                emitted = true;
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+
+                            std::uint32_t lhs_pair_width = 0;
+                            emitted = emit_vector_load_pair(
+                                          ir, ir.operands[lhs_index],
+                                          code->q4, code->q5,
+                                          lhs_pair_width) &&
+                                      lhs_pair_width == 16;
+                            if (emitted &&
+                                tiered_rhs.type ==
+                                    X86_OPERAND_TYPE_REGISTER) {
+                                std::uint32_t rhs_pair_width = 0;
+                                emitted = emit_vector_load_pair(
+                                              ir, tiered_rhs, code->q2,
+                                              code->q3, rhs_pair_width) &&
+                                          rhs_pair_width == 16;
+                            } else if (emitted) {
+                                emitted =
+                                    tiered_rhs.type ==
+                                        X86_OPERAND_TYPE_MEMORY &&
+                                    tiered_rhs.size == 32 &&
+                                    emit_memory_address(
+                                        ir, tiered_rhs, code->x14);
+                                if (emitted) {
+                                    emit_publish_fault_ir_fast(ir);
+                                    code->ldr(
+                                        code->s2,
+                                        Xbyak_aarch64::ptr(code->x14));
+                                }
+                            }
+                            if (!emitted) {
+                                continue;
+                            }
+
+                            if (mnemonic == X86_MNEMONIC_ADDSS ||
+                                mnemonic == X86_MNEMONIC_VADDSS) {
+                                code->fadd(code->s0, code->s4, code->s2);
+                            } else if (
+                                mnemonic == X86_MNEMONIC_SUBSS ||
+                                mnemonic == X86_MNEMONIC_VSUBSS) {
+                                code->fsub(code->s0, code->s4, code->s2);
+                            } else {
+                                code->fmul(code->s0, code->s4, code->s2);
+                            }
+                            code->ins(code->v4.s4[0], code->v0.s4[0]);
+                            emitted = emit_vector_store_pair(
+                                ir, ir.operands[0], code->q4, code->q5,
+                                16);
+                            emitted_simd_fast += emitted ? 1u : 0u;
                             continue;
                         }
 
@@ -15747,10 +20486,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->str(code->q4,
                                   Xbyak_aarch64::ptr(code->x19, destination_offset));
                         if (vex) {
-                            clear_vector_scratch();
-                            code->str(code->q31,
-                                      Xbyak_aarch64::ptr(code->x19,
-                                                        destination_offset + 16));
+                            emit_zero_vector_upper_half(destination_offset);
                         }
                         ++emitted_simd_fast;
                         continue;
@@ -16135,10 +20871,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->str(code->q4,
                                   Xbyak_aarch64::ptr(code->x19, destination_offset));
                         if (vex) {
-                            clear_vector_scratch();
-                            code->str(code->q31,
-                                      Xbyak_aarch64::ptr(code->x19,
-                                                        destination_offset + 16));
+                            emit_zero_vector_upper_half(destination_offset);
                         }
                         ++emitted_simd_fast;
                         continue;
@@ -16181,10 +20914,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->str(code->q4,
                                   Xbyak_aarch64::ptr(code->x19, destination_offset));
                         if (vex) {
-                            clear_vector_scratch();
-                            code->str(code->q31,
-                                      Xbyak_aarch64::ptr(code->x19,
-                                                        destination_offset + 16));
+                            emit_zero_vector_upper_half(destination_offset);
                         }
                         ++emitted_simd_fast;
                         continue;
@@ -16254,10 +20984,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->str(code->q4,
                                   Xbyak_aarch64::ptr(code->x19, destination_offset));
                         if (vex) {
-                            clear_vector_scratch();
-                            code->str(code->q31,
-                                      Xbyak_aarch64::ptr(code->x19,
-                                                        destination_offset + 16));
+                            emit_zero_vector_upper_half(destination_offset);
                         }
                         ++emitted_simd_fast;
                         continue;
@@ -16320,9 +21047,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->str(code->q4,
                                   Xbyak_aarch64::ptr(code->x19, destination_offset));
                         if (mnemonic == X86_MNEMONIC_VINSERTPS) {
-                            code->str(code->q31,
-                                      Xbyak_aarch64::ptr(code->x19,
-                                                        destination_offset + 16));
+                            emit_zero_vector_upper_half(destination_offset);
                         }
                         ++emitted_simd_fast;
                         continue;
@@ -16436,18 +21161,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                                  mnemonic == X86_MNEMONIC_VDIVPD;
                         const std::uint8_t lhs_index = vex ? 1u : 0u;
                         const std::uint8_t rhs_index = vex ? 2u : 1u;
-                        std::uint32_t lhs_width = 0;
-                        std::uint32_t rhs_width = 0;
-                        emitted = emit_vector_load_pair(ir, ir.operands[lhs_index],
-                                                        code->q0, code->q1, lhs_width) &&
-                                  emit_vector_load_pair(ir, ir.operands[rhs_index],
-                                                        code->q2, code->q3, rhs_width) &&
-                                  lhs_width == rhs_width &&
-                                  (lhs_width == 16 || lhs_width == 32);
-                        if (!emitted) {
-                            continue;
-                        }
-
                         const bool subtract = mnemonic == X86_MNEMONIC_SUBPS ||
                                               mnemonic == X86_MNEMONIC_SUBPD ||
                                               mnemonic == X86_MNEMONIC_VSUBPS ||
@@ -16468,8 +21181,144 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             else if (divide) code->fdiv(dst, lhs, rhs);
                             else code->fadd(dst, lhs, rhs);
                         };
+                        const auto emit_float_operation = [&](const VReg4S& dst,
+                                                              const VReg4S& lhs,
+                                                              const VReg4S& rhs) {
+                            if (subtract) code->fsub(dst, lhs, rhs);
+                            else if (multiply) code->fmul(dst, lhs, rhs);
+                            else if (divide) code->fdiv(dst, lhs, rhs);
+                            else code->fadd(dst, lhs, rhs);
+                        };
+                        if (tiered_vector_residency &&
+                            ir.operands[0].type ==
+                                X86_OPERAND_TYPE_REGISTER &&
+                            ir.operands[lhs_index].type ==
+                                X86_OPERAND_TYPE_REGISTER) {
+                            std::uint32_t destination_offset = 0;
+                            std::uint32_t destination_width = 0;
+                            std::uint32_t lhs_offset = 0;
+                            std::uint32_t lhs_cached_width = 0;
+                            bool direct_ready =
+                                vector_register_state_offset(
+                                    ir.operands[0].reg.value,
+                                    destination_offset,
+                                    destination_width) &&
+                                vector_register_state_offset(
+                                    ir.operands[lhs_index].reg.value,
+                                    lhs_offset, lhs_cached_width) &&
+                                destination_width == 16 &&
+                                lhs_cached_width == 16;
+                            const int destination_cache =
+                                direct_ready
+                                    ? cached_vector_half_host_index(
+                                          destination_offset)
+                                    : -1;
+                            const int lhs_cache =
+                                direct_ready
+                                    ? cached_vector_half_host_index(lhs_offset)
+                                    : -1;
+                            int rhs_cache = -1;
+                            bool rhs_memory = false;
+                            if (direct_ready &&
+                                ir.operands[rhs_index].type ==
+                                    X86_OPERAND_TYPE_REGISTER) {
+                                std::uint32_t rhs_offset = 0;
+                                std::uint32_t rhs_cached_width = 0;
+                                direct_ready =
+                                    vector_register_state_offset(
+                                        ir.operands[rhs_index].reg.value,
+                                        rhs_offset, rhs_cached_width) &&
+                                    rhs_cached_width == 16;
+                                rhs_cache =
+                                    direct_ready
+                                        ? cached_vector_half_host_index(
+                                              rhs_offset)
+                                        : -1;
+                                direct_ready = rhs_cache >= 0;
+                            } else if (direct_ready) {
+                                rhs_memory =
+                                    ir.operands[rhs_index].type ==
+                                        X86_OPERAND_TYPE_MEMORY &&
+                                    ir.operands[rhs_index].size == 128;
+                                direct_ready = rhs_memory;
+                            }
+                            direct_ready =
+                                direct_ready && destination_cache >= 0 &&
+                                lhs_cache >= 0;
+                            if (direct_ready && rhs_memory) {
+                                direct_ready = emit_memory_address(
+                                    ir, ir.operands[rhs_index], code->x14);
+                                if (direct_ready) {
+                                    emit_publish_fault_ir_fast(ir);
+                                    code->ldr(
+                                        code->q2,
+                                        Xbyak_aarch64::ptr(code->x14));
+                                }
+                            }
+                            if (direct_ready) {
+                                const std::uint32_t destination_host =
+                                    static_cast<std::uint32_t>(
+                                        destination_cache);
+                                const std::uint32_t lhs_host =
+                                    static_cast<std::uint32_t>(lhs_cache);
+                                const std::uint32_t rhs_host =
+                                    rhs_cache >= 0
+                                        ? static_cast<std::uint32_t>(
+                                              rhs_cache)
+                                        : 2u;
+                                if (double_lane) {
+                                    emit_double_operation(
+                                        VReg2D{destination_host},
+                                        VReg2D{lhs_host},
+                                        VReg2D{rhs_host});
+                                } else {
+                                    emit_float_operation(
+                                        VReg4S{destination_host},
+                                        VReg4S{lhs_host},
+                                        VReg4S{rhs_host});
+                                }
+                                if (!cached_vector_half_is_writeback(
+                                        destination_cache)) {
+                                    code->str(
+                                        QReg{destination_host},
+                                        Xbyak_aarch64::ptr(
+                                            code->x19,
+                                            destination_offset));
+                                }
+                                mark_cached_vector_half_written(
+                                    destination_cache);
+                                if (vex) {
+                                    emit_zero_vector_upper_half(
+                                        destination_offset);
+                                }
+                                emitted = true;
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+                        }
+                        std::uint32_t lhs_width = 0;
+                        std::uint32_t rhs_width = 0;
+                        emitted = emit_vector_load_pair(ir, ir.operands[lhs_index],
+                                                        code->q0, code->q1, lhs_width) &&
+                                  emit_vector_load_pair(ir, ir.operands[rhs_index],
+                                                        code->q2, code->q3, rhs_width) &&
+                                  lhs_width == rhs_width &&
+                                  (lhs_width == 16 || lhs_width == 32);
+                        if (!emitted) {
+                            continue;
+                        }
+
                         const auto emit_float_lane = [&](const VReg4S& lhs,
                                                          const VReg4S& rhs) {
+                            if (TieredJitEnabled()) {
+                                // SSE packed-single arithmetic is already
+                                // lane-wise binary32.  Keeping it in NEON
+                                // avoids eight widen/operate/narrow
+                                // instructions and also avoids double
+                                // rounding on the optimized tiers.
+                                emit_float_operation(lhs, lhs, rhs);
+                                return;
+                            }
                             code->fcvtl(code->v4.d2, VReg2S{lhs.getIdx()});
                             code->fcvtl2(code->v5.d2, lhs);
                             code->fcvtl(code->v6.d2, VReg2S{rhs.getIdx()});
@@ -16776,10 +21625,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->str(code->q4,
                                   Xbyak_aarch64::ptr(code->x19, destination_offset));
                         if (vex) {
-                            clear_vector_scratch();
-                            code->str(code->q31,
-                                      Xbyak_aarch64::ptr(code->x19,
-                                                        destination_offset + 16));
+                            emit_zero_vector_upper_half(destination_offset);
                         }
                         ++emitted_simd_fast;
                         continue;
@@ -19409,7 +24255,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             *code, code->x16,
                             reinterpret_cast<std::uint64_t>(
                                 &ExecuteNativeSimdSemanticInstruction));
+                        emit_sync_native_edge_phase();
                         code->blr(code->x16);
+                        emit_reload_native_edge_phase();
                         Xbyak_aarch64::Label simd_semantic_continue;
                         code->cbz(code->x0, simd_semantic_continue);
                         code->mov(code->x20, code->x0);
@@ -19425,10 +24273,21 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             generic_elide_status_flags[i] != 0;
                         if (status_is_dead) {
                             ++emitted_scalar_dead_flag_elisions;
+                            if (generic_has_deferred_status_flags) {
+                                code->mov(code->x17, 0);
+                                store_machine_word(
+                                    code->x17,
+                                    kStateDeferredFlagsMetaOffset);
+                            }
                         } else {
                             std::forward<decltype(emit_status)>(emit_status)();
                         }
                     };
+                    const DeferredFlagKind deferred_fault_recipe =
+                        i < generic_defer_fault_status_flags.size()
+                        ? static_cast<DeferredFlagKind>(
+                              generic_defer_fault_status_flags[i])
+                        : DeferredFlagKind::None;
                     const auto invoke_machine_helper = [&](const XReg& operand,
                                                            const std::uint32_t width,
                                                            const std::uint64_t mode,
@@ -19440,7 +24299,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         EmitJitRelocatablePointer(
                             *code, code->x16,
                             reinterpret_cast<std::uint64_t>(helper));
+                        emit_sync_native_edge_phase();
                         code->blr(code->x16);
+                        emit_reload_native_edge_phase();
                     };
                     const auto emit_unary_integer = [&]() -> std::optional<bool> {
                         if (mnemonic != X86_MNEMONIC_INC &&
@@ -19471,7 +24332,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     *code, code->x16,
                                     reinterpret_cast<std::uint64_t>(
                                         &AdjustAtomicMemoryByOne));
+                                emit_sync_native_edge_phase();
                                 code->blr(code->x16);
+                                emit_reload_native_edge_phase();
                                 emit_reload_register_caches();
                             };
                             if (!JitHostHasLseAtomics()) {
@@ -19491,10 +24354,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             std::uint64_t image_lo = 0;
                             std::uint64_t image_hi = 0;
                             if (JitOwnHostImageRange(image_lo, image_hi)) {
-                                code->mov(code->x10, image_lo);
+                                EmitJitRelocatablePointer(
+                                    *code, code->x10, image_lo);
                                 code->cmp(code->x14, code->x10);
                                 code->blo(direct_increment);
-                                code->mov(code->x11, image_hi);
+                                EmitJitRelocatablePointer(
+                                    *code, code->x11, image_hi);
                                 code->cmp(code->x14, code->x11);
                                 code->bhs(direct_increment);
                                 code->b(slow_increment);
@@ -19557,10 +24422,35 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         const bool written = emit_write_operand(
                             ir, destination, code->x12);
                         if (written) {
-                            emit_inline_flags_addsub(
-                                decrements, destination.size,
-                                mnemonic != X86_MNEMONIC_NEG,
-                                destination.type == X86_OPERAND_TYPE_MEMORY);
+                            if (generic_deferred_loop_flags &&
+                                i == generic_deferred_loop_dec_index) {
+                                store_machine_word(
+                                    source, kStateDeferredFlagsLhsOffset);
+                                code->mov(
+                                    code->x13,
+                                    PackDeferredFlagMeta(
+                                        DeferredFlagKind::Decrement,
+                                        destination.size));
+                                store_machine_word(
+                                    code->x13,
+                                    kStateDeferredFlagsMetaOffset);
+                            } else if (
+                                i < generic_elide_status_flags.size() &&
+                                generic_elide_status_flags[i] != 0) {
+                                ++emitted_scalar_dead_flag_elisions;
+                                if (generic_has_deferred_status_flags) {
+                                    code->mov(code->x17, 0);
+                                    store_machine_word(
+                                        code->x17,
+                                        kStateDeferredFlagsMetaOffset);
+                                }
+                            } else {
+                                emit_inline_flags_addsub(
+                                    decrements, destination.size,
+                                    mnemonic != X86_MNEMONIC_NEG,
+                                    destination.type ==
+                                        X86_OPERAND_TYPE_MEMORY);
+                            }
                         }
                         return written;
                     };
@@ -19609,7 +24499,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(&ReadGuestTscAux));
+                            emit_sync_native_edge_phase();
                             code->blr(code->x16);
+                            emit_reload_native_edge_phase();
                             store_machine_word(code->x0, kStateRcxOffset);
                         }
                         break;
@@ -19661,9 +24553,16 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             code->bic(code->x12, code->x11, code->x10);
                             emitted = publish_x12_to_first_operand(ir);
                             if (emitted) {
-                                emit_required_status([&] {
-                                    emit_inline_flags_logic(ir.operands[0].size);
-                                });
+                                if (deferred_fault_recipe ==
+                                    DeferredFlagKind::Logical) {
+                                    emit_deferred_fault_logic_flags(
+                                        ir.operands[0].size);
+                                } else {
+                                    emit_required_status([&] {
+                                        emit_inline_flags_logic(
+                                            ir.operands[0].size);
+                                    });
+                                }
                             }
                         }
                         break;
@@ -19708,7 +24607,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(status_helper));
+                            emit_sync_native_edge_phase();
                             code->blr(code->x16);
+                            emit_reload_native_edge_phase();
                             emitted = emit_write_operand(
                                 ir, ir.operands[0], code->x20);
                         } else {
@@ -19735,7 +24636,32 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             }
                             emitted = emit_write_operand(ir, ir.operands[0], code->x12);
                             if (emitted) {
-                                emit_required_status([&] {
+                                const std::uint8_t deferred_addsub =
+                                    i <
+                                            generic_deferred_addsub_immediate_flags
+                                                .size()
+                                        ? generic_deferred_addsub_immediate_flags[
+                                              i]
+                                        : 0;
+                                if (deferred_addsub != 0) {
+                                    emit_deferred_addsub_immediate_flags(
+                                        ir, deferred_addsub == 2);
+                                } else if (
+                                    deferred_fault_recipe ==
+                                        DeferredFlagKind::Addition ||
+                                    deferred_fault_recipe ==
+                                        DeferredFlagKind::Subtraction) {
+                                    emit_deferred_fault_addsub_flags(
+                                        deferred_fault_recipe ==
+                                            DeferredFlagKind::Subtraction,
+                                        ir.operands[0].size);
+                                } else if (
+                                    deferred_fault_recipe ==
+                                    DeferredFlagKind::Logical) {
+                                    emit_deferred_fault_logic_flags(
+                                        ir.operands[0].size);
+                                } else {
+                                    emit_required_status([&] {
                                     const bool memory_result =
                                         ir.operands[0].type == X86_OPERAND_TYPE_MEMORY;
                                     if (status_kind == StatusKind::Logical) {
@@ -19746,7 +24672,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                             status_kind == StatusKind::Subtract,
                                             ir.operands[0].size, false, memory_result);
                                     }
-                                });
+                                    });
+                                }
                             }
                         }
                         break;
@@ -19760,12 +24687,23 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emitted = left_ready && right_ready;
                         if (emitted) {
                             const bool compare = mnemonic == X86_MNEMONIC_CMP;
+                            const bool fuse_branch =
+                                i < generic_fused_compare_branch.size() &&
+                                generic_fused_compare_branch[i] != 0;
                             if (compare) {
-                                code->sub(code->x12, code->x10, code->x11);
-                                emit_inline_flags_addsub(true, ir.operands[0].size);
+                                if (!fuse_branch) {
+                                    code->sub(
+                                        code->x12, code->x10, code->x11);
+                                }
                             } else {
                                 code->and_(code->x12, code->x10, code->x11);
-                                emit_inline_flags_logic(ir.operands[0].size);
+                            }
+                            if (!fuse_branch && compare) {
+                                emit_inline_flags_addsub(
+                                    true, ir.operands[0].size);
+                            } else if (!fuse_branch) {
+                                emit_inline_flags_logic(
+                                    ir.operands[0].size);
                             }
                         }
                         break;
@@ -19797,7 +24735,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                         *code, code->x16,
                                         reinterpret_cast<std::uint64_t>(
                                             &ExchangeGuestMemoryAtomically));
+                                    emit_sync_native_edge_phase();
                                     code->blr(code->x16);
+                                    emit_reload_native_edge_phase();
                                     emit_reload_register_caches();
                                 };
                                 if (JitHostHasLseAtomics()) {
@@ -19813,10 +24753,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     std::uint64_t image_lo = 0;
                                     std::uint64_t image_hi = 0;
                                     if (JitOwnHostImageRange(image_lo, image_hi)) {
-                                        code->mov(code->x10, image_lo);
+                                        EmitJitRelocatablePointer(
+                                            *code, code->x10, image_lo);
                                         code->cmp(code->x14, code->x10);
                                         code->blo(direct_exchange);
-                                        code->mov(code->x11, image_hi);
+                                        EmitJitRelocatablePointer(
+                                            *code, code->x11, image_hi);
                                         code->cmp(code->x14, code->x11);
                                         code->bhs(direct_exchange);
                                         code->b(slow_exchange);
@@ -19883,7 +24825,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
                                     &ExchangeAddMemoryAtomic));
+                            emit_sync_native_edge_phase();
                             code->blr(code->x16);
+                            emit_reload_native_edge_phase();
                             emit_reload_register_caches();
                         };
                         if (!JitHostHasLseAtomics()) {
@@ -19903,10 +24847,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         std::uint64_t image_lo = 0;
                         std::uint64_t image_hi = 0;
                         if (JitOwnHostImageRange(image_lo, image_hi)) {
-                            code->mov(code->x10, image_lo);
+                            EmitJitRelocatablePointer(
+                                *code, code->x10, image_lo);
                             code->cmp(code->x14, code->x10);
                             code->blo(direct_xadd);
-                            code->mov(code->x11, image_hi);
+                            EmitJitRelocatablePointer(
+                                *code, code->x11, image_hi);
                             code->cmp(code->x14, code->x11);
                             code->bhs(direct_xadd);
                             code->b(slow_xadd);
@@ -20011,7 +24957,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     *code, code->x16,
                                     reinterpret_cast<std::uint64_t>(
                                         &DispatchBitMutationAbi));
+                                emit_sync_native_edge_phase();
                                 code->blr(code->x16);
+                                emit_reload_native_edge_phase();
                             }
                         }
                         break;
@@ -20109,6 +25057,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 const bool elide_dead_flags =
                                     i < generic_elide_status_flags.size() &&
                                     generic_elide_status_flags[i] != 0;
+                                const bool defer_fault_flags =
+                                    deferred_fault_recipe ==
+                                    DeferredFlagKind::ImulOverflow;
                                 if (!elide_dead_flags && size_bits < 64) {
                                     const std::uint32_t extension_shift = 64u - size_bits;
                                     code->lsl(code->x10, code->x10, extension_shift);
@@ -20135,7 +25086,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 emitted = emit_write_operand(
                                     ir, ir.operands[0], code->x12);
                                 if (emitted) {
-                                    if (!elide_dead_flags) {
+                                    if (defer_fault_flags) {
+                                        emit_deferred_fault_imul_flags();
+                                    } else if (!elide_dead_flags) {
                                         code->mov(code->x15, code->x14);
                                         code->lsl(code->x15, code->x15, kOfBit);
                                         code->orr(code->x14, code->x14, code->x15);
@@ -20152,8 +25105,20 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                             code->x15,
                                             Xbyak_aarch64::ptr(code->x19,
                                                               kStateRflagsOffset));
+                                        if (generic_has_deferred_status_flags) {
+                                            code->mov(code->x17, 0);
+                                            store_machine_word(
+                                                code->x17,
+                                                kStateDeferredFlagsMetaOffset);
+                                        }
                                     } else {
                                         ++emitted_scalar_dead_flag_elisions;
+                                        if (generic_has_deferred_status_flags) {
+                                            code->mov(code->x17, 0);
+                                            store_machine_word(
+                                                code->x17,
+                                                kStateDeferredFlagsMetaOffset);
+                                        }
                                     }
                                     ++emitted_scalar_imul_inline;
                                 }
@@ -20373,7 +25338,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             target_is_memory
                                 ? reinterpret_cast<std::uint64_t>(&ShldMem)
                                 : reinterpret_cast<std::uint64_t>(&Shld));
+                        emit_sync_native_edge_phase();
                         code->blr(code->x16);
+                        emit_reload_native_edge_phase();
                         break;
                     }
                     case X86_MNEMONIC_SHL:
@@ -20469,6 +25436,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                         if (i < generic_elide_status_flags.size() &&
                             generic_elide_status_flags[i] != 0) {
+                            if (generic_has_deferred_status_flags) {
+                                code->mov(code->x17, 0);
+                                store_machine_word(
+                                    code->x17,
+                                    kStateDeferredFlagsMetaOffset);
+                            }
                             if (!immediate_count) {
                                 code->L(count_zero);
                             }
@@ -20483,16 +25456,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
 
                         code->mov(code->x13, 0);
 
-                        code->mov(code->w14, code->w12);
-                        code->lsr(code->w15, code->w14, 4);
-                        code->eor(code->w14, code->w14, code->w15);
-                        code->lsr(code->w15, code->w14, 2);
-                        code->eor(code->w14, code->w14, code->w15);
-                        code->lsr(code->w15, code->w14, 1);
-                        code->eor(code->w14, code->w14, code->w15);
-                        code->mov(code->w15, 1);
-                        code->and_(code->w14, code->w14, code->w15);
-                        code->eor(code->w14, code->w14, code->w15);
+                        code->eor(
+                            code->w14, code->w12, code->w12,
+                            Xbyak_aarch64::LSR, 4);
+                        code->and_(code->w14, code->w14, 0xf);
+                        code->mov(code->w15, 0x9669);
+                        code->lsrv(code->w14, code->w15, code->w14);
+                        code->and_(code->w14, code->w14, 1);
                         code->lsl(code->x14, code->x14, kPfBit);
                         code->orr(code->x13, code->x13, code->x14);
 
@@ -20539,6 +25509,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         EmitReplaceMachineStatus(
                             *code, code->x19, code->x13, code->x14, code->x15,
                             kStateRflagsOffset, kArithmeticStatusBits);
+                        if (generic_deferred_loop_flags) {
+                            code->mov(code->x17, 0);
+                            store_machine_word(
+                                code->x17, kStateDeferredFlagsMetaOffset);
+                        }
 
                         if (!immediate_count) {
                             code->L(count_zero);
@@ -20581,7 +25556,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             target_is_memory
                                 ? reinterpret_cast<std::uint64_t>(&RotateMem)
                                 : reinterpret_cast<std::uint64_t>(&RotateRegisterBridge));
+                        emit_sync_native_edge_phase();
                         code->blr(code->x16);
+                        emit_reload_native_edge_phase();
                         break;
                     }
                     case X86_MNEMONIC_CLC:
@@ -20631,7 +25608,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         EmitJitRelocatablePointer(
                             *code, code->x16,
                             reinterpret_cast<std::uint64_t>(&CopyStringUnit));
+                        emit_sync_native_edge_phase();
                         code->blr(code->x16);
+                        emit_reload_native_edge_phase();
                         emit_reload_register_caches();
                         break;
                     }
@@ -20645,6 +25624,23 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                 }
                 if (emitted && generic_has_conditional_terminator) {
+                    const std::size_t compare_index =
+                        generic_scalar_instruction_count == 0
+                        ? 0
+                        : generic_scalar_instruction_count - 1u;
+                    const bool fused_compare_terminator =
+                        generic_scalar_instruction_count != 0 &&
+                        generic_fused_compare_branch[compare_index] == 2;
+                    if (fused_compare_terminator) {
+                        Xbyak_aarch64::Cond condition =
+                            Xbyak_aarch64::EQ;
+                        emitted = emit_fused_compare_condition(
+                            generic_last_mnemonic,
+                            block.instructions[compare_index], condition);
+                        if (emitted) {
+                            code->b(condition, take);
+                        }
+                    } else {
                     const auto emit_signed_flag_difference = [&] {
                         code->lsr(code->x10, code->x9, kOfBit - kSfBit);
                         code->eor(code->x10, code->x10, code->x9);
@@ -20670,9 +25666,18 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         generic_last_mnemonic != X86_MNEMONIC_JCXZ &&
                         generic_last_mnemonic != X86_MNEMONIC_JECXZ &&
                         generic_last_mnemonic != X86_MNEMONIC_JRCXZ &&
-                        generic_last_mnemonic != X86_MNEMONIC_LOOP;
+                        generic_last_mnemonic != X86_MNEMONIC_LOOP &&
+                        !generic_deferred_loop_flags;
                     if (terminator_reads_rflags && !generic_rflags_live_in_x9) {
                         load_machine_word(code->x9, kStateRflagsOffset);
+                    }
+                    if (generic_deferred_loop_flags) {
+                        const auto& decrement =
+                            block.instructions[
+                                generic_deferred_loop_dec_index];
+                        emitted = emit_gpr_load(
+                            decrement.operands[0].reg.value,
+                            generic_deferred_loop_dec_width, code->x10);
                     }
                     switch (static_cast<X86Mnemonic>(terminator.mnemonic)) {
                     case X86_MNEMONIC_JCXZ:
@@ -20768,7 +25773,15 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         branch_if_status_bit(kSfBit, false, take);
                         break;
                     case X86_MNEMONIC_JNZ:
-                        branch_if_status_bit(kZfBit, false, take);
+                        if (generic_deferred_loop_flags) {
+                            if (generic_deferred_loop_dec_width == 64) {
+                                code->cbnz(code->x10, take);
+                            } else {
+                                code->cbnz(code->w10, take);
+                            }
+                        } else {
+                            branch_if_status_bit(kZfBit, false, take);
+                        }
                         break;
                     case X86_MNEMONIC_JO:
                         branch_if_status_bit(kOfBit, true, take);
@@ -20780,11 +25793,20 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         branch_if_status_bit(kSfBit, true, take);
                         break;
                     case X86_MNEMONIC_JZ:
-                        branch_if_status_bit(kZfBit, true, take);
+                        if (generic_deferred_loop_flags) {
+                            if (generic_deferred_loop_dec_width == 64) {
+                                code->cbz(code->x10, take);
+                            } else {
+                                code->cbz(code->w10, take);
+                            }
+                        } else {
+                            branch_if_status_bit(kZfBit, true, take);
+                        }
                         break;
                     default:
                         emitted = false;
                         break;
+                    }
                     }
                 }
                 if (emitted &&
@@ -20811,7 +25833,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (emitted) {
                             if (dynamic_hle_slab_base != 0 &&
                                 dynamic_hle_slab_size != 0) {
-                                code->mov(code->x11, dynamic_hle_slab_base);
+                                EmitJitRelocatablePointer(
+                                    *code, code->x11,
+                                    dynamic_hle_slab_base);
                                 code->sub(code->x11, code->x10, code->x11);
 #ifdef LSX4_PS5_DESKTOP_PATH
                                 code->mov(code->x12, dynamic_hle_slab_size);
@@ -20859,7 +25883,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             EmitJitRelocatablePointer(
                                 *code, code->x16,
                                 Lsx4::Translation::SelectiveLeafBridgeEntry());
+                            emit_sync_native_edge_phase();
                             code->blr(code->x16);
+                            emit_reload_native_edge_phase();
                             code->cbz(code->x1, dynamic_full_semantic);
                             store_machine_word(code->x0, kStateRaxOffset);
                             if (generic_has_call_terminator) {
@@ -20888,7 +25914,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 *code, code->x16,
                                 reinterpret_cast<std::uint64_t>(
                                     &InterpretDecodedInstruction));
+                            emit_sync_native_edge_phase();
                             code->blr(code->x16);
+                            emit_reload_native_edge_phase();
                             code->mov(code->x10, code->x0);
                             emit_epilogue_return_reg(code->x10);
                             code->L(dynamic_target_ready);
@@ -20915,7 +25943,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 *code, code->x16,
                                 generic_leaf_hle_target.native_function);
                             code->dmb(Xbyak_aarch64::ISH);
+                            emit_sync_native_edge_phase();
                             code->blr(code->x16);
+                            emit_reload_native_edge_phase();
                             code->dmb(Xbyak_aarch64::ISH);
                             store_machine_word(code->x0, kStateRaxOffset);
                             if (!emit_static_edge_tail(fallthrough)) {
@@ -20951,16 +25981,53 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 }
                 if (emitted) {
                     if (generic_has_conditional_terminator) {
+                        const std::size_t exit_compare_index =
+                            generic_scalar_instruction_count == 0
+                                ? 0
+                                : generic_scalar_instruction_count - 1u;
+                        const bool deferred_compare_exit =
+                            generic_scalar_instruction_count != 0 &&
+                            generic_fused_compare_branch[
+                                exit_compare_index] == 2;
                         code->L(skip);
+                        if (deferred_compare_exit) {
+                            emit_deferred_fused_compare_flags(
+                                block.instructions[exit_compare_index]);
+                            emit_materialize_deferred_flags(true);
+                        } else {
+                            emit_materialize_deferred_flags();
+                        }
                         if (!emit_static_edge_tail(fallthrough)) {
                             emit_epilogue_return(fallthrough);
                         }
                         code->L(take);
                         if (generic_has_local_backedge) {
                             code->subs(code->x22, code->x22, 1);
+                            if (generic_strong_memory_sequence_has_write) {
+                                code->dmb(Xbyak_aarch64::ISHST);
+                            }
                             code->cbnz(code->x22, local_loop_body);
                         }
-                        if (!emit_static_edge_tail(branch_target)) {
+                        if (!deferred_compare_exit) {
+                            emit_materialize_deferred_flags();
+                        }
+                        const bool force_tier0_promotion_sample =
+                            generic_has_local_backedge &&
+                            compilation_tier == LocalJitTier::Tier0 &&
+                            TieredJitEnabled();
+                        if (generic_has_local_backedge &&
+                            (generic_read_only_poll_loop ||
+                             force_local_loop_dispatch_safepoint ||
+                             force_tier0_promotion_sample)) {
+                            // Validate the full published trace witness before
+                            // leaving a trace-local loop. Returning straight to
+                            // the dispatcher would only revalidate the seed
+                            // block and could postpone internal-member SMC
+                            // detection until the normal 4096-edge cadence.
+                            if (!emit_static_edge_tail(branch_target, true)) {
+                                emit_epilogue_return(branch_target);
+                            }
+                        } else if (!emit_static_edge_tail(branch_target)) {
                             emit_epilogue_return(branch_target);
                         }
                     } else if (generic_has_jump_terminator ||
@@ -20988,6 +26055,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emit_epilogue_return_reg(code->x20);
                     }
                     auto* entry = seal_code_draft(std::move(code));
+                    if (generic_deferred_loop_flags) {
+                        g_jit_native_deferred_loop_flag_blocks.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                     if (generic_has_leaf_hle_call) {
                         g_jit_leaf_hle_fused_blocks.fetch_add(
                             1, std::memory_order_relaxed);
@@ -21061,6 +26132,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                                normal_entry_code->sp);
                         normal_entry_code->mov(normal_entry_code->x19,
                                                normal_entry_code->x0);
+                        normal_entry_code->ldr(
+                            normal_entry_code->w28,
+                            Xbyak_aarch64::ptr(
+                                normal_entry_code->x19,
+                                kStateNativeEdgePhaseOffset));
                         EmitJitRelocatablePointer(
                             *normal_entry_code, normal_entry_code->x16,
                             reinterpret_cast<std::uint64_t>(entry));
@@ -21394,19 +26470,22 @@ enum class JitStableNativeTargetId : std::uint32_t {
     ValidateDirectTargetAtSafepoint = 24,
     BindIndirectEdgeFanout = 25,
     ReservedDiagnostic26 = 26,
-    ReservedDiagnostic27 = 27,
-    ReservedDiagnostic28 = 28,
-    ReservedDiagnostic29 = 29,
-    ReservedDiagnostic30 = 30,
+    AdjustAtomicMemoryByOne = 27,
+    ReadGuestTscAux = 28,
+    ExchangeAddMemoryAtomic = 29,
+    CopyStringUnit = 30,
     ReservedDiagnostic31 = 31,
-    ReservedDiagnostic32 = 32,
-    ReservedDiagnostic33 = 33,
-    ReservedDiagnostic34 = 34,
-    ReservedDiagnostic35 = 35,
+    InterpretDecodedRegion = 32,
+    ExecuteProfiledInterpreterBridge = 33,
+    OwnHostImageBegin = 34,
+    OwnHostImageEnd = 35,
     TryLeafHleThunk = 36,
     CompareExchangeValue = 37,
     CompareExchangeMemoryAtomic = 38,
     ResolvedLeafHle = 39,
+    ValidateDirectTargetAtLoopSafepoint = 40,
+    HleThunkSlabBase = 41,
+    ValidateDirectTargetAtPollingLoopSafepoint = 42,
 };
 
 struct JitStableNativeTarget {
@@ -21466,6 +26545,28 @@ std::span<const JitStableNativeTarget> JitStableNativeTargets() noexcept {
             reinterpret_cast<std::uint64_t>(&ValidateObservedDirectTargetAtSafepoint)},
         JitStableNativeTarget{JitStableNativeTargetId::BindIndirectEdgeFanout,
             reinterpret_cast<std::uint64_t>(&BindIndirectEdgeFanout)},
+        JitStableNativeTarget{JitStableNativeTargetId::AdjustAtomicMemoryByOne,
+            reinterpret_cast<std::uint64_t>(&AdjustAtomicMemoryByOne)},
+        JitStableNativeTarget{JitStableNativeTargetId::ReadGuestTscAux,
+            reinterpret_cast<std::uint64_t>(&ReadGuestTscAux)},
+        JitStableNativeTarget{JitStableNativeTargetId::ExchangeAddMemoryAtomic,
+            reinterpret_cast<std::uint64_t>(&ExchangeAddMemoryAtomic)},
+        JitStableNativeTarget{JitStableNativeTargetId::CopyStringUnit,
+            reinterpret_cast<std::uint64_t>(&CopyStringUnit)},
+        JitStableNativeTarget{JitStableNativeTargetId::InterpretDecodedRegion,
+            reinterpret_cast<std::uint64_t>(&InterpretDecodedRegion)},
+        JitStableNativeTarget{JitStableNativeTargetId::ExecuteProfiledInterpreterBridge,
+            reinterpret_cast<std::uint64_t>(&ExecuteProfiledInterpreterBridge)},
+        JitStableNativeTarget{JitStableNativeTargetId::OwnHostImageBegin, [] {
+            std::uint64_t begin = 0;
+            std::uint64_t end = 0;
+            return JitOwnHostImageRange(begin, end) ? begin : 0;
+        }()},
+        JitStableNativeTarget{JitStableNativeTargetId::OwnHostImageEnd, [] {
+            std::uint64_t begin = 0;
+            std::uint64_t end = 0;
+            return JitOwnHostImageRange(begin, end) ? end : 0;
+        }()},
         JitStableNativeTarget{JitStableNativeTargetId::TryLeafHleThunk,
             Lsx4::Translation::SelectiveLeafBridgeEntry()},
         JitStableNativeTarget{JitStableNativeTargetId::CompareExchangeValue,
@@ -21474,6 +26575,14 @@ std::span<const JitStableNativeTarget> JitStableNativeTargets() noexcept {
             reinterpret_cast<std::uint64_t>(&DispatchCompareExchangeAtomicAbi)},
         JitStableNativeTarget{JitStableNativeTargetId::ResolvedLeafHle,
             Lsx4::Translation::ResolvedLeafBridgeEntry()},
+        JitStableNativeTarget{
+            JitStableNativeTargetId::ValidateDirectTargetAtLoopSafepoint,
+            reinterpret_cast<std::uint64_t>(
+                &ValidateObservedDirectTargetAtLoopSafepoint)},
+        JitStableNativeTarget{
+            JitStableNativeTargetId::ValidateDirectTargetAtPollingLoopSafepoint,
+            reinterpret_cast<std::uint64_t>(
+                &ValidateObservedDirectTargetAtPollingLoopSafepoint)},
     };
     return targets;
 }
@@ -21488,11 +26597,28 @@ bool ClassifyJitStableExternal(const std::uint64_t value,
             return true;
         }
     }
+    if (value != 0 &&
+        value == g_jit_hle_slab_base_for_native_cache.load(
+                     std::memory_order_acquire)) {
+        relocation.kind = JitNativeRelocationKind::StableExternal;
+        relocation.target_index =
+            static_cast<std::uint32_t>(
+                JitStableNativeTargetId::HleThunkSlabBase);
+        relocation.addend = 0;
+        return true;
+    }
     return false;
 }
 
 bool ResolveJitStableExternal(const std::uint32_t target_index,
                                    std::uint64_t& target_out) noexcept {
+    if (target_index ==
+        static_cast<std::uint32_t>(
+            JitStableNativeTargetId::HleThunkSlabBase)) {
+        target_out = g_jit_hle_slab_base_for_native_cache.load(
+            std::memory_order_acquire);
+        return target_out != 0;
+    }
     for (const JitStableNativeTarget& target : JitStableNativeTargets()) {
         if (target_index == static_cast<std::uint32_t>(target.id)) {
             target_out = target.address;
@@ -21501,6 +26627,28 @@ bool ResolveJitStableExternal(const std::uint32_t target_index,
     }
     target_out = 0;
     return false;
+}
+
+bool ValidateJitStableExternal(const std::uint32_t target_index,
+                               const std::uint64_t target,
+                               const std::uint64_t module_base) noexcept {
+    const auto id = static_cast<JitStableNativeTargetId>(target_index);
+    if (id == JitStableNativeTargetId::OwnHostImageBegin ||
+        id == JitStableNativeTargetId::OwnHostImageEnd) {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        if (!JitOwnHostImageRange(begin, end)) {
+            return false;
+        }
+        return target ==
+            (id == JitStableNativeTargetId::OwnHostImageBegin ? begin : end);
+    }
+    if (id == JitStableNativeTargetId::HleThunkSlabBase) {
+        return target != 0 &&
+               target == g_jit_hle_slab_base_for_native_cache.load(
+                             std::memory_order_acquire);
+    }
+    return JitAddressInOwnLoadSegment(target, module_base);
 }
 }
 
@@ -29945,14 +35093,19 @@ enum class HleEdgeForm : std::uint8_t {
     TailTransfer,
 };
 
-bool TryExecuteJitDirectHleEdge(LsxMachineImage& state, const std::uint64_t thunk,
-                                const std::uint64_t fallthrough,
-                                const HleEdgeForm form) {
+bool TryExecuteJitDirectHleEdge(
+    LsxMachineImage& state, const std::uint64_t thunk,
+    const std::uint64_t fallthrough, const HleEdgeForm form,
+    const int known_resolution = 0,
+    const std::uint64_t known_native_function = 0) {
     if (!IsJitHleThunkAddressCandidate(thunk)) {
         return false;
     }
-    std::uint64_t native_function = 0;
-    const int resolved_kind = executor_jit_resolve_hle_thunk(thunk, &native_function);
+    std::uint64_t native_function = known_native_function;
+    const int resolved_kind =
+        known_resolution != 0
+            ? known_resolution
+            : executor_jit_resolve_hle_thunk(thunk, &native_function);
     if (resolved_kind == 0) {
         return false;
     }
@@ -29999,6 +35152,16 @@ bool TryExecuteJitDirectHleCall(LsxMachineImage& state, const std::uint64_t thun
 bool TryExecuteJitDirectHleTail(const HleTailRequest& request) {
     return TryExecuteJitDirectHleEdge(
         request.machine, request.thunk, 0, HleEdgeForm::TailTransfer);
+}
+
+bool TryExecuteJitResolvedLeafHleTail(
+    LsxMachineImage& state, const JitLeafHlePltTarget& target) {
+    if (target.expected_thunk == 0 || target.native_function == 0) {
+        return false;
+    }
+    return TryExecuteJitDirectHleEdge(
+        state, target.expected_thunk, 0, HleEdgeForm::TailTransfer, 2,
+        target.native_function);
 }
 
 std::string HexBytesAt(const DiagnosticGuestAddress address,
@@ -32620,7 +37783,7 @@ void DivideAccumulatorPair(LsxMachineImage& state,
     const auto division_fault = [] {
 #ifdef __ANDROID__
         (void)executor_jit_defer_synchronous_guest_fault(
-            SIGFPE, FPE_INTDIV, 0, 0, 0, 0, 0);
+            SIGFPE, FPE_INTDIV, 0, 0, 0, 0, 0, nullptr);
 #endif
     };
     const __uint128_t lane_mask = size_bits == 64
@@ -33682,6 +38845,44 @@ RuntimeStatsSnapshot SnapshotTranslationTelemetry() noexcept {
             g_jit_persistent_native_restore_fallbacks.load(std::memory_order_relaxed),
         .persistent_native_capture_rejected =
             g_jit_persistent_native_capture_rejected.load(std::memory_order_relaxed),
+        .tier0_compiled =
+            g_tiered_counts.tier0_compiled.load(std::memory_order_relaxed),
+        .tier0_active =
+            g_tiered_counts.tier0_active.load(std::memory_order_relaxed),
+        .tier1_queued =
+            g_tiered_counts.tier1_queued.load(std::memory_order_relaxed),
+        .tier1_compiled =
+            g_tiered_counts.tier1_compiled.load(std::memory_order_relaxed),
+        .tier1_active =
+            g_tiered_counts.tier1_active.load(std::memory_order_relaxed),
+        .tier1_promotions =
+            g_tiered_counts.tier1_promotions.load(std::memory_order_relaxed),
+        .tier1_deopts =
+            g_tiered_counts.tier1_deopts.load(std::memory_order_relaxed),
+        .tier1_rejected =
+            g_tiered_counts.tier1_rejected.load(std::memory_order_relaxed),
+        .tier1_safe_handoffs =
+            g_tiered_counts.tier1_safe_handoffs.load(std::memory_order_relaxed),
+        .tier1_loop_osr_handoffs =
+            g_tiered_counts.tier1_loop_osr_handoffs.load(std::memory_order_relaxed),
+        .tier1_compile_time_us =
+            g_tiered_counts.tier1_compile_time_us.load(std::memory_order_relaxed),
+        .tier1_generated_bytes =
+            g_tiered_counts.tier1_generated_bytes.load(std::memory_order_relaxed),
+        .gpr_cached_blocks =
+            g_jit_native_scalar_gpr_cached_blocks.load(std::memory_order_relaxed),
+        .gpr_cached_registers =
+            g_jit_native_scalar_gpr_cached_registers.load(std::memory_order_relaxed),
+        .gpr_estimated_loads_stores_avoided =
+            g_jit_native_scalar_gpr_saved_accesses.load(std::memory_order_relaxed),
+        .gpr_cache_shape_rejections =
+            g_jit_native_scalar_gpr_shape_rejections.load(std::memory_order_relaxed),
+        .simd_cached_blocks =
+            g_jit_native_simd_cached_blocks.load(std::memory_order_relaxed),
+        .simd_cached_halves =
+            g_jit_native_simd_cached_halves.load(std::memory_order_relaxed),
+        .simd_estimated_loads_stores_avoided =
+            g_jit_native_simd_saved_accesses.load(std::memory_order_relaxed),
     };
 }
 
@@ -33752,9 +38953,53 @@ std::string DescribeTranslationEngineJson() {
         {"tieredJit", {
             {"enabled", TieredJitEnabled()},
             {"traceCompilationEnabled", JitTraceCompilationEnabled()},
+            {"tier0", {
+                {"identity", static_cast<std::uint32_t>(
+                    LocalJitTier::Tier0)},
+                {"compiled", relaxed(g_tiered_counts.tier0_compiled)},
+                {"active", relaxed(g_tiered_counts.tier0_active)},
+                {"persistentNativeBaseline", true},
+            }},
+            {"tier1", {
+                {"identity", static_cast<std::uint32_t>(
+                    LocalJitTier::Tier1)},
+                {"hotThresholdEdges", 32},
+                {"loopSafepointPeriod", kTier1LoopSafepointPeriod},
+                {"queued", relaxed(g_tiered_counts.tier1_queued)},
+                {"compiled", relaxed(g_tiered_counts.tier1_compiled)},
+                {"active", relaxed(g_tiered_counts.tier1_active)},
+                {"promotions", relaxed(g_tiered_counts.tier1_promotions)},
+                {"deopts", relaxed(g_tiered_counts.tier1_deopts)},
+                {"rejected", relaxed(g_tiered_counts.tier1_rejected)},
+                {"safeHandoffs",
+                 relaxed(g_tiered_counts.tier1_safe_handoffs)},
+                {"loopOsrHandoffs",
+                 relaxed(g_tiered_counts.tier1_loop_osr_handoffs)},
+                {"compileTimeUs",
+                 relaxed(g_tiered_counts.tier1_compile_time_us)},
+                {"generatedBytes",
+                 relaxed(g_tiered_counts.tier1_generated_bytes)},
+                {"codeBudgetBytes", 32u * 1024u * 1024u},
+                {"titlePgoPromotion", true},
+            }},
+            {"tier2", {
+                {"identity", static_cast<std::uint32_t>(
+                    LocalJitTier::Tier2)},
+            }},
             {"profiledEdges", relaxed(g_tiered_counts.profiled_edges)},
+            {"persistentEdgesLoaded",
+             relaxed(g_tiered_counts.persistent_edges_loaded)},
+            {"persistentEdgesWritten",
+             relaxed(g_tiered_counts.persistent_edges_written)},
+            {"persistentProfileRejected",
+             relaxed(g_tiered_counts.persistent_profile_rejected)},
             {"queued", relaxed(g_tiered_counts.queued)},
+            {"loopOsrQueued", relaxed(g_tiered_counts.loop_osr_queued)},
             {"compiled", relaxed(g_tiered_counts.compiled)},
+            {"faultableCompiled",
+             relaxed(g_tiered_counts.faultable_compiled)},
+            {"loopOsrCompiled", relaxed(g_tiered_counts.loop_osr_compiled)},
+            {"loopOsrSafepointPeriod", kTieredLoopSafepointPeriod},
             {"active", relaxed(g_tiered_counts.active)},
             {"retired", relaxed(g_tiered_counts.retired)},
             {"rejected", relaxed(g_tiered_counts.rejected)},
@@ -33768,6 +39013,9 @@ std::string DescribeTranslationEngineJson() {
             {"entries", relaxed(g_tiered_counts.entries)},
             {"internalEdges", relaxed(g_tiered_counts.internal_edges)},
             {"sideExits", relaxed(g_tiered_counts.side_exits)},
+            {"sideExitSites", relaxed(g_tiered_counts.side_exits)},
+            {"guardDeopts", relaxed(g_tiered_counts.guard_deopts)},
+            {"guardRollbacks", relaxed(g_tiered_counts.guard_rollbacks)},
             {"smcRetirements", relaxed(g_tiered_counts.smc_retirements)},
             {"estimatedBoundaryOperationsAvoided",
              relaxed(g_tiered_counts.boundary_operations_avoided)},
@@ -33783,11 +39031,27 @@ std::string DescribeTranslationEngineJson() {
             {"fastInstructions", relaxed(g_jit_native_simd_fast_instructions)},
             {"semanticInstructions", relaxed(g_jit_native_simd_semantic_instructions)},
             {"faultableWritebackBlocks", relaxed(g_jit_native_simd_faultable_writeback_blocks)},
+            {"registerCache", {
+                {"blocks", relaxed(g_jit_native_simd_cached_blocks)},
+                {"halves", relaxed(g_jit_native_simd_cached_halves)},
+                {"estimatedLoadsStoresAvoided",
+                 relaxed(g_jit_native_simd_saved_accesses)},
+            }},
+            {"deferredLoopFlagBlocks",
+             relaxed(g_jit_native_deferred_loop_flag_blocks)},
         }},
         {"nativeScalar", {
             {"blocks", relaxed(g_jit_native_scalar_blocks)},
             {"directInstructions", relaxed(g_jit_native_scalar_direct_instructions)},
             {"semanticInstructions", relaxed(g_jit_native_scalar_semantic_instructions)},
+            {"gprCache", {
+                {"blocks", relaxed(g_jit_native_scalar_gpr_cached_blocks)},
+                {"registers", relaxed(g_jit_native_scalar_gpr_cached_registers)},
+                {"estimatedLoadsStoresAvoided",
+                 relaxed(g_jit_native_scalar_gpr_saved_accesses)},
+                {"shapeRejections",
+                 relaxed(g_jit_native_scalar_gpr_shape_rejections)},
+            }},
             {"repStringBulk", {
                 {"movsCalls", relaxed(g_jit_rep_movs_bulk_calls)},
                 {"movsBytes", relaxed(g_jit_rep_movs_bulk_bytes)},
@@ -34215,6 +39479,71 @@ std::uint64_t InvokeGeneratedCode(const Arm64BlockEntry entry,
     return entry == nullptr ? 0 : std::invoke(entry, &machine);
 }
 
+[[gnu::noinline]] bool InvokeGeneratedCodeWithAbiCanaries(
+    const Arm64BlockEntry entry, LsxMachineImage& machine,
+    std::uint64_t& value) {
+    if (entry == nullptr) {
+        value = 0;
+        return false;
+    }
+#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+    constexpr std::uint64_t kX19 = UINT64_C(0x1919191919191919);
+    constexpr std::uint64_t kX20 = UINT64_C(0x2020202020202020);
+    constexpr std::uint64_t kX21 = UINT64_C(0x2121212121212121);
+    constexpr std::uint64_t kX22 = UINT64_C(0x2222222222222222);
+    constexpr std::uint64_t kX23 = UINT64_C(0x2323232323232323);
+    constexpr std::uint64_t kX24 = UINT64_C(0x2424242424242424);
+    constexpr std::uint64_t kX25 = UINT64_C(0x2525252525252525);
+    constexpr std::uint64_t kX26 = UINT64_C(0x2626262626262626);
+    constexpr std::uint64_t kX27 = UINT64_C(0x2727272727272727);
+    constexpr std::uint64_t kX28 = UINT64_C(0x2828282828282828);
+    register std::uint64_t x19_canary __asm__("x19") = kX19;
+    register std::uint64_t x20_canary __asm__("x20") = kX20;
+    register std::uint64_t x21_canary __asm__("x21") = kX21;
+    register std::uint64_t x22_canary __asm__("x22") = kX22;
+    register std::uint64_t x23_canary __asm__("x23") = kX23;
+    register std::uint64_t x24_canary __asm__("x24") = kX24;
+    register std::uint64_t x25_canary __asm__("x25") = kX25;
+    register std::uint64_t x26_canary __asm__("x26") = kX26;
+    register std::uint64_t x27_canary __asm__("x27") = kX27;
+    register std::uint64_t x28_canary __asm__("x28") = kX28;
+    __asm__ volatile(
+        ""
+        : "+r"(x19_canary), "+r"(x20_canary), "+r"(x21_canary),
+          "+r"(x22_canary), "+r"(x23_canary), "+r"(x24_canary),
+          "+r"(x25_canary), "+r"(x26_canary), "+r"(x27_canary),
+          "+r"(x28_canary)
+        :
+        : "memory");
+    std::uintptr_t sp_before = 0;
+    std::uintptr_t x29_before = 0;
+    __asm__ volatile("mov %0, sp" : "=r"(sp_before));
+    __asm__ volatile("mov %0, x29" : "=r"(x29_before));
+    value = std::invoke(entry, &machine);
+    __asm__ volatile(
+        ""
+        : "+r"(x19_canary), "+r"(x20_canary), "+r"(x21_canary),
+          "+r"(x22_canary), "+r"(x23_canary), "+r"(x24_canary),
+          "+r"(x25_canary), "+r"(x26_canary), "+r"(x27_canary),
+          "+r"(x28_canary)
+        :
+        : "memory");
+    std::uintptr_t sp_after = 0;
+    std::uintptr_t x29_after = 0;
+    __asm__ volatile("mov %0, sp" : "=r"(sp_after));
+    __asm__ volatile("mov %0, x29" : "=r"(x29_after));
+    return sp_after == sp_before && x29_after == x29_before &&
+           x19_canary == kX19 && x20_canary == kX20 &&
+           x21_canary == kX21 && x22_canary == kX22 &&
+           x23_canary == kX23 && x24_canary == kX24 &&
+           x25_canary == kX25 && x26_canary == kX26 &&
+           x27_canary == kX27 && x28_canary == kX28;
+#else
+    value = std::invoke(entry, &machine);
+    return true;
+#endif
+}
+
 std::uint64_t InvokeResolvedTranslation(const TranslationRecord& translation,
                                         LsxMachineImage& machine) {
     return InvokeGeneratedCode(translation.entry, machine);
@@ -34441,6 +39770,223 @@ std::string ExerciseTranslationEngineJson() {
             .Finish();
         LsxDecodedRegion block = DecodeGuestBasicRegion(
             reinterpret_cast<std::uint64_t>(add_rax_imm8.data()), 8);
+        // Keep this fixture free of four-part MOVZ/MOVK immediates: persistent
+        // capture deliberately treats that encoding as a relocatable pointer.
+        auto* code_range_snapshot_block = arena.EmitReturnImmediateBlock(0);
+        std::vector<JitNativeSegment> code_range_snapshot_baseline;
+        std::uint32_t code_range_snapshot_entry = kJitNativeNoSegment;
+        std::uint32_t code_range_snapshot_direct = kJitNativeNoSegment;
+        const bool code_range_snapshot_baseline_ok =
+            arena.CapturePersistentNativeBlock(
+                code_range_snapshot_block, code_range_snapshot_block, block,
+                nullptr, nullptr, nullptr,
+                code_range_snapshot_baseline, code_range_snapshot_entry,
+                code_range_snapshot_direct) &&
+            code_range_snapshot_baseline.size() == 1 &&
+            code_range_snapshot_entry == 0 &&
+            code_range_snapshot_direct == 0;
+        std::atomic<bool> code_range_snapshot_start{false};
+        std::atomic<bool> code_range_snapshot_capture_ok{
+            code_range_snapshot_baseline_ok};
+        std::atomic<bool> code_range_snapshot_commit_ok{true};
+        constexpr std::size_t kCodeRangeSnapshotIterations = 128;
+        std::thread code_range_snapshot_capture_thread([&] {
+            while (!code_range_snapshot_start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            for (std::size_t iteration = 0;
+                 iteration < kCodeRangeSnapshotIterations; ++iteration) {
+                std::vector<JitNativeSegment> captured;
+                std::uint32_t captured_entry = kJitNativeNoSegment;
+                std::uint32_t captured_direct = kJitNativeNoSegment;
+                if (!arena.CapturePersistentNativeBlock(
+                        code_range_snapshot_block, code_range_snapshot_block,
+                        block, nullptr, nullptr, nullptr,
+                        captured, captured_entry, captured_direct) ||
+                    captured_entry != 0 || captured_direct != 0 ||
+                    captured.size() != code_range_snapshot_baseline.size() ||
+                    captured.empty() ||
+                    captured[0].bytes !=
+                        code_range_snapshot_baseline[0].bytes ||
+                    captured[0].relocs.size() !=
+                        code_range_snapshot_baseline[0].relocs.size()) {
+                    code_range_snapshot_capture_ok.store(
+                        false, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        });
+        std::thread code_range_snapshot_commit_thread([&] {
+            code_range_snapshot_start.store(true, std::memory_order_release);
+            for (std::size_t iteration = 0;
+                 iteration < kCodeRangeSnapshotIterations; ++iteration) {
+                if (arena.EmitReturnImmediateBlock(
+                        kReturnMarker + iteration + 1u) == nullptr) {
+                    code_range_snapshot_commit_ok.store(
+                        false, std::memory_order_relaxed);
+                    break;
+                }
+            }
+        });
+        code_range_snapshot_capture_thread.join();
+        code_range_snapshot_commit_thread.join();
+        const bool code_range_snapshot_concurrent_ok =
+            code_range_snapshot_capture_ok.load(std::memory_order_relaxed) &&
+            code_range_snapshot_commit_ok.load(std::memory_order_relaxed);
+        bool runtime_elf_build_identity_ok = true;
+        bool module_relative_native_relocation_ok = true;
+#ifdef __ANDROID__
+        runtime_elf_build_identity_ok =
+            JitRuntimeElfBuildIdentity() != 0 &&
+            JitNativeCacheAbiId() != 0;
+        const std::uint64_t selftest_module_base =
+            JitModuleBaseForNativeCache();
+        const std::uint64_t selftest_function_address =
+            reinterpret_cast<std::uint64_t>(
+                &JitRuntimeElfBuildIdentity);
+        const std::uint64_t selftest_global_address =
+            reinterpret_cast<std::uint64_t>(
+                std::addressof(g_tiered_jit_enabled));
+        JitNativeRelocation selftest_function_relocation{};
+        JitNativeRelocation selftest_global_relocation{};
+        const bool selftest_function_classified =
+            ClassifyJitModuleRelative(
+                selftest_function_address, selftest_module_base,
+                selftest_function_relocation);
+        const bool selftest_global_classified =
+            ClassifyJitModuleRelative(
+                selftest_global_address, selftest_module_base,
+                selftest_global_relocation);
+        JitNativeSegment module_relative_segment{};
+        module_relative_segment.bytes.resize(
+            2u * kJitNativePointerPatchBytes);
+        const auto initialize_pointer_materialization =
+            [&](const std::size_t offset,
+                const std::uint8_t register_index) {
+            std::array<std::uint32_t, 4> instructions{};
+            instructions[0] =
+                kAarch64MovzXOpcode | register_index;
+            for (std::uint32_t index = 1;
+                 index < instructions.size(); ++index) {
+                instructions[index] =
+                    kAarch64MovkXOpcode | (index << 21u) |
+                    register_index;
+            }
+            std::memcpy(
+                module_relative_segment.bytes.data() + offset,
+                instructions.data(),
+                kJitNativePointerPatchBytes);
+        };
+        initialize_pointer_materialization(0, 9);
+        initialize_pointer_materialization(
+            kJitNativePointerPatchBytes, 10);
+        selftest_function_relocation.code_offset = 0;
+        selftest_function_relocation.register_index = 9;
+        selftest_global_relocation.code_offset =
+            kJitNativePointerPatchBytes;
+        selftest_global_relocation.register_index = 10;
+        module_relative_segment.relocs = {
+            selftest_function_relocation,
+            selftest_global_relocation,
+        };
+        std::vector<JitNativeSegment> module_relative_segments{
+            module_relative_segment};
+        Arm64BlockEntry module_relative_entry = nullptr;
+        Arm64BlockEntry module_relative_direct = nullptr;
+        const bool module_relative_restored =
+            selftest_function_classified &&
+            selftest_global_classified &&
+            arena.RestorePersistentNativeBlock(
+                module_relative_segments, 0, kJitNativeNoSegment,
+                block, nullptr, nullptr, nullptr,
+                module_relative_entry, module_relative_direct);
+        std::uint64_t restored_function_address = 0;
+        std::uint64_t restored_global_address = 0;
+        bool restored_pointer_sequences_ok = false;
+        if (module_relative_restored &&
+            module_relative_entry != nullptr) {
+            const auto range = arena.FindCodeRange(
+                reinterpret_cast<std::uint64_t>(
+                    module_relative_entry));
+            if (range && range->size >=
+                    module_relative_segment.bytes.size()) {
+                const std::span<const std::uint8_t> restored_bytes{
+                    reinterpret_cast<const std::uint8_t*>(
+                        range->base),
+                    static_cast<std::size_t>(range->size)};
+                std::uint8_t function_register = 0;
+                std::uint8_t global_register = 0;
+                restored_pointer_sequences_ok =
+                    DecodeJitRelocatablePointer(
+                        restored_bytes, 0, function_register,
+                        restored_function_address) &&
+                    DecodeJitRelocatablePointer(
+                        restored_bytes,
+                        kJitNativePointerPatchBytes,
+                        global_register,
+                        restored_global_address) &&
+                    function_register == 9 &&
+                    global_register == 10;
+            }
+        }
+        std::vector<JitNativeSegment>
+            recaptured_module_relative_segments;
+        std::uint32_t recaptured_module_relative_entry =
+            kJitNativeNoSegment;
+        std::uint32_t recaptured_module_relative_direct =
+            kJitNativeNoSegment;
+        const bool module_relative_recaptured =
+            module_relative_restored &&
+            arena.CapturePersistentNativeBlock(
+                module_relative_entry, nullptr, block, nullptr,
+                nullptr, nullptr,
+                recaptured_module_relative_segments,
+                recaptured_module_relative_entry,
+                recaptured_module_relative_direct) &&
+            recaptured_module_relative_segments.size() == 1 &&
+            recaptured_module_relative_entry == 0 &&
+            recaptured_module_relative_direct ==
+                kJitNativeNoSegment &&
+            recaptured_module_relative_segments[0].relocs.size() ==
+                2 &&
+            recaptured_module_relative_segments[0].relocs[0] ==
+                selftest_function_relocation &&
+            recaptured_module_relative_segments[0].relocs[1] ==
+                selftest_global_relocation;
+        std::vector<JitNativeSegment>
+            invalid_module_relative_segments{
+                module_relative_segment};
+        invalid_module_relative_segments[0]
+            .relocs[0]
+            .addend = std::numeric_limits<std::int64_t>::max();
+        Arm64BlockEntry invalid_module_relative_entry = nullptr;
+        Arm64BlockEntry invalid_module_relative_direct = nullptr;
+        const bool invalid_module_relative_rejected =
+            !arena.RestorePersistentNativeBlock(
+                invalid_module_relative_segments, 0,
+                kJitNativeNoSegment, block, nullptr, nullptr,
+                nullptr, invalid_module_relative_entry,
+                invalid_module_relative_direct);
+        module_relative_native_relocation_ok =
+            runtime_elf_build_identity_ok &&
+            selftest_function_classified &&
+            selftest_global_classified &&
+            selftest_function_relocation.kind ==
+                JitNativeRelocationKind::ModuleRelative &&
+            selftest_global_relocation.kind ==
+                JitNativeRelocationKind::ModuleRelative &&
+            selftest_function_relocation.target_index == 0 &&
+            selftest_global_relocation.target_index == 0 &&
+            module_relative_restored &&
+            module_relative_direct == nullptr &&
+            restored_pointer_sequences_ok &&
+            module_relative_recaptured &&
+            restored_function_address ==
+                selftest_function_address &&
+            restored_global_address ==
+                selftest_global_address &&
+            invalid_module_relative_rejected;
+#endif
         LsxDecodedRegion stale_derived_block = block;
         stale_derived_block.SelectInitialNativeTier(false);
         for (LsxDecodedOp& instruction : stale_derived_block.instructions) {
@@ -34735,7 +40281,9 @@ std::string ExerciseTranslationEngineJson() {
                 taken_chain_marker != nullptr &&
                 fallthrough_chain_marker != nullptr &&
                 taken_result == kTakenMarker &&
-                fallthrough_result == kFallthroughMarker;
+                fallthrough_result == kFallthroughMarker &&
+                taken_state.native_edge_phase == 1 &&
+                fallthrough_state.native_edge_phase == 1;
 
             const std::uint32_t revision_before_safepoint =
                 taken_publication.revision.load(std::memory_order_acquire);
@@ -34746,6 +40294,7 @@ std::string ExerciseTranslationEngineJson() {
                 conditional_direct != nullptr ? conditional_direct(&safepoint_state) : 0;
             conditional_two_edge_safepoint_ok =
                 safepoint_result == fallthrough_rip &&
+                safepoint_state.native_edge_phase == 0 &&
                 fallthrough_slot.target.load(std::memory_order_acquire) ==
                     fallthrough_chain_marker &&
                 taken_publication.revision.load(std::memory_order_acquire) ==
@@ -34759,6 +40308,7 @@ std::string ExerciseTranslationEngineJson() {
                 conditional_direct != nullptr ? conditional_direct(&smc_state) : 0;
             conditional_two_edge_smc_ok =
                 smc_result == taken_rip &&
+                smc_state.native_edge_phase == 0 &&
                 taken_slot.target.load(std::memory_order_acquire) == nullptr &&
                 taken_publication.revision.load(std::memory_order_acquire) ==
                     revision_before_safepoint + 1;
@@ -34767,6 +40317,180 @@ std::string ExerciseTranslationEngineJson() {
         const bool conditional_two_edge_direct_ok =
             conditional_two_edge_semantic_ok &&
             conditional_two_edge_safepoint_ok && conditional_two_edge_smc_ok;
+
+        constexpr std::uint64_t kTieredProfileHotTarget = 0x12345000;
+        constexpr std::uint64_t kTieredProfileColdTarget = 0x12346000;
+        TieredEdgeProfile fresh_stable_profile{};
+        fresh_stable_profile.total_samples = 100;
+        fresh_stable_profile.targets = {
+            {kTieredProfileHotTarget, 90},
+            {kTieredProfileColdTarget, 10},
+        };
+        TieredEdgeProfile fresh_ambiguous_profile = fresh_stable_profile;
+        fresh_ambiguous_profile.targets[kTieredProfileHotTarget] = 89;
+        fresh_ambiguous_profile.targets[kTieredProfileColdTarget] = 11;
+        TieredEdgeProfile imported_stable_profile = fresh_stable_profile;
+        imported_stable_profile.imported = true;
+        TieredEdgeProfile imported_contradicted_profile =
+            imported_stable_profile;
+        imported_stable_profile.live_samples = 10;
+        imported_stable_profile.live_targets = {
+            {kTieredProfileHotTarget, 9},
+            {kTieredProfileColdTarget, 1},
+        };
+        imported_contradicted_profile.live_samples = 10;
+        imported_contradicted_profile.live_targets = {
+            {kTieredProfileHotTarget, 1},
+            {kTieredProfileColdTarget, 9},
+        };
+        const bool tiered_profile_selection_ok =
+            SelectStableTieredTarget(fresh_stable_profile, 32) ==
+                kTieredProfileHotTarget &&
+            !SelectStableTieredTarget(fresh_ambiguous_profile, 32) &&
+            !SelectStableTieredTarget(imported_contradicted_profile, 32) &&
+            SelectStableTieredTarget(imported_stable_profile, 32) ==
+                kTieredProfileHotTarget;
+
+        bool tiered_loop_dispatch_safepoint_ok = false;
+        {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            alignas(16) std::array<std::uint8_t, 4> loop_code = {
+                0xff, 0xc9, // dec ecx
+                0x75, 0xfc, // jnz loop_code
+            };
+            const std::uint64_t loop_rip =
+                reinterpret_cast<std::uint64_t>(loop_code.data());
+            LsxDecodedRegion loop_block =
+                DecodeGuestBasicRegion(loop_rip, 2);
+            constexpr std::uint64_t kUnexpectedLoopChainMarker =
+                0x4c4f4f5043484149ull;
+            Arm64BlockEntry unexpected_chain =
+                arena.EmitSharedChainReturnImmediateBlock(
+                    kUnexpectedLoopChainMarker);
+            OutboundEdgeState loop_edge(loop_rip);
+            loop_edge.enters_resident_frame = true;
+            loop_edge.target.store(
+                unexpected_chain, std::memory_order_release);
+            Arm64BlockEntry loop_direct = nullptr;
+            Arm64BlockEntry loop_resident = nullptr;
+            bool loop_chain_abi = false;
+            Arm64BlockEntry loop_entry = arena.EmitNativeControlFlowBlock(
+                loop_block, &loop_edge, &loop_direct, nullptr, nullptr,
+                nullptr, &loop_chain_abi, &loop_resident, nullptr, true);
+            LsxMachineImage loop_state{};
+            WriteGuestGpr64(loop_state, LsxGpr::Rcx, 1030);
+            loop_state.native_edge_phase = 4095;
+            const std::uint64_t loop_result =
+                loop_entry != nullptr ? loop_entry(&loop_state) : 0;
+            tiered_loop_dispatch_safepoint_ok =
+                loop_entry != nullptr && loop_direct != nullptr &&
+                loop_resident != nullptr && loop_chain_abi &&
+                unexpected_chain != nullptr &&
+                loop_result == loop_rip &&
+                loop_result != kUnexpectedLoopChainMarker &&
+                loop_state.native_edge_phase == 4095 &&
+                ReadGuestGpr64(loop_state, LsxGpr::Rcx) == 6;
+        }
+
+        bool tiered_guarded_loop_osr_ok = false;
+        {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            alignas(16) std::array<std::uint8_t, 11> guarded_loop_code = {
+                0x85, 0xc0, // test eax, eax
+                0x74, 0x06, // jz cold/loop exit
+                0xff, 0xc1, // inc ecx
+                0xff, 0xca, // dec edx
+                0x75, 0xf6, // jnz guarded_loop_code
+                0x90,       // cold/loop exit
+            };
+            const std::uint64_t guarded_loop_rip =
+                reinterpret_cast<std::uint64_t>(
+                    guarded_loop_code.data());
+            LsxDecodedRegion guarded_loop_prefix =
+                DecodeGuestBasicRegion(guarded_loop_rip, 2);
+            LsxDecodedRegion guarded_loop_body =
+                DecodeGuestBasicRegion(guarded_loop_rip + 4, 3);
+            if (!guarded_loop_prefix.HasDecodeFailure() &&
+                !guarded_loop_body.HasDecodeFailure() &&
+                guarded_loop_prefix.instructions.size() == 2 &&
+                guarded_loop_body.instructions.size() == 3) {
+                LsxDecodedRegion guarded_loop_trace{};
+                guarded_loop_trace.start_rip = guarded_loop_rip;
+                guarded_loop_trace.end_rip = guarded_loop_rip + 10;
+                guarded_loop_trace.decode_status =
+                    RegionDecodeStatus::Ready;
+                guarded_loop_trace.SelectInitialNativeTier(true);
+                guarded_loop_trace.diagnostic =
+                    "selftest-tiered-guarded-loop-osr";
+                guarded_loop_trace.instructions =
+                    guarded_loop_prefix.instructions;
+                guarded_loop_trace.instructions.insert(
+                    guarded_loop_trace.instructions.end(),
+                    guarded_loop_body.instructions.begin(),
+                    guarded_loop_body.instructions.end());
+                guarded_loop_trace.validation_bytes =
+                    guarded_loop_prefix.validation_bytes;
+                guarded_loop_trace.validation_bytes.insert(
+                    guarded_loop_trace.validation_bytes.end(),
+                    guarded_loop_body.validation_bytes.begin(),
+                    guarded_loop_body.validation_bytes.end());
+                TieredGuardDeoptContext guarded_loop_deopt{};
+                guarded_loop_deopt.cold_target =
+                    guarded_loop_rip + 10;
+                const std::vector<TieredGuardEmission>
+                    guarded_loop_guards{{
+                        .instruction_index = 1,
+                        .source_block_rip = guarded_loop_rip,
+                        .hot_target = guarded_loop_rip + 4,
+                        .cold_target = guarded_loop_rip + 10,
+                        .hot_path_is_taken = false,
+                        .deopt_context = &guarded_loop_deopt,
+                    }};
+                Arm64BlockEntry guarded_loop_direct = nullptr;
+                Arm64BlockEntry guarded_loop_resident = nullptr;
+                bool guarded_loop_chain_abi = false;
+                Arm64BlockEntry guarded_loop_entry =
+                    arena.EmitNativeControlFlowBlock(
+                        guarded_loop_trace, nullptr,
+                        &guarded_loop_direct, nullptr, nullptr, nullptr,
+                        &guarded_loop_chain_abi,
+                        &guarded_loop_resident,
+                        &guarded_loop_guards, true);
+
+                LsxMachineImage hot_state{};
+                WriteGuestGpr64(hot_state, LsxGpr::Rax, 1);
+                WriteGuestGpr64(hot_state, LsxGpr::Rcx, 5);
+                WriteGuestGpr64(hot_state, LsxGpr::Rdx, 3);
+                hot_state.native_edge_phase = 123;
+                const std::uint64_t hot_result =
+                    guarded_loop_direct != nullptr
+                        ? guarded_loop_direct(&hot_state)
+                        : 0;
+
+                LsxMachineImage cold_state{};
+                WriteGuestGpr64(cold_state, LsxGpr::Rax, 0);
+                WriteGuestGpr64(cold_state, LsxGpr::Rcx, 5);
+                WriteGuestGpr64(cold_state, LsxGpr::Rdx, 3);
+                cold_state.native_edge_phase = 321;
+                const std::uint64_t cold_result =
+                    guarded_loop_direct != nullptr
+                        ? guarded_loop_direct(&cold_state)
+                        : 0;
+                tiered_guarded_loop_osr_ok =
+                    guarded_loop_entry != nullptr &&
+                    guarded_loop_direct != nullptr &&
+                    guarded_loop_resident != nullptr &&
+                    guarded_loop_chain_abi &&
+                    hot_result == guarded_loop_rip + 10 &&
+                    ReadGuestGpr64(hot_state, LsxGpr::Rcx) == 8 &&
+                    ReadGuestGpr64(hot_state, LsxGpr::Rdx) == 0 &&
+                    cold_result == guarded_loop_rip + 10 &&
+                    ReadGuestGpr64(cold_state, LsxGpr::Rcx) == 5 &&
+                    ReadGuestGpr64(cold_state, LsxGpr::Rdx) == 3 &&
+                    hot_state.native_edge_phase == 123 &&
+                    cold_state.native_edge_phase == 321;
+            }
+        }
 
         bool resident_to_external_boundary_ok = false;
         {
@@ -34931,6 +40655,7 @@ std::string ExerciseTranslationEngineJson() {
         bool generic_indirect_pic_safepoint_smc_ok = false;
         bool generic_indirect_pic_deny_retire_ok = false;
         bool generic_indirect_pic_persistence_roundtrip_ok = false;
+        bool generic_indirect_pic_entry_conventions_abi_ok = false;
         {
             const ScopedJitSelfTestProductionDirect production_direct_scope;
             const auto set_edge_phase = [](LsxMachineImage& state,
@@ -34972,18 +40697,118 @@ std::string ExerciseTranslationEngineJson() {
             LsxMachineImage pic_state_a{};
             WriteGuestGpr64(pic_state_a, LsxGpr::Rax, kPicGuestTargetA);
             set_edge_phase(pic_state_a, 2);
-            const std::uint64_t pic_result_a =
-                pic_jmp_direct != nullptr ? pic_jmp_direct(&pic_state_a) : 0;
+            std::uint64_t pic_result_a = 0;
+            const bool pic_external_a_abi_ok =
+                InvokeGeneratedCodeWithAbiCanaries(
+                    pic_jmp_direct, pic_state_a, pic_result_a);
             LsxMachineImage pic_state_b{};
             WriteGuestGpr64(pic_state_b, LsxGpr::Rax, kPicGuestTargetB);
             set_edge_phase(pic_state_b, 2);
-            const std::uint64_t pic_result_b =
-                pic_jmp_direct != nullptr ? pic_jmp_direct(&pic_state_b) : 0;
+            std::uint64_t pic_result_b = 0;
+            const bool pic_external_b_abi_ok =
+                InvokeGeneratedCodeWithAbiCanaries(
+                    pic_jmp_direct, pic_state_b, pic_result_b);
             generic_indirect_pic_mono_poly_ok =
                 pic_jmp_entry != nullptr && pic_jmp_direct != nullptr && pic_jmp_used &&
                 pic_result_a == kPicMarkerA && pic_result_b == kPicMarkerB &&
                 pic_state_a.rip_or_exit == kPicGuestTargetA &&
                 pic_state_b.rip_or_exit == kPicGuestTargetB;
+
+            constexpr std::uint64_t kPicGuestTargetResident = 0x80009abc0ull;
+            constexpr std::uint64_t kPicMarkerResident =
+                0x7265736964656e74ull;
+            Arm64BlockEntry pic_resident_marker =
+                arena.EmitSharedChainReturnImmediateBlock(kPicMarkerResident);
+            OutboundEdgeState pic_resident_slot(
+                kPicGuestTargetResident, nullptr, 0, true);
+            arm_slot(pic_resident_slot, pic_resident_marker);
+            IndirectEdgeFanout pic_resident_site(
+                nullptr, pic_jmp_block.start_rip, false, true);
+            pic_resident_site.ways[0].store(
+                &pic_resident_slot, std::memory_order_release);
+            Arm64BlockEntry pic_resident_direct = nullptr;
+            Arm64BlockEntry pic_resident_chain = nullptr;
+            bool pic_resident_used = false;
+            bool pic_resident_chain_abi = false;
+            Arm64BlockEntry pic_resident_entry =
+                arena.EmitNativeControlFlowBlock(
+                    pic_jmp_block, nullptr, &pic_resident_direct, nullptr,
+                    &pic_resident_site, &pic_resident_used,
+                    &pic_resident_chain_abi, &pic_resident_chain);
+            LsxMachineImage pic_resident_state{};
+            WriteGuestGpr64(
+                pic_resident_state, LsxGpr::Rax, kPicGuestTargetResident);
+            set_edge_phase(pic_resident_state, 2);
+            std::uint64_t pic_resident_result = 0;
+            const bool pic_resident_abi_ok =
+                InvokeGeneratedCodeWithAbiCanaries(
+                    pic_resident_direct, pic_resident_state,
+                    pic_resident_result);
+
+            constexpr std::uint64_t kPicGuestTargetResidentBind =
+                kPicGuestTargetResident + 0x100ull;
+            RetiringTranslationRuntime pic_resident_backend;
+            pic_resident_backend.InstallPublishedDestination(
+                kPicGuestTargetResidentBind, pic_marker_a,
+                pic_resident_marker, nullptr, 0);
+            IndirectEdgeFanout pic_resident_bind_site(
+                &pic_resident_backend, pic_jmp_block.start_rip, false, true);
+            Arm64BlockEntry pic_resident_bind_direct = nullptr;
+            Arm64BlockEntry pic_resident_bind_chain = nullptr;
+            bool pic_resident_bind_used = false;
+            bool pic_resident_bind_chain_abi = false;
+            Arm64BlockEntry pic_resident_bind_entry =
+                arena.EmitNativeControlFlowBlock(
+                    pic_jmp_block, nullptr, &pic_resident_bind_direct, nullptr,
+                    &pic_resident_bind_site, &pic_resident_bind_used,
+                    &pic_resident_bind_chain_abi,
+                    &pic_resident_bind_chain);
+            LsxMachineImage pic_resident_bind_state{};
+            WriteGuestGpr64(
+                pic_resident_bind_state, LsxGpr::Rax,
+                kPicGuestTargetResidentBind);
+            set_edge_phase(pic_resident_bind_state, 2);
+            std::uint64_t pic_resident_bind_result = 0;
+            const bool pic_resident_bind_abi_ok =
+                InvokeGeneratedCodeWithAbiCanaries(
+                    pic_resident_bind_direct, pic_resident_bind_state,
+                    pic_resident_bind_result);
+            OutboundEdgeState* pic_resident_bound_slot = nullptr;
+            for (const auto& way : pic_resident_bind_site.ways) {
+                OutboundEdgeState* const slot =
+                    way.load(std::memory_order_acquire);
+                if (slot != nullptr &&
+                    slot->guest_rip == kPicGuestTargetResidentBind) {
+                    pic_resident_bound_slot = slot;
+                    break;
+                }
+            }
+            const bool pic_resident_bind_convention_ok =
+                pic_resident_bind_entry != nullptr &&
+                pic_resident_bind_direct != nullptr &&
+                pic_resident_bind_chain != nullptr &&
+                pic_resident_bind_used && pic_resident_bind_chain_abi &&
+                pic_resident_bind_abi_ok &&
+                pic_resident_bind_result == kPicMarkerResident &&
+                pic_resident_bind_state.rip_or_exit ==
+                    kPicGuestTargetResidentBind &&
+                pic_resident_bound_slot != nullptr &&
+                pic_resident_bound_slot->enters_resident_frame &&
+                pic_resident_bound_slot->target.load(
+                    std::memory_order_acquire) == pic_resident_marker;
+            generic_indirect_pic_entry_conventions_abi_ok =
+                pic_external_a_abi_ok && pic_external_b_abi_ok &&
+                pic_resident_abi_ok && pic_resident_bind_convention_ok &&
+                !pic_site.resident_frame &&
+                pic_resident_site.resident_frame &&
+                !pic_slot_a.enters_resident_frame &&
+                pic_resident_slot.enters_resident_frame &&
+                pic_resident_entry != nullptr &&
+                pic_resident_direct != nullptr &&
+                pic_resident_chain != nullptr &&
+                pic_resident_used && pic_resident_chain_abi &&
+                pic_resident_result == kPicMarkerResident &&
+                pic_resident_state.rip_or_exit == kPicGuestTargetResident;
 
             RetiringTranslationRuntime pic_backend;
             IndirectEdgeFanout cold_site(&pic_backend, pic_jmp_block.start_rip);
@@ -35254,7 +41079,8 @@ std::string ExerciseTranslationEngineJson() {
             generic_indirect_pic_ret_nine_way_warm_ok &&
             generic_indirect_pic_safepoint_smc_ok &&
             generic_indirect_pic_deny_retire_ok &&
-            generic_indirect_pic_persistence_roundtrip_ok;
+            generic_indirect_pic_persistence_roundtrip_ok &&
+            generic_indirect_pic_entry_conventions_abi_ok;
 
         alignas(16) std::array<std::uint8_t, 128> outbound_edge_code{};
         std::ranges::fill(outbound_edge_code, UINT8_C(0x90));
@@ -38012,6 +43838,347 @@ std::string ExerciseTranslationEngineJson() {
             generic_addsub_fault_barrier_semantic_ok &&
             generic_addsub_fault_barrier_structural_ok;
 
+        // Synthetic two-block trace:
+        //   add eax, ecx       ; flags are consumed by the guard
+        //   jz cold
+        // hot:
+        //   add edx, r8d       ; flags are dead
+        //   mov ebx, edi
+        //   cmp r9d, r10d      ; unconditional overwrite
+        //
+        // The guard must stop the first ADD from being elided, while the ADD
+        // in the hot continuation is safe to elide.
+        const std::array<std::uint8_t, 12> generic_guarded_dead_flags = {
+            0x01, 0xc8,
+            0x74, 0x08,
+            0x44, 0x01, 0xc2,
+            0x89, 0xfb,
+            0x45, 0x39, 0xd1,
+        };
+        LsxDecodedRegion generic_guarded_prefix = DecodeGuestBasicRegion(
+            reinterpret_cast<std::uint64_t>(generic_guarded_dead_flags.data()), 2);
+        LsxDecodedRegion generic_guarded_hot = DecodeGuestBasicRegion(
+            reinterpret_cast<std::uint64_t>(generic_guarded_dead_flags.data() + 4), 3);
+        const auto generic_guarded_destinations =
+            ResolveFixtureBranch(generic_guarded_prefix);
+        bool generic_guarded_dead_flags_semantic_ok = false;
+        bool generic_guarded_dead_flags_structural_ok = false;
+        if (!generic_guarded_prefix.HasDecodeFailure() &&
+            !generic_guarded_hot.HasDecodeFailure() &&
+            generic_guarded_prefix.SupportsInitialNativeTier() &&
+            generic_guarded_hot.SupportsInitialNativeTier() &&
+            generic_guarded_prefix.instructions.size() == 2 &&
+            generic_guarded_hot.instructions.size() == 3 &&
+            generic_guarded_destinations &&
+            generic_guarded_destinations->fallthrough ==
+                generic_guarded_hot.start_rip &&
+            generic_guarded_destinations->taken == generic_guarded_hot.end_rip) {
+            LsxDecodedRegion generic_guarded_trace{};
+            generic_guarded_trace.start_rip = generic_guarded_prefix.start_rip;
+            generic_guarded_trace.end_rip = generic_guarded_hot.end_rip;
+            generic_guarded_trace.decode_status = RegionDecodeStatus::Ready;
+            generic_guarded_trace.SelectInitialNativeTier(true);
+            generic_guarded_trace.diagnostic =
+                "selftest-tiered-guard-dead-flags";
+            generic_guarded_trace.instructions =
+                generic_guarded_prefix.instructions;
+            generic_guarded_trace.instructions.insert(
+                generic_guarded_trace.instructions.end(),
+                generic_guarded_hot.instructions.begin(),
+                generic_guarded_hot.instructions.end());
+            generic_guarded_trace.validation_bytes =
+                generic_guarded_prefix.validation_bytes;
+            generic_guarded_trace.validation_bytes.insert(
+                generic_guarded_trace.validation_bytes.end(),
+                generic_guarded_hot.validation_bytes.begin(),
+                generic_guarded_hot.validation_bytes.end());
+            TieredGuardDeoptContext generic_guarded_deopt{};
+            generic_guarded_deopt.cold_target =
+                generic_guarded_destinations->taken;
+            const std::vector<TieredGuardEmission> generic_guarded_guards{{
+                .instruction_index =
+                    generic_guarded_prefix.instructions.size() - 1u,
+                .hot_target = generic_guarded_hot.start_rip,
+                .cold_target = generic_guarded_destinations->taken,
+                .hot_path_is_taken = false,
+                .deopt_context = &generic_guarded_deopt,
+            }};
+            const std::uint64_t generic_guarded_elisions_before =
+                g_jit_native_scalar_dead_flag_elisions.load(
+                    std::memory_order_relaxed);
+            const std::uint64_t generic_guarded_inline_before =
+                g_jit_selftest_scalar_flag_inline_emissions;
+            const std::uint64_t generic_guarded_helpers_before =
+                g_jit_selftest_scalar_flag_helper_emissions;
+            Arm64BlockEntry generic_guarded_direct = nullptr;
+            Arm64BlockEntry generic_guarded_entry = nullptr;
+            {
+                const ScopedJitSelfTestProductionDirect production_direct_scope;
+                generic_guarded_entry = arena.EmitNativeControlFlowBlock(
+                    generic_guarded_trace, nullptr, &generic_guarded_direct,
+                    nullptr, nullptr, nullptr, nullptr, nullptr,
+                    &generic_guarded_guards);
+            }
+            generic_guarded_dead_flags_structural_ok =
+                generic_guarded_entry != nullptr &&
+                generic_guarded_direct != nullptr &&
+                g_jit_native_scalar_dead_flag_elisions.load(
+                    std::memory_order_relaxed) ==
+                    generic_guarded_elisions_before + 1u &&
+                g_jit_selftest_scalar_flag_inline_emissions ==
+                    generic_guarded_inline_before + 2u &&
+                g_jit_selftest_scalar_flag_helper_emissions ==
+                    generic_guarded_helpers_before;
+
+            bool hot_path_seen = false;
+            bool cold_path_seen = false;
+            bool states_match = generic_guarded_entry != nullptr;
+            for (std::uint32_t iteration = 0;
+                 iteration < 18 && states_match; ++iteration) {
+                LsxMachineImage interpreter_state{};
+                interpreter_state.rflags =
+                    (iteration & 1u) != 0 ? 0xad7u : 0x202u;
+                WriteGuestGpr64(
+                    interpreter_state, LsxGpr::Rax,
+                    (iteration & 1u) != 0 ? 1u : 0xffffffffu);
+                WriteGuestGpr64(
+                    interpreter_state, LsxGpr::Rcx,
+                    (iteration & 1u) != 0 ? 2u : 1u);
+                WriteGuestGpr64(
+                    interpreter_state, LsxGpr::Rdx,
+                    0x1122334400000000ull | iteration);
+                WriteGuestGpr64(
+                    interpreter_state, LsxGpr::R8,
+                    0x5566778800000000ull | (iteration + 3u));
+                WriteGuestGpr64(
+                    interpreter_state, LsxGpr::Rbx, kAuxCanaryB);
+                WriteGuestGpr64(
+                    interpreter_state, LsxGpr::Rdi, kAuxCanaryC);
+                WriteGuestGpr64(
+                    interpreter_state, LsxGpr::R9,
+                    0x80000000u + iteration);
+                WriteGuestGpr64(
+                    interpreter_state, LsxGpr::R10,
+                    0x7fffffffu - iteration);
+                LsxMachineImage native_state = interpreter_state;
+
+                const std::uint64_t prefix_result =
+                    InterpretDecodedRegion(
+                        &interpreter_state, &generic_guarded_prefix);
+                std::uint64_t interpreter_next = EffectiveBlockNext(
+                    generic_guarded_prefix, interpreter_state, prefix_result);
+                if (interpreter_next == generic_guarded_hot.start_rip) {
+                    hot_path_seen = true;
+                    const std::uint64_t hot_result = InterpretDecodedRegion(
+                        &interpreter_state, &generic_guarded_hot);
+                    interpreter_next = EffectiveBlockNext(
+                        generic_guarded_hot, interpreter_state, hot_result);
+                } else {
+                    cold_path_seen = true;
+                }
+                const std::uint64_t native_result =
+                    InvokeGeneratedCode(generic_guarded_entry, native_state);
+                const std::uint64_t native_next = EffectiveBlockNext(
+                    generic_guarded_trace, native_state, native_result);
+                states_match =
+                    native_next == interpreter_next &&
+                    CheckedNativeStateMatches(native_state, interpreter_state);
+            }
+            generic_guarded_dead_flags_semantic_ok =
+                states_match && hot_path_seen && cold_path_seen;
+        }
+        const bool generic_guarded_dead_flags_native_ok =
+            generic_guarded_dead_flags_semantic_ok &&
+            generic_guarded_dead_flags_structural_ok;
+
+        // A guarded trace must publish all architectural GPR state before both
+        // its cold side exit and a resident-frame handoff.  In particular, the
+        // next block may compute an indirect target from memory addressed by a
+        // GPR written before the guard.
+        bool generic_guarded_indirect_handoff_ok = false;
+        {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            constexpr std::uint64_t kGuardedIndirectGuestTarget =
+                0x8000abcdeull;
+            constexpr std::uint64_t kGuardedIndirectMarker =
+                0x4755415244494e44ull;
+            alignas(16) std::array<std::uint8_t, 21>
+                generic_guarded_indirect_code = {
+                    0x48, 0x89, 0xf7,       // mov rdi, rsi
+                    0x48, 0x89, 0xf8,       // mov rax, rdi
+                    0x48, 0x89, 0xfb,       // mov rbx, rdi
+                    0x85, 0xc9,             // test ecx, ecx
+                    0x74, 0x08,             // jz cold
+                    0x48, 0x89, 0xfa,       // mov rdx, rdi
+                    0x45, 0x39, 0xd1,       // cmp r9d, r10d
+                    0xff, 0x27,             // jmp qword ptr [rdi]
+                };
+            const std::uint64_t guarded_indirect_rip =
+                reinterpret_cast<std::uint64_t>(
+                    generic_guarded_indirect_code.data());
+            LsxDecodedRegion guarded_indirect_prefix =
+                DecodeGuestBasicRegion(guarded_indirect_rip, 5);
+            LsxDecodedRegion guarded_indirect_hot =
+                DecodeGuestBasicRegion(guarded_indirect_rip + 13, 2);
+            LsxDecodedRegion guarded_indirect_target =
+                DecodeGuestBasicRegion(guarded_indirect_rip + 19, 1);
+            const auto guarded_indirect_destinations =
+                ResolveFixtureBranch(guarded_indirect_prefix);
+            if (!guarded_indirect_prefix.HasDecodeFailure() &&
+                !guarded_indirect_hot.HasDecodeFailure() &&
+                !guarded_indirect_target.HasDecodeFailure() &&
+                guarded_indirect_prefix.SupportsInitialNativeTier() &&
+                guarded_indirect_hot.SupportsInitialNativeTier() &&
+                guarded_indirect_target.SupportsInitialNativeTier() &&
+                guarded_indirect_prefix.instructions.size() == 5 &&
+                guarded_indirect_hot.instructions.size() == 2 &&
+                guarded_indirect_target.instructions.size() == 1 &&
+                guarded_indirect_destinations &&
+                guarded_indirect_destinations->fallthrough ==
+                    guarded_indirect_hot.start_rip &&
+                guarded_indirect_destinations->taken ==
+                    guarded_indirect_target.end_rip &&
+                guarded_indirect_hot.end_rip ==
+                    guarded_indirect_target.start_rip) {
+                Arm64BlockEntry guarded_indirect_marker =
+                    arena.EmitReturnImmediateBlock(
+                        kGuardedIndirectMarker);
+                OutboundEdgeState guarded_indirect_way(
+                    kGuardedIndirectGuestTarget);
+                // The PIC handoff selects frame teardown from this per-way
+                // convention, so this external marker requires false.
+                guarded_indirect_way.enters_resident_frame = false;
+                guarded_indirect_way.target.store(
+                    guarded_indirect_marker, std::memory_order_release);
+                IndirectEdgeFanout guarded_indirect_site(
+                    nullptr, guarded_indirect_target.start_rip);
+                guarded_indirect_site.ways[0].store(
+                    &guarded_indirect_way, std::memory_order_release);
+                Arm64BlockEntry guarded_indirect_direct = nullptr;
+                Arm64BlockEntry guarded_indirect_resident = nullptr;
+                bool guarded_indirect_used = false;
+                bool guarded_indirect_chain_abi = false;
+                Arm64BlockEntry guarded_indirect_entry =
+                    arena.EmitNativeControlFlowBlock(
+                        guarded_indirect_target, nullptr,
+                        &guarded_indirect_direct, nullptr,
+                        &guarded_indirect_site, &guarded_indirect_used,
+                        &guarded_indirect_chain_abi,
+                        &guarded_indirect_resident);
+
+                LsxDecodedRegion guarded_handoff_trace{};
+                guarded_handoff_trace.start_rip =
+                    guarded_indirect_prefix.start_rip;
+                guarded_handoff_trace.end_rip =
+                    guarded_indirect_hot.end_rip;
+                guarded_handoff_trace.decode_status =
+                    RegionDecodeStatus::Ready;
+                guarded_handoff_trace.SelectInitialNativeTier(true);
+                guarded_handoff_trace.diagnostic =
+                    "selftest-tiered-guard-indirect-handoff";
+                guarded_handoff_trace.instructions =
+                    guarded_indirect_prefix.instructions;
+                guarded_handoff_trace.instructions.insert(
+                    guarded_handoff_trace.instructions.end(),
+                    guarded_indirect_hot.instructions.begin(),
+                    guarded_indirect_hot.instructions.end());
+                guarded_handoff_trace.validation_bytes =
+                    guarded_indirect_prefix.validation_bytes;
+                guarded_handoff_trace.validation_bytes.insert(
+                    guarded_handoff_trace.validation_bytes.end(),
+                    guarded_indirect_hot.validation_bytes.begin(),
+                    guarded_indirect_hot.validation_bytes.end());
+                TieredGuardDeoptContext guarded_handoff_deopt{};
+                guarded_handoff_deopt.cold_target =
+                    guarded_indirect_destinations->taken;
+                const std::vector<TieredGuardEmission>
+                    guarded_handoff_guards{{
+                        .instruction_index =
+                            guarded_indirect_prefix.instructions.size() - 1u,
+                        .hot_target = guarded_indirect_hot.start_rip,
+                        .cold_target =
+                            guarded_indirect_destinations->taken,
+                        .hot_path_is_taken = false,
+                        .deopt_context = &guarded_handoff_deopt,
+                    }};
+                OutboundEdgeState guarded_handoff_edge(
+                    guarded_indirect_target.start_rip);
+                guarded_handoff_edge.enters_resident_frame = true;
+                guarded_handoff_edge.target.store(
+                    guarded_indirect_resident, std::memory_order_release);
+                Arm64BlockEntry guarded_handoff_direct = nullptr;
+                Arm64BlockEntry guarded_handoff_resident = nullptr;
+                bool guarded_handoff_chain_abi = false;
+                Arm64BlockEntry guarded_handoff_entry =
+                    arena.EmitNativeControlFlowBlock(
+                        guarded_handoff_trace, &guarded_handoff_edge,
+                        &guarded_handoff_direct, nullptr, nullptr, nullptr,
+                        &guarded_handoff_chain_abi,
+                        &guarded_handoff_resident,
+                        &guarded_handoff_guards);
+
+                std::uint64_t indirect_target =
+                    kGuardedIndirectGuestTarget;
+                const std::uint64_t indirect_target_address =
+                    reinterpret_cast<std::uint64_t>(&indirect_target);
+                LsxMachineImage hot_state{};
+                WriteGuestGpr64(
+                    hot_state, LsxGpr::Rsi, indirect_target_address);
+                WriteGuestGpr64(hot_state, LsxGpr::Rcx, 1);
+                WriteGuestGpr64(hot_state, LsxGpr::R9, 2);
+                WriteGuestGpr64(hot_state, LsxGpr::R10, 1);
+                hot_state.native_edge_phase = 4;
+                const std::uint64_t hot_result =
+                    guarded_handoff_direct != nullptr
+                        ? guarded_handoff_direct(&hot_state)
+                        : 0;
+
+                LsxMachineImage cold_state{};
+                WriteGuestGpr64(
+                    cold_state, LsxGpr::Rsi, indirect_target_address);
+                WriteGuestGpr64(cold_state, LsxGpr::Rcx, 0);
+                WriteGuestGpr64(cold_state, LsxGpr::R9, 2);
+                WriteGuestGpr64(cold_state, LsxGpr::R10, 1);
+                cold_state.native_edge_phase = 4;
+                const std::uint64_t cold_result =
+                    guarded_handoff_direct != nullptr
+                        ? guarded_handoff_direct(&cold_state)
+                        : 0;
+                const std::uint64_t cold_next = EffectiveBlockNext(
+                    guarded_handoff_trace, cold_state, cold_result);
+
+                const auto state_handoff_ok =
+                    [indirect_target_address](const LsxMachineImage& state) {
+                        return ReadGuestGpr64(state, LsxGpr::Rdi) ==
+                                   indirect_target_address &&
+                               ReadGuestGpr64(state, LsxGpr::Rax) ==
+                                   indirect_target_address &&
+                               ReadGuestGpr64(state, LsxGpr::Rbx) ==
+                                   indirect_target_address;
+                    };
+                generic_guarded_indirect_handoff_ok =
+                    guarded_indirect_marker != nullptr &&
+                    guarded_indirect_entry != nullptr &&
+                    guarded_indirect_direct == guarded_indirect_entry &&
+                    guarded_indirect_used &&
+                    guarded_indirect_chain_abi &&
+                    guarded_indirect_resident != nullptr &&
+                    guarded_handoff_entry != nullptr &&
+                    guarded_handoff_direct == guarded_handoff_entry &&
+                    guarded_handoff_chain_abi &&
+                    guarded_handoff_resident != nullptr &&
+                    hot_result == kGuardedIndirectMarker &&
+                    hot_state.rip_or_exit ==
+                        kGuardedIndirectGuestTarget &&
+                    state_handoff_ok(hot_state) &&
+                    cold_result ==
+                        guarded_indirect_destinations->taken &&
+                    cold_next ==
+                        guarded_indirect_destinations->taken &&
+                    state_handoff_ok(cold_state);
+            }
+        }
+
         const std::uint64_t generic_logic_dead_elisions_before =
             g_jit_native_scalar_dead_flag_elisions.load(
                 std::memory_order_relaxed);
@@ -38295,6 +44462,8 @@ std::string ExerciseTranslationEngineJson() {
         const bool generic_scalar_native_ok =
             generic_extension_native_ok && generic_live_flags_native_ok &&
             generic_shift_native_ok && generic_addsub_dead_flags_native_ok &&
+            generic_guarded_dead_flags_native_ok &&
+            generic_guarded_indirect_handoff_ok &&
             generic_logic_dead_flags_native_ok &&
             generic_static_jmp_native_ok &&
             generic_fallthrough_native_ok && generic_wide_hot_v5_counts_ok;
@@ -40938,6 +47107,96 @@ std::string ExerciseTranslationEngineJson() {
             generic_high8_native_memory[1] == 0xabu &&
             ReadGuestGpr64(generic_high8_native_state, LsxGpr::Rax) == 0xabu;
 
+        // Keep the parent RAX resident while AH is both merged and consumed.
+        // The two inputs cover the fallthrough (hot) and taken (cold) Jcc exits.
+        const std::array<std::uint8_t, 13> generic_high8_cached_branch = {
+            0x48, 0x89, 0xf0, // mov rax, rsi
+            0x88, 0xd4,       // mov ah, dl
+            0x88, 0xe1,       // mov cl, ah
+            0x88, 0xe3,       // mov bl, ah
+            0x84, 0xe4,       // test ah, ah
+            0x74, 0x02,       // jz cold
+        };
+        LsxDecodedRegion generic_high8_cached_branch_block =
+            DecodeGuestBasicRegion(
+                reinterpret_cast<std::uint64_t>(
+                    generic_high8_cached_branch.data()),
+                6);
+        const auto generic_high8_cached_branch_destinations =
+            ResolveFixtureBranch(generic_high8_cached_branch_block);
+        const std::uint64_t generic_high8_cached_emissions_before =
+            g_jit_selftest_high8_cached_access_emissions;
+        Arm64BlockEntry generic_high8_cached_branch_direct = nullptr;
+        Arm64BlockEntry generic_high8_cached_branch_entry = nullptr;
+        {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            generic_high8_cached_branch_entry =
+                arena.EmitNativeControlFlowBlock(
+                    generic_high8_cached_branch_block, nullptr,
+                    &generic_high8_cached_branch_direct);
+        }
+        const auto run_generic_high8_cached_branch =
+            [&](const std::uint8_t value, const bool expect_taken) {
+            constexpr std::uint64_t kParent = 0x1122334455667788ull;
+            constexpr std::uint64_t kInitialRcx = 0xa1a2a3a4a5a6a7a8ull;
+            constexpr std::uint64_t kInitialRbx = 0xb1b2b3b4b5b6b7b8ull;
+            LsxMachineImage interpreter_state{};
+            interpreter_state.rflags = 0xad7u;
+            WriteGuestGpr64(
+                interpreter_state, LsxGpr::Rax, kStatePoison);
+            WriteGuestGpr64(
+                interpreter_state, LsxGpr::Rsi, kParent);
+            WriteGuestGpr64(
+                interpreter_state, LsxGpr::Rdx,
+                (kAuxCanaryD & ~std::uint64_t{0xff}) | value);
+            WriteGuestGpr64(
+                interpreter_state, LsxGpr::Rcx, kInitialRcx);
+            WriteGuestGpr64(
+                interpreter_state, LsxGpr::Rbx, kInitialRbx);
+            LsxMachineImage native_state = interpreter_state;
+            const std::uint64_t interpreter_result =
+                InterpretDecodedRegion(
+                    &interpreter_state,
+                    &generic_high8_cached_branch_block);
+            const std::uint64_t native_result =
+                InvokeGeneratedCode(
+                    generic_high8_cached_branch_entry, native_state);
+            const std::uint64_t interpreter_next = EffectiveBlockNext(
+                generic_high8_cached_branch_block, interpreter_state,
+                interpreter_result);
+            const std::uint64_t native_next = EffectiveBlockNext(
+                generic_high8_cached_branch_block, native_state,
+                native_result);
+            const std::uint64_t expected_parent =
+                (kParent & ~std::uint64_t{0xff00}) |
+                (static_cast<std::uint64_t>(value) << 8u);
+            const std::uint64_t expected_next = expect_taken
+                ? generic_high8_cached_branch_destinations->taken
+                : generic_high8_cached_branch_destinations->fallthrough;
+            return interpreter_next == expected_next &&
+                   native_next == expected_next &&
+                   ReadGuestGpr64(native_state, LsxGpr::Rax) ==
+                       expected_parent &&
+                   (ReadGuestGpr64(native_state, LsxGpr::Rcx) & 0xffu) ==
+                       value &&
+                   (ReadGuestGpr64(native_state, LsxGpr::Rbx) & 0xffu) ==
+                       value &&
+                   CheckedNativeStateMatches(
+                       native_state, interpreter_state);
+        };
+        const bool generic_high8_cache_hot_cold_ok =
+            !generic_high8_cached_branch_block.HasDecodeFailure() &&
+            generic_high8_cached_branch_block.SupportsInitialNativeTier() &&
+            generic_high8_cached_branch_block.instructions.size() == 6 &&
+            generic_high8_cached_branch_destinations &&
+            generic_high8_cached_branch_entry != nullptr &&
+            generic_high8_cached_branch_direct ==
+                generic_high8_cached_branch_entry &&
+            g_jit_selftest_high8_cached_access_emissions >=
+                generic_high8_cached_emissions_before + 2u &&
+            run_generic_high8_cached_branch(0x7fu, false) &&
+            run_generic_high8_cached_branch(0x00u, true);
+
         const std::array<std::uint8_t, 7> generic_stack_jmp = {
             0x53,
             0x5a,
@@ -41615,13 +47874,19 @@ std::string ExerciseTranslationEngineJson() {
         const bool generic_indirect_pic_ok =
             generic_indirect_pic_core_ok && generic_indirect_hle_slow_gate_ok;
         const bool full_ok = ok && manual_ok && memory_exchange_contract_ok &&
+                             code_range_snapshot_concurrent_ok &&
+                             runtime_elf_build_identity_ok &&
+                             module_relative_native_relocation_ok &&
                              unwind_stop_frames_ok &&
                              nested_stack_isolation_ok &&
                              execute_loop_ok && direct_zero_root_chain_ok && cache_contract_ok &&
                              cache_public_hash_abi_ok &&
-                             persistent_ir_derived_recompute_ok && edge_e2e_ok &&
-                             conditional_two_edge_direct_ok &&
-                             resident_to_external_boundary_ok &&
+                               persistent_ir_derived_recompute_ok && edge_e2e_ok &&
+                               conditional_two_edge_direct_ok &&
+                               tiered_profile_selection_ok &&
+                               tiered_loop_dispatch_safepoint_ok &&
+                               tiered_guarded_loop_osr_ok &&
+                               resident_to_external_boundary_ok &&
                              direct_fault_target_fallback_ok &&
                              direct_fault_synthetic_resume_ok &&
                              divide_error_delivery_ok &&
@@ -41642,6 +47907,7 @@ std::string ExerciseTranslationEngineJson() {
                               generic_shift_inline_ok && generic_imul_inline_ok &&
                               generic_lahf_sahf_contract_ok &&
                               generic_high8_semantic_native_ok &&
+                              generic_high8_cache_hot_cold_ok &&
                               generic_stack_control_native_ok &&
                               generic_indirect_control_semantic_counter_ok &&
                                generic_indirect_call_native_ok &&
@@ -41695,6 +47961,12 @@ std::string ExerciseTranslationEngineJson() {
             << R"("mappedInstructionCount":)" << mapped_block.instructions.size() << ","
             << R"("dispatchLoopResult":)" << execute_loop_result << ","
             << R"("dispatchLoopOk":)" << (execute_loop_ok ? "true" : "false") << ","
+            << R"("tieredLoopDispatchSafepointOk":)"
+            << (tiered_loop_dispatch_safepoint_ok ? "true" : "false") << ","
+            << R"("tieredProfileSelectionOk":)"
+            << (tiered_profile_selection_ok ? "true" : "false") << ","
+            << R"("tieredGuardedLoopOsrOk":)"
+            << (tiered_guarded_loop_osr_ok ? "true" : "false") << ","
             << R"("dispatchExceptionText":")"
             << Lsx4::Translation::EscapeJsonText(execute_loop_exception)
             << R"(",)"
@@ -41887,6 +48159,9 @@ std::string ExerciseTranslationEngineJson() {
         emit_flag("monoInterfaceCopy60Ok", mono_interface_copy_60_ok);
         emit_flag("monoInterfaceCopy78Ok", mono_interface_copy_78_ok);
         emit_flag("genericScalarNativeOk", generic_scalar_native_ok);
+        emit_flag("codeRangeSnapshotConcurrentOk", code_range_snapshot_concurrent_ok);
+        emit_flag("runtimeElfBuildIdentityOk", runtime_elf_build_identity_ok);
+        emit_flag("moduleRelativeNativeRelocationOk", module_relative_native_relocation_ok);
         emit_flag("serializedHeaderMovbeNativeOk", serialized_header_movbe_native_ok);
         emit_flag("serializedMetadataDivNativeOk", serialized_metadata_div_native_ok);
         emit_flag("genericSimdNativeOk", generic_simd_native_ok);
@@ -41983,6 +48258,10 @@ std::string ExerciseTranslationEngineJson() {
         emit_flag("genericAddSubDeadFlagsStructuralOk", generic_addsub_dead_flags_structural_ok);
         emit_flag("genericAddSubFaultBarrierSemanticOk", generic_addsub_fault_barrier_semantic_ok);
         emit_flag("genericAddSubFaultBarrierStructuralOk", generic_addsub_fault_barrier_structural_ok);
+        emit_flag("genericGuardedDeadFlagsNativeOk", generic_guarded_dead_flags_native_ok);
+        emit_flag("genericGuardedDeadFlagsSemanticOk", generic_guarded_dead_flags_semantic_ok);
+        emit_flag("genericGuardedDeadFlagsStructuralOk", generic_guarded_dead_flags_structural_ok);
+        emit_flag("genericGuardedIndirectHandoffOk", generic_guarded_indirect_handoff_ok);
         emit_flag("genericLogicDeadFlagsNativeOk", generic_logic_dead_flags_native_ok);
         emit_flag("genericLogicDeadFlagsSemanticOk", generic_logic_dead_flags_semantic_ok);
         emit_flag("genericLogicDeadFlagsStructuralOk", generic_logic_dead_flags_structural_ok);
@@ -42016,6 +48295,7 @@ std::string ExerciseTranslationEngineJson() {
         emit_flag("genericSahfIgnoredBitsOk", generic_sahf_ignored_bits_ok);
         emit_flag("genericSahfRaxPreservedOk", generic_sahf_rax_preserved_ok);
         emit_flag("genericHigh8SemanticNativeOk", generic_high8_semantic_native_ok);
+        emit_flag("genericHigh8CacheHotColdOk", generic_high8_cache_hot_cold_ok);
         emit_flag("genericCountedControlNativeOk", generic_counted_control_native_ok);
         emit_flag("genericStackControlNativeOk", generic_stack_control_native_ok);
         emit_flag("genericIndirectControlSemanticCounterOk", generic_indirect_control_semantic_counter_ok);
@@ -42031,6 +48311,8 @@ std::string ExerciseTranslationEngineJson() {
         emit_flag("genericIndirectPicSafepointSmcOk", generic_indirect_pic_safepoint_smc_ok);
         emit_flag("genericIndirectPicDenyRetireOk", generic_indirect_pic_deny_retire_ok);
         emit_flag("genericIndirectPicPersistenceRoundtripOk", generic_indirect_pic_persistence_roundtrip_ok);
+        emit_flag("genericIndirectPicEntryConventionsAbiOk",
+                  generic_indirect_pic_entry_conventions_abi_ok);
 
         emit_number("genericIndirectPicBindCalls",
                     g_jit_indirect_pic_bind_calls.load(std::memory_order_relaxed));
@@ -42133,6 +48415,15 @@ ExecutorProbeNativeOwnership(std::uint64_t pc, std::uint64_t* base_out,
     return probe.found;
 }
 
+void ConfigureTieredJit(const bool enabled,
+                        const bool trace_compilation_enabled) noexcept {
+    ConfigureTieredJitState(enabled, trace_compilation_enabled);
+}
+
+void ConfigureFastGuestMemory(const bool enabled) noexcept {
+    g_fast_guest_memory_enabled.store(enabled, std::memory_order_release);
+}
+
 }
 
 namespace Lsx4::Translation {
@@ -42181,7 +48472,26 @@ TranslationCounters ReadTranslationCounters() noexcept {
             source.persistent_native_records_captured,
             source.persistent_native_records_written,
             source.persistent_native_restore_fallbacks,
-            source.persistent_native_capture_rejected};
+            source.persistent_native_capture_rejected,
+            source.tier0_compiled,
+            source.tier0_active,
+            source.tier1_queued,
+            source.tier1_compiled,
+            source.tier1_active,
+            source.tier1_promotions,
+            source.tier1_deopts,
+            source.tier1_rejected,
+            source.tier1_safe_handoffs,
+            source.tier1_loop_osr_handoffs,
+            source.tier1_compile_time_us,
+            source.tier1_generated_bytes,
+            source.gpr_cached_blocks,
+            source.gpr_cached_registers,
+            source.gpr_estimated_loads_stores_avoided,
+            source.gpr_cache_shape_rejections,
+            source.simd_cached_blocks,
+            source.simd_cached_halves,
+            source.simd_estimated_loads_stores_avoided};
 }
 
 std::string DescribeTranslationRuntime() {

@@ -16,7 +16,11 @@ if (NOT ANDROID)
     message(FATAL_ERROR "LSX4 native runtime must be configured with the Android NDK toolchain")
 endif()
 
-set(LSX4_ARM_DESKTOP_LAYER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/funnel-arm")
+set(LSX4_ARM_DESKTOP_LAYER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/funnel-arm" CACHE PATH
+    "Funnel ARM desktop layer source directory")
+option(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT
+       "Build the runtime against a historical Funnel tree for regression bisection"
+       OFF)
 set(LSX4_ARM_DESKTOP_LAYER_MANIFEST
     "${LSX4_ARM_DESKTOP_LAYER_DIR}/cmake/lsx4_arm_desktop_layer.cmake")
 if(NOT EXISTS "${LSX4_ARM_DESKTOP_LAYER_MANIFEST}")
@@ -363,6 +367,11 @@ add_library(lsx4_executor_android SHARED
     src/executor/runtime_death_catcher.cpp
 )
 
+if(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
+    target_compile_definitions(lsx4_executor_android PRIVATE
+        LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT=1)
+endif()
+
 if(LSX4_ENABLE_PS5_DESKTOP_PATH)
     lsx4_define_ps5_desktop_profile()
     lsx4_assert_ps5_desktop_ownership(${LSX4_PS5_DESKTOP_SOURCES})
@@ -382,18 +391,45 @@ if(LSX4_ENABLE_PS5_DESKTOP_PATH)
             "The isolated PS5 Gen5 translator source tree is missing: ${LSX4_KYTY_GEN5_DIR}")
     endif()
 
+    set(LSX4_KYTY_GENERATED_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/kyty")
+    file(MAKE_DIRECTORY "${LSX4_KYTY_GENERATED_DIR}")
+    set(KYTY_VERSION "0.2.2")
+    set(KYTY_ENDIAN KYTY_ENDIAN_LITTLE)
+    set(KYTY_PLATFORM KYTY_PLATFORM_LINUX)
+    set(KYTY_COMPILER CLANG)
+    set(KYTY_LINKER LLD)
+    if(CMAKE_BUILD_TYPE MATCHES Debug)
+        set(KYTY_BUILD KYTY_BUILD_DEBUG)
+    else()
+        set(KYTY_BUILD KYTY_BUILD_RELEASE)
+    endif()
+    set(KYTY_FINAL OFF)
+    configure_file(
+        "${LSX4_KYTY_GEN5_DIR}/src/cmake_config.h.in"
+        "${LSX4_KYTY_GENERATED_DIR}/cmake_config.h"
+        @ONLY)
+
     add_library(lsx4_executor_ps5_android SHARED
         ${LSX4_PS5_DESKTOP_SOURCES}
         ${LSX4_JIT_COMMON_SOURCES}
         ${LSX4_GEN5_RECOMPILER_SOURCES}
         "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/x86_decoder.cpp"
+        "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/thread.cpp"
+        "${LSX4_ARM_DESKTOP_SOURCE_DIR}/core/libraries/audio/audio_mix.cpp"
         src/executor/ps5_desktop/backend_contract.cpp
         src/executor/ps5_desktop/bc7decomp.cpp
         src/executor/ps5_desktop/gen5_compute_recompiler.cpp
+        src/executor/ps5_desktop/ps5_audio_scheduler.cpp
         src/executor/ps5_desktop/vulkan_presenter.cpp
         src/executor/ps5_desktop/runtime_api.cpp)
+    set_property(
+        SOURCE "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/thread.cpp"
+        APPEND PROPERTY COMPILE_OPTIONS
+        "-iquote${LSX4_ARM_DESKTOP_SOURCE_DIR}")
     target_include_directories(lsx4_executor_ps5_android BEFORE PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/ps5_desktop/kyty_compat"
+        "${LSX4_KYTY_GENERATED_DIR}"
         "${LSX4_KYTY_GEN5_DIR}/src")
     target_include_directories(lsx4_executor_ps5_android PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -446,8 +482,32 @@ if(ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
     endif()
 endif()
 
+file(GLOB_RECURSE LSX4_JIT_NATIVE_ARTIFACT_ABI_SOURCES
+    CONFIGURE_DEPENDS
+    LIST_DIRECTORIES false
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/executor/dynamic_translation/*.in")
+list(SORT LSX4_JIT_NATIVE_ARTIFACT_ABI_SOURCES)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${LSX4_JIT_NATIVE_ARTIFACT_ABI_SOURCES})
+set(LSX4_JIT_NATIVE_ARTIFACT_SOURCE_MATERIAL "")
+foreach(LSX4_JIT_NATIVE_ARTIFACT_ABI_SOURCE
+        IN LISTS LSX4_JIT_NATIVE_ARTIFACT_ABI_SOURCES)
+    file(SHA256 "${LSX4_JIT_NATIVE_ARTIFACT_ABI_SOURCE}"
+         LSX4_JIT_NATIVE_ARTIFACT_SOURCE_FILE_HASH)
+    file(RELATIVE_PATH LSX4_JIT_NATIVE_ARTIFACT_SOURCE_RELATIVE
+         "${CMAKE_CURRENT_SOURCE_DIR}"
+         "${LSX4_JIT_NATIVE_ARTIFACT_ABI_SOURCE}")
+    string(APPEND LSX4_JIT_NATIVE_ARTIFACT_SOURCE_MATERIAL
+        "${LSX4_JIT_NATIVE_ARTIFACT_SOURCE_RELATIVE}:"
+        "${LSX4_JIT_NATIVE_ARTIFACT_SOURCE_FILE_HASH}\n")
+endforeach()
+string(SHA256 LSX4_JIT_NATIVE_ARTIFACT_SOURCE_HASH
+    "${LSX4_JIT_NATIVE_ARTIFACT_SOURCE_MATERIAL}")
+
 set(LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH "4b739d10c6e58a21"
-    CACHE STRING "Explicit compatibility epoch for persisted AArch64 translations")
+    CACHE STRING "Explicit compatibility salt for persisted AArch64 translations")
 string(LENGTH "${LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH}"
        LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH_LENGTH)
 if(NOT LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH_LENGTH EQUAL 16 OR
@@ -456,6 +516,12 @@ if(NOT LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH_LENGTH EQUAL 16 OR
         "LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH must contain exactly 16 hexadecimal digits")
 endif()
 string(TOLOWER "${LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH}"
+       LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH_NORMALIZED)
+set(LSX4_JIT_NATIVE_ARTIFACT_ABI_MATERIAL
+    "ps4:${LSX4_JIT_NATIVE_ARTIFACT_ABI_EPOCH_NORMALIZED}:${LSX4_JIT_NATIVE_ARTIFACT_SOURCE_HASH}")
+string(SHA256 LSX4_JIT_NATIVE_ARTIFACT_ABI_HASH
+    "${LSX4_JIT_NATIVE_ARTIFACT_ABI_MATERIAL}")
+string(SUBSTRING "${LSX4_JIT_NATIVE_ARTIFACT_ABI_HASH}" 0 16
        EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH_64)
 set(EXECUTOR_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/generated/executor/dynamic_translation")
@@ -477,6 +543,12 @@ if(TARGET lsx4_executor_ps5_android)
             "LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH must contain exactly 16 hexadecimal digits")
     endif()
     string(TOLOWER "${LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH}"
+           LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH_NORMALIZED)
+    set(LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_MATERIAL
+        "ps5:${LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_EPOCH_NORMALIZED}:${LSX4_JIT_NATIVE_ARTIFACT_SOURCE_HASH}")
+    string(SHA256 LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_HASH
+        "${LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_MATERIAL}")
+    string(SUBSTRING "${LSX4_PS5_JIT_NATIVE_ARTIFACT_ABI_HASH}" 0 16
            EXECUTOR_JIT_NATIVE_CACHE_ABI_HASH_64)
     set(LSX4_PS5_JIT_NATIVE_CACHE_ABI_INCLUDE_DIR
         "${CMAKE_CURRENT_BINARY_DIR}/generated/ps5/executor/dynamic_translation")
@@ -601,7 +673,8 @@ target_include_directories(lsx4_executor_android PRIVATE ${CMAKE_CURRENT_SOURCE_
 
 set(HOST_SHADERS_INCLUDE ${LSX4_ARM_DESKTOP_SOURCE_DIR}/video_core/host_shaders)
 
-add_subdirectory(${HOST_SHADERS_INCLUDE})
+add_subdirectory(${HOST_SHADERS_INCLUDE}
+    "${CMAKE_CURRENT_BINARY_DIR}/lsx4-arm-host-shaders")
 add_dependencies(lsx4_executor_android host_shaders)
 target_include_directories(lsx4_executor_android PRIVATE ${HOST_SHADERS_INCLUDE})
 
@@ -617,7 +690,8 @@ cmrc_add_resource_library(embedded-resources
         ${LSX4_ARM_DESKTOP_SOURCE_DIR}/runtime_resources/silver.png)
 target_link_libraries(lsx4_executor_android PRIVATE res::embedded)
 
-add_subdirectory(${LSX4_ARM_DESKTOP_SOURCE_DIR}/imgui/renderer)
+add_subdirectory(${LSX4_ARM_DESKTOP_SOURCE_DIR}/imgui/renderer
+    "${CMAKE_CURRENT_BINARY_DIR}/lsx4-arm-imgui-renderer")
 add_dependencies(lsx4_executor_android ImGui_Resources)
 target_include_directories(lsx4_executor_android PRIVATE ${IMGUI_RESOURCES_INCLUDE})
 

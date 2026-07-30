@@ -15,7 +15,7 @@
 
 namespace Executor::Jit {
 
-inline constexpr std::uint32_t kJitIrCacheFormatVersion = 4;
+inline constexpr std::uint32_t kJitIrCacheFormatVersion = 5;
 inline constexpr std::size_t kJitIrCacheContentKeySize = 32;
 inline constexpr std::uint32_t kJitNativeNoSegment = UINT32_MAX;
 inline constexpr std::uint32_t kJitNativeFlagValid = 1u << 0;
@@ -42,8 +42,14 @@ inline constexpr std::uint32_t kJitNativeFlagHotStateDirectV19 = 1u << 20;
 inline constexpr std::uint32_t kJitNativeFlagHotAtomicPermuteV20 = 1u << 21;
 inline constexpr std::uint32_t kJitNativeFlagCmpxchgCacheSyncV21 = 1u << 22;
 inline constexpr std::uint32_t kJitNativeFlagXchgCacheSyncV22 = 1u << 23;
+inline constexpr std::uint32_t kJitNativeFlagIndirectPicSafeLinearV26 = 1u << 24;
 inline constexpr std::uint32_t kJitNativeFlagPs5PauseYieldV23 = 1u << 25;
+inline constexpr std::uint32_t kJitNativeFlagTieredScalarFloatDirectV29 = 1u << 26;
+inline constexpr std::uint32_t kJitNativeFlagLocalLoopSamplingV28 = 1u << 29;
 inline constexpr std::uint32_t kJitNativeFlagPs5AtomicRestoreV24 = 1u << 27;
+inline constexpr std::uint32_t kJitNativeFlagHashedIndirectPicV25 = 1u << 28;
+inline constexpr std::uint32_t kJitNativeFlagSignalFaultDescriptorV30 = 1u << 30;
+inline constexpr std::uint32_t kJitNativeFlagVectorUpperZeroElisionV31 = 1u << 31;
 
 enum class JitNativeRelocationKind : std::uint8_t {
     ModuleRelative = 0,
@@ -147,5 +153,10 @@ struct JitIrCacheLoadResult {
                                                  std::span<const JitIrCacheRecord> records,
                                                  std::string& error,
                                                  const JitIrCacheLimits& limits = {});
+
+[[nodiscard]] bool SaveJitAuxiliaryFileAtomic(
+    const std::filesystem::path& path,
+    std::span<const std::uint8_t> bytes,
+    std::string& error);
 
 }

@@ -193,3 +193,90 @@ For a page-watcher or Android presentation change:
 7. Recheck Hyper Light Drifter because it exercised a related resource-update pattern, and retain a game such as Limbo as a broader non-regression check rather than as the primary reproducer.
 
 If a future change improves one scene but fails another, treat it as incomplete. The successful fix must satisfy the memory-protection invariants independently of engine, game, surface address, or frame cadence.
+
+## Bloodborne mobile-renderer regression (2026-07-29)
+
+### Symptom
+
+After enabling the new managed renderer optimizations, Bloodborne could alternate between complete
+frames and frames with missing character parts, missing terrain, white attachment regions, or
+temporarily recolored foliage. Static screenshots were insufficient; the reliable reproducer was a
+20-second 60 FPS screen recording of the Hunter's Dream gameplay scene.
+
+### Confirmed cause and fix
+
+The ordinary draw path had inherited the late-render-scope ordering needed by physical DRS and
+deferred transfer batching. It bound the graphics pipeline and vertex/index state before opening
+the dynamic-rendering scope even when neither optimization had pending work. That ordering is legal
+in the abstract Vulkan model, but was not stable on the tested Qualcomm mobile path and produced
+intermittent loss of draw state/resources.
+
+[`vk_rasterizer.cpp`](../funnel-arm/src/video_core/renderer_vulkan/vk_rasterizer.cpp) now uses two
+explicit paths:
+
+- ordinary draws enter dynamic rendering before binding graphics/vertex/index state, matching the
+  previously stable renderer contract;
+- the late scope remains enabled only when a physical-DRS target is active or the scheduler has
+  pending buffer transfers that can still end the scope.
+
+This is not a blanket rollback: transfer coalescing and physical DRS retain their required late
+scope, while unrelated draws no longer pay its compatibility risk. A 20-second gameplay recording
+after the change contained zero missing-character, missing-terrain, white-region, or foliage-color
+frames.
+
+The diagnostic `run-bisect-disable-pm4-descriptor-cache` sentinel was also removed before the
+confirmation run; it must not be left on during performance measurements.
+
+### Hypotheses tested but not sufficient
+
+- Reverting typed buffer alias bindings removed one independent regression but did not eliminate
+  all missing-surface frames.
+- Restoring strict guest page watcher protection was required for coherency but did not fix this
+  renderer-order regression by itself.
+- Making new scheduler optimization state ABI-neutral removed the stale-layout failure, but current
+  scheduler behavior still exposed the draw-order issue.
+- Correcting the fault-bitset Vulkan barrier to describe `atomicOr`/`atomicExchange` as shader
+  read-modify-write access was valid synchronization hardening, but the dynamic artifact remained.
+- Replacing the atomic fault producer with the older non-atomic load/OR/store path did not change
+  the artifact; the atomic producer was restored.
+- Disabling render-scope reuse, transfer coalescing, state deduplication, PM4 descriptor caching,
+  tile scratch reuse, graphics-pipeline generation shortcuts, async pipelines, and page-manager
+  experiments individually did not remove the defect.
+- Pipeline-cache telemetry showed frequent legitimate graphics-state changes; it was not evidence
+  that shader invalidation itself caused the missing meshes.
+
+### Additional invariant
+
+On the Android renderer, do not apply late dynamic-rendering scope creation globally. It is allowed
+only while a known operation can still flush transfers or replace the render target. The ordinary
+path must preserve the stable ordering:
+
+`BindResources / barriers -> BeginRendering -> bind pipeline -> bind vertex/index -> draw`.
+
+### Related full-profile T2 stall
+
+Enabling every managed optimization after the renderer fix exposed a separate loading-screen
+stall: GNM progress stopped after `Continue`, while the tiered worker kept publishing T2 traces.
+An A/B run with T0/T1, Vulkan, readback, DRS and async pipelines unchanged isolated the failure to
+trace compilation.
+
+The trace planner could be queued from a forward edge, follow several hot successors, and later
+discover a backedge to a member already in the trace. It stopped extending the plan but still
+published it as `loopOsr=0`. The resulting native self-chain had no periodic composite-witness
+safepoint and could remain inside stale polling/control flow indefinitely.
+
+[`retiring_execution_core.cpp`](../src/executor/dynamic_translation/retiring_execution_core.cpp)
+now handles the cycle without disabling T2:
+
+- an exact closure to the trace seed is promoted to the existing safe loop-OSR path;
+- a cycle into another member is rejected and re-profiled from its real loop head;
+- minimum-size and loop-closure validation use the final plan classification, including dynamically
+  discovered loops.
+
+With `TRACE` enabled again alongside the complete managed GPU/readback/async profile, Bloodborne
+passed the same loading point and ran gameplay continuously. A 20-second recording contained no
+stall, missing geometry, white attachment regions, or foliage-color frames.
+
+Additional JIT invariant: no trace that can native-chain back into its own member set may be
+published as a straight-line trace. Every such cycle requires a validated loop head and periodic
+OSR/deopt safepoint.

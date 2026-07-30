@@ -20,6 +20,8 @@ namespace Executor::Jit {
 void ConfigureTieredJit(bool enabled, bool trace_compilation_enabled) noexcept;
 [[nodiscard]] bool TieredJitEnabled() noexcept;
 [[nodiscard]] bool JitTraceCompilationEnabled() noexcept;
+void ConfigureFastGuestMemory(bool enabled) noexcept;
+[[nodiscard]] bool FastGuestMemoryEnabled() noexcept;
 
 enum class LsxGpr : std::uint8_t {
     Rax,
@@ -104,6 +106,9 @@ struct alignas(32) LsxMachineImage {
     std::array<std::array<std::uint8_t, 0x20>, 16> ymm{};
     std::uint64_t fault_ir_slot = 0;
     std::uint64_t native_fault_ir = 0;
+    std::uint64_t deferred_flags_lhs = 0;
+    std::uint64_t deferred_flags_meta = 0;
+    std::uint64_t deferred_flags_rhs = 0;
 };
 
 static_assert(std::is_standard_layout_v<LsxMachineImage>);
@@ -126,7 +131,10 @@ static_assert(offsetof(LsxMachineImage, x87_data_pointer) == 0x138);
 static_assert(offsetof(LsxMachineImage, ymm) == 0x140);
 static_assert(offsetof(LsxMachineImage, fault_ir_slot) == 0x340);
 static_assert(offsetof(LsxMachineImage, native_fault_ir) == 0x348);
-static_assert(sizeof(LsxMachineImage) == 0x360);
+static_assert(offsetof(LsxMachineImage, deferred_flags_lhs) == 0x350);
+static_assert(offsetof(LsxMachineImage, deferred_flags_meta) == 0x358);
+static_assert(offsetof(LsxMachineImage, deferred_flags_rhs) == 0x360);
+static_assert(sizeof(LsxMachineImage) == 0x380);
 
 struct LsxEntryPacket {
     using Argument = std::uint64_t;
@@ -508,6 +516,25 @@ struct RuntimeStatsSnapshot {
     std::uint64_t persistent_native_records_written{};
     std::uint64_t persistent_native_restore_fallbacks{};
     std::uint64_t persistent_native_capture_rejected{};
+    std::uint64_t tier0_compiled{};
+    std::uint64_t tier0_active{};
+    std::uint64_t tier1_queued{};
+    std::uint64_t tier1_compiled{};
+    std::uint64_t tier1_active{};
+    std::uint64_t tier1_promotions{};
+    std::uint64_t tier1_deopts{};
+    std::uint64_t tier1_rejected{};
+    std::uint64_t tier1_safe_handoffs{};
+    std::uint64_t tier1_loop_osr_handoffs{};
+    std::uint64_t tier1_compile_time_us{};
+    std::uint64_t tier1_generated_bytes{};
+    std::uint64_t gpr_cached_blocks{};
+    std::uint64_t gpr_cached_registers{};
+    std::uint64_t gpr_estimated_loads_stores_avoided{};
+    std::uint64_t gpr_cache_shape_rejections{};
+    std::uint64_t simd_cached_blocks{};
+    std::uint64_t simd_cached_halves{};
+    std::uint64_t simd_estimated_loads_stores_avoided{};
 };
 
 [[nodiscard]] RuntimeStatsSnapshot SnapshotTranslationTelemetry() noexcept;

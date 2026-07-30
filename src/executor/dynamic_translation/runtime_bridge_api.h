@@ -49,5 +49,6 @@ extern "C" int executor_lsx4_android_dispatch_deferred_guest_signal(
 extern "C" int executor_jit_defer_synchronous_guest_fault(
     std::int32_t native_sig, std::int32_t si_code, std::int32_t si_errno,
     std::int32_t source_pid, std::uint32_t source_uid,
-    std::uint64_t fault_addr, std::int32_t is_write);
+    std::uint64_t fault_addr, std::int32_t is_write,
+    const void* raw_context);
 #endif

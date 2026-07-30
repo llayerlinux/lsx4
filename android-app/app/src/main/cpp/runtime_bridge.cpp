@@ -1242,7 +1242,7 @@ Java_app_lsx4_android_RuntimeBridge_jitStatus(JNIEnv* env, jclass)
 extern "C" JNIEXPORT jlongArray JNICALL
 Java_app_lsx4_android_RuntimeBridge_runtimeHudStats(JNIEnv* env, jclass)
 {
-    constexpr std::size_t kValueCapacity = 21;
+    constexpr std::size_t kValueCapacity = 92;
     std::uint64_t values[kValueCapacity]{};
     const auto hud_stats =
         g_active_ps5_runtime.load(std::memory_order_acquire)

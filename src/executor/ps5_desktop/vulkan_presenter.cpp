@@ -16,11 +16,21 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace Lsx4::Ps5Desktop {
@@ -29,14 +39,23 @@ namespace {
 inline constexpr std::uint32_t VulkanFullscreenTriangleShader[] =
 #include "executor/ps5_desktop/vulkan_fullscreen_triangle.spv.inc"
 ;
+inline constexpr std::uint32_t VulkanFsrUpscaleVertexShader[] = {
+#include "executor/ps5_desktop/vulkan_fsr_upscale.vert.spv.inc"
+};
+inline constexpr std::uint32_t VulkanFsrUpscaleFragmentShader[] = {
+#include "executor/ps5_desktop/vulkan_fsr_upscale.frag.spv.inc"
+};
 
 struct GuestTextureResource {
     std::uint64_t key{};
     std::uint64_t signature{};
+    std::uint64_t content_hash_low{};
+    std::uint64_t content_hash_high{};
     VkImage image{};
     VkDeviceMemory memory{};
     VkImageView view{};
     VkDescriptorSet descriptor{};
+    VkDeviceSize allocation_size{};
     std::uint32_t width{};
     std::uint32_t height{};
     bool initialized{};
@@ -52,11 +71,155 @@ struct GuestTargetResource {
     VkFramebuffer framebuffer{};
     VkDescriptorSet descriptor{};
     VkDescriptorSet nearest_descriptor{};
+    VkDeviceSize allocation_size{};
     VkExtent2D extent{};
     bool initialized{};
     std::uint64_t last_batch_id{};
     std::uint64_t last_use{};
 };
+
+constexpr std::size_t Gen5ComputePipelineCacheLimit = 256u;
+constexpr std::size_t AsyncPipelineQueueLimit = 32u;
+constexpr std::size_t AsyncPipelineQueueByteLimit = 16u * 1024u * 1024u;
+
+struct AtomicAsyncPipelineStats {
+    std::atomic<std::uint64_t> compute_misses{};
+    std::atomic<std::uint64_t> cache_hits{};
+    std::atomic<std::uint64_t> fast_completed{};
+    std::atomic<std::uint64_t> optimized_queued{};
+    std::atomic<std::uint64_t> optimized_completed{};
+    std::atomic<std::uint64_t> published{};
+    std::atomic<std::uint64_t> optimized_replacements{};
+    std::atomic<std::uint64_t> build_failures{};
+    std::atomic<std::uint64_t> queue_drops{};
+    std::atomic<std::uint64_t> disk_cache_loads{};
+    std::atomic<std::uint64_t> disk_cache_writes{};
+    std::atomic<std::uint64_t> negative_cache_hits{};
+};
+
+struct AtomicDriverOptimizationStats {
+    std::atomic<std::uint64_t> pipeline_bind_attempts{};
+    std::atomic<std::uint64_t> pipeline_binds_elided{};
+    std::atomic<std::uint64_t> descriptor_bind_attempts{};
+    std::atomic<std::uint64_t> descriptor_binds_elided{};
+    std::atomic<std::uint64_t> push_constant_attempts{};
+    std::atomic<std::uint64_t> push_constants_elided{};
+    std::atomic<std::uint64_t> dynamic_state_commits{};
+    std::atomic<std::uint64_t> dynamic_state_full_replays{};
+    std::atomic<std::uint64_t> barriers_elided{};
+    std::atomic<std::uint64_t> render_scope_reuses{};
+    std::atomic<std::uint64_t> barrier_requests{};
+    std::atomic<std::uint64_t> barrier_batches{};
+    std::atomic<std::uint64_t> barrier_regions{};
+    std::atomic<std::uint64_t> barrier_regions_merged{};
+    std::atomic<std::uint64_t> transfer_requests{};
+    std::atomic<std::uint64_t> transfer_flushes{};
+    std::atomic<std::uint64_t> transfer_regions{};
+    std::atomic<std::uint64_t> transfer_copy_calls{};
+    std::atomic<std::uint64_t> queue_submits{};
+    std::atomic<std::uint64_t> queue_submit_logical_packets{};
+    std::atomic<std::uint64_t> queue_submit_command_buffers{};
+    std::atomic<std::uint64_t> queue_submit_calls_saved{};
+    std::atomic<std::uint64_t> queue_submit_forced_boundaries{};
+    std::atomic<std::uint64_t> vertex_bind_attempts{};
+    std::atomic<std::uint64_t> vertex_binds_elided{};
+    std::atomic<std::uint64_t> index_bind_attempts{};
+    std::atomic<std::uint64_t> index_binds_elided{};
+};
+
+struct AtomicMobileGpuStats {
+    std::atomic<std::uint64_t> effective_scale_percent{100u};
+    std::atomic<std::uint64_t> max_gpu_backlog{};
+    std::atomic<std::uint64_t> coarse_rate_draws{};
+    std::atomic<std::uint64_t> fsr_frames{};
+    std::atomic<std::uint64_t> exact_surface_reuses{};
+    std::atomic<std::uint64_t> exact_surface_reuse_bytes{};
+    std::atomic<std::uint64_t> residency_gc_evictions{};
+    std::atomic<std::uint64_t> physical_drs_available{};
+    std::atomic<std::uint64_t> physical_scaled_draws{};
+    std::atomic<std::uint64_t> physical_scale_fallbacks{};
+    std::atomic<std::uint64_t> physical_resolve_blits{};
+    std::atomic<std::uint64_t> physical_pixels_saved{};
+    std::atomic<std::uint64_t> source_smaller_than_output_frames{};
+    std::atomic<std::uint64_t> scale_down_events{};
+    std::atomic<std::uint64_t> scale_up_events{};
+};
+
+struct AtomicReadbackBatchStats {
+    std::atomic<std::uint64_t> snapshots{};
+    std::atomic<std::uint64_t> ranges{};
+    std::atomic<std::uint64_t> copy_commands{};
+    std::atomic<std::uint64_t> copy_regions{};
+    std::atomic<std::uint64_t> retirement_waits{};
+    std::atomic<std::uint64_t> fallbacks{};
+};
+
+AtomicAsyncPipelineStats g_async_pipeline_stats;
+AtomicDriverOptimizationStats g_driver_optimization_stats;
+AtomicMobileGpuStats g_mobile_gpu_stats;
+AtomicReadbackBatchStats g_readback_batch_stats;
+bool g_driver_optimization_enabled{};
+bool g_async_pipeline_enabled{};
+bool g_mobile_gpu_enabled{};
+bool g_readback_batch_enabled{};
+std::uint32_t g_requested_max_anisotropy{1u};
+std::string g_pipeline_cache_root;
+std::string g_pipeline_cache_title{"unknown"};
+bool g_pipeline_cache_disk_enabled{};
+
+struct Gen5ComputeDescriptorBindingKey {
+    std::uint32_t binding{};
+    VkDescriptorType descriptor_type{};
+    std::uint32_t descriptor_count{};
+    VkShaderStageFlags stage_flags{};
+    std::vector<VkSampler> immutable_samplers;
+};
+
+struct Gen5ComputePipelineKey {
+    std::uint64_t spirv_hash_low{};
+    std::uint64_t spirv_hash_high{};
+    std::size_t spirv_word_count{};
+    std::vector<Gen5ComputeDescriptorBindingKey> bindings;
+    VkDescriptorSetLayoutCreateFlags descriptor_layout_flags{};
+    VkPipelineLayoutCreateFlags pipeline_layout_flags{};
+    std::uint32_t descriptor_set{};
+    VkShaderStageFlags push_constant_stage_flags{};
+    std::uint32_t push_constant_offset{};
+    std::uint32_t push_constant_size{};
+    VkShaderModuleCreateFlags shader_module_flags{};
+    VkPipelineShaderStageCreateFlags shader_stage_flags{};
+    VkShaderStageFlagBits shader_stage{VK_SHADER_STAGE_COMPUTE_BIT};
+    std::array<char, 5> entry_point{'m', 'a', 'i', 'n', '\0'};
+    bool has_specialization_info{};
+    VkPipelineCreateFlags pipeline_flags{};
+    VkPipeline base_pipeline_handle{};
+    std::int32_t base_pipeline_index{};
+};
+
+struct Gen5ComputePipelineBundle {
+    VkShaderModule module{};
+    VkDescriptorSetLayout set_layout{};
+    VkPipelineLayout pipeline_layout{};
+    VkPipeline pipeline{};
+};
+
+struct Gen5ComputePipelineCacheEntry {
+    Gen5ComputePipelineKey key;
+    std::vector<std::uint32_t> spirv;
+    Gen5ComputePipelineBundle bundle;
+    std::uint64_t last_use{};
+    std::uint64_t generation{};
+    bool optimized{};
+    bool optimization_pending{};
+};
+
+struct Gen5ComputePipelineNegativeEntry {
+    Gen5ComputePipelineKey key;
+    std::vector<std::uint32_t> spirv;
+    std::uint64_t last_use{};
+};
+
+struct AsyncPipelineState;
 
 struct Presenter {
     ANativeWindow* window{};
@@ -66,9 +229,21 @@ struct Presenter {
     VkDevice device{};
     std::uint32_t queue_family{std::numeric_limits<std::uint32_t>::max()};
     VkQueue queue{};
+    VkPhysicalDeviceProperties physical_properties{};
+    VkPhysicalDeviceMemoryProperties memory_properties{};
+    bool sampler_anisotropy_supported{};
+    float effective_anisotropy{1.0f};
+    bool fragment_shading_rate_supported{};
+    bool fragment_shading_rate_2x2{};
+    PFN_vkCmdSetFragmentShadingRateKHR cmd_set_fragment_shading_rate{};
+    bool timeline_semaphore_supported{};
+    PFN_vkWaitSemaphoresKHR wait_semaphores{};
+    VkSemaphore retirement_timeline{};
+    std::uint64_t retirement_timeline_value{};
     VkSwapchainKHR swapchain{};
     VkFormat swapchain_format{VK_FORMAT_UNDEFINED};
     VkExtent2D swapchain_extent{};
+    bool swapchain_color_attachment_supported{};
     std::uint32_t configured_width{};
     std::uint32_t configured_height{};
     std::vector<VkImage> swapchain_images;
@@ -105,10 +280,31 @@ struct Presenter {
     VkSampler guest_repeat_sampler{};
     VkSampler guest_nearest_sampler{};
     VkSampler guest_nearest_repeat_sampler{};
+    VkRenderPass fsr_render_pass{};
+    VkDescriptorSetLayout fsr_descriptor_layout{};
+    VkDescriptorPool fsr_descriptor_pool{};
+    VkDescriptorSet fsr_descriptor{};
+    VkPipelineLayout fsr_pipeline_layout{};
+    VkPipeline fsr_pipeline{};
+    VkShaderModule fsr_vertex_shader{};
+    VkShaderModule fsr_fragment_shader{};
+    VkSampler fsr_sampler{};
+    std::vector<VkImageView> fsr_swapchain_views;
+    std::vector<VkFramebuffer> fsr_framebuffers;
+    VkImageView fsr_bound_source_view{};
     std::unordered_map<std::uint64_t, GuestTextureResource>
         guest_textures;
+    std::unordered_map<std::uint64_t, std::uint64_t>
+        guest_texture_aliases;
+    VkDeviceSize guest_texture_resident_bytes{};
+    VkDeviceSize guest_target_resident_bytes{};
+    VkDeviceSize guest_resource_budget_bytes{256u * 1024u * 1024u};
     std::unordered_map<std::uint64_t, GuestTargetResource>
         guest_targets;
+    std::unordered_set<std::uint64_t>
+        pending_guest_target_uses;
+    std::unordered_set<std::uint64_t>
+        in_flight_guest_target_uses;
     std::uint64_t guest_frame_serial{};
     std::uint64_t last_guest_batch_id{};
     std::uint64_t last_guest_target_key{};
@@ -118,6 +314,20 @@ struct Presenter {
     bool source_initialized{};
     bool submission_in_flight{};
     bool permanently_failed{};
+    std::vector<Gen5ComputePipelineCacheEntry>
+        gen5_compute_pipeline_cache;
+    std::vector<Gen5ComputePipelineNegativeEntry>
+        gen5_compute_pipeline_negative_cache;
+    std::vector<Gen5ComputePipelineBundle>
+        gen5_compute_pipeline_retired_bundles;
+    std::uint64_t gen5_compute_pipeline_use_serial{};
+    std::uint64_t gen5_compute_pipeline_generation{1u};
+    std::shared_ptr<AsyncPipelineState> async_pipeline;
+    std::uint32_t mobile_scale_percent{100u};
+    std::uint32_t mobile_pending_scale_percent{100u};
+    std::uint64_t mobile_frame_count{};
+    std::uint64_t mobile_pressure_frames{};
+    std::uint64_t mobile_relaxed_frames{};
 };
 
 std::mutex g_mutex;
@@ -129,6 +339,799 @@ void LogFailure(const char* const operation, const VkResult result) {
         ANDROID_LOG_WARN, "LSX4-PS5",
         "vulkan presenter failed operation=%s result=%d",
         operation, static_cast<int>(result));
+}
+
+bool SameGen5ComputeDescriptorBinding(
+    const Gen5ComputeDescriptorBindingKey& left,
+    const Gen5ComputeDescriptorBindingKey& right) {
+    return left.binding == right.binding &&
+        left.descriptor_type == right.descriptor_type &&
+        left.descriptor_count == right.descriptor_count &&
+        left.stage_flags == right.stage_flags &&
+        left.immutable_samplers == right.immutable_samplers;
+}
+
+bool SameGen5ComputePipelineKey(
+    const Gen5ComputePipelineKey& left,
+    const Gen5ComputePipelineKey& right) {
+    if (left.spirv_hash_low != right.spirv_hash_low ||
+        left.spirv_hash_high != right.spirv_hash_high ||
+        left.spirv_word_count != right.spirv_word_count ||
+        left.bindings.size() != right.bindings.size() ||
+        left.descriptor_layout_flags !=
+            right.descriptor_layout_flags ||
+        left.pipeline_layout_flags != right.pipeline_layout_flags ||
+        left.descriptor_set != right.descriptor_set ||
+        left.push_constant_stage_flags !=
+            right.push_constant_stage_flags ||
+        left.push_constant_offset != right.push_constant_offset ||
+        left.push_constant_size != right.push_constant_size ||
+        left.shader_module_flags != right.shader_module_flags ||
+        left.shader_stage_flags != right.shader_stage_flags ||
+        left.shader_stage != right.shader_stage ||
+        left.entry_point != right.entry_point ||
+        left.has_specialization_info !=
+            right.has_specialization_info ||
+        left.pipeline_flags != right.pipeline_flags ||
+        left.base_pipeline_handle != right.base_pipeline_handle ||
+        left.base_pipeline_index != right.base_pipeline_index) {
+        return false;
+    }
+    for (std::size_t index = 0;
+         index < left.bindings.size(); ++index) {
+        if (!SameGen5ComputeDescriptorBinding(
+                left.bindings[index], right.bindings[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool SameGen5ComputeSpirv(
+    const std::vector<std::uint32_t>& cached,
+    const std::span<const std::uint32_t> requested) {
+    return cached.size() == requested.size() &&
+        std::equal(cached.begin(), cached.end(), requested.begin());
+}
+
+Gen5ComputePipelineKey MakeGen5ComputePipelineKey(
+    const std::span<const std::uint32_t> spirv,
+    const std::span<const VkDescriptorSetLayoutBinding> bindings,
+    const std::uint32_t descriptor_set,
+    const std::uint32_t push_constant_offset,
+    const std::uint32_t push_constant_size) {
+    Gen5ComputePipelineKey key{};
+    key.spirv_word_count = spirv.size();
+    key.descriptor_set = descriptor_set;
+    key.push_constant_stage_flags = VK_SHADER_STAGE_COMPUTE_BIT;
+    key.push_constant_offset = push_constant_offset;
+    key.push_constant_size = push_constant_size;
+
+    // Two hashes make the common lookup cheap; SameGen5ComputeSpirv still
+    // compares every word before a bundle is reused, so collisions fail closed.
+    auto low = UINT64_C(1469598103934665603);
+    auto high = UINT64_C(1099511628211);
+    for (const auto word : spirv) {
+        low ^= static_cast<std::uint64_t>(word);
+        low *= UINT64_C(1099511628211);
+        high ^= static_cast<std::uint64_t>(word) +
+            UINT64_C(0x9e3779b97f4a7c15) +
+            (high << 6u) + (high >> 2u);
+        high = (high << 27u) | (high >> 37u);
+        high *= UINT64_C(0x94d049bb133111eb);
+    }
+    low ^= static_cast<std::uint64_t>(spirv.size());
+    low *= UINT64_C(1099511628211);
+    high ^= static_cast<std::uint64_t>(spirv.size_bytes());
+    key.spirv_hash_low = low;
+    key.spirv_hash_high = high;
+
+    key.bindings.reserve(bindings.size());
+    for (const auto& binding : bindings) {
+        Gen5ComputeDescriptorBindingKey binding_key{
+            binding.binding, binding.descriptorType,
+            binding.descriptorCount, binding.stageFlags, {}};
+        if (binding.pImmutableSamplers != nullptr) {
+            binding_key.immutable_samplers.assign(
+                binding.pImmutableSamplers,
+                binding.pImmutableSamplers +
+                    binding.descriptorCount);
+        }
+        key.bindings.push_back(std::move(binding_key));
+    }
+    return key;
+}
+
+void DestroyGen5ComputePipelineBundle(
+    const VkDevice device,
+    Gen5ComputePipelineBundle& bundle) {
+    if (device != VK_NULL_HANDLE) {
+        if (bundle.pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device, bundle.pipeline, nullptr);
+        }
+        if (bundle.pipeline_layout != VK_NULL_HANDLE) {
+            vkDestroyPipelineLayout(
+                device, bundle.pipeline_layout, nullptr);
+        }
+        if (bundle.set_layout != VK_NULL_HANDLE) {
+            vkDestroyDescriptorSetLayout(
+                device, bundle.set_layout, nullptr);
+        }
+        if (bundle.module != VK_NULL_HANDLE) {
+            vkDestroyShaderModule(device, bundle.module, nullptr);
+        }
+    }
+    bundle = {};
+}
+
+VkResult BuildGen5ComputePipelineBundle(
+    const VkDevice device,
+    const VkPipelineCache pipeline_cache,
+    const Gen5ComputePipelineKey& key,
+    const std::span<const std::uint32_t> spirv,
+    const std::span<const VkDescriptorSetLayoutBinding> bindings,
+    const bool fast,
+    Gen5ComputePipelineBundle& bundle) {
+    const VkDescriptorSetLayoutCreateInfo set_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        nullptr, key.descriptor_layout_flags,
+        static_cast<std::uint32_t>(bindings.size()),
+        bindings.data()};
+    auto result = vkCreateDescriptorSetLayout(
+        device, &set_info, nullptr, &bundle.set_layout);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    const VkPushConstantRange push_range{
+        key.push_constant_stage_flags,
+        key.push_constant_offset, key.push_constant_size};
+    const VkPipelineLayoutCreateInfo pipeline_layout_info{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        nullptr, key.pipeline_layout_flags, 1,
+        &bundle.set_layout,
+        push_range.size == 0u ? 0u : 1u,
+        push_range.size == 0u ? nullptr : &push_range};
+    result = vkCreatePipelineLayout(
+        device, &pipeline_layout_info, nullptr,
+        &bundle.pipeline_layout);
+    if (result != VK_SUCCESS) {
+        DestroyGen5ComputePipelineBundle(device, bundle);
+        return result;
+    }
+    const VkShaderModuleCreateInfo module_info{
+        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        nullptr, key.shader_module_flags,
+        spirv.size_bytes(), spirv.data()};
+    result = vkCreateShaderModule(
+        device, &module_info, nullptr, &bundle.module);
+    if (result != VK_SUCCESS) {
+        DestroyGen5ComputePipelineBundle(device, bundle);
+        return result;
+    }
+    const VkPipelineShaderStageCreateInfo stage{
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        nullptr, key.shader_stage_flags, key.shader_stage,
+        bundle.module, key.entry_point.data(), nullptr};
+    VkPipelineCreateFlags flags = key.pipeline_flags;
+    if (fast) {
+        flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    }
+    const VkComputePipelineCreateInfo pipeline_info{
+        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        nullptr, flags, stage,
+        bundle.pipeline_layout, key.base_pipeline_handle,
+        key.base_pipeline_index};
+    result = vkCreateComputePipelines(
+        device, pipeline_cache, 1,
+        &pipeline_info, nullptr, &bundle.pipeline);
+    if (result != VK_SUCCESS) {
+        DestroyGen5ComputePipelineBundle(device, bundle);
+    }
+    return result;
+}
+
+std::string SanitizeCacheComponent(std::string value) {
+    if (value.empty()) {
+        return "unknown";
+    }
+    for (auto& character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        if (!((byte >= 'a' && byte <= 'z') ||
+              (byte >= 'A' && byte <= 'Z') ||
+              (byte >= '0' && byte <= '9') ||
+              character == '-' || character == '_')) {
+            character = '_';
+        }
+    }
+    return value;
+}
+
+struct PipelineCacheDiskHeader {
+    std::array<char, 8> magic{'L', 'S', 'X', '4', 'P', '5', 'V', 'K'};
+    std::uint32_t version{1u};
+    std::uint32_t vendor_id{};
+    std::uint32_t device_id{};
+    std::uint32_t driver_version{};
+    std::array<std::uint8_t, VK_UUID_SIZE> uuid{};
+    std::uint64_t data_size{};
+};
+
+struct AsyncPipelineState {
+    struct Job {
+        Gen5ComputePipelineKey key;
+        std::vector<std::uint32_t> spirv;
+        std::vector<VkDescriptorSetLayoutBinding> bindings;
+        std::uint64_t generation{};
+        std::size_t bytes{};
+    };
+
+    struct Completion {
+        Gen5ComputePipelineKey key;
+        std::vector<std::uint32_t> spirv;
+        Gen5ComputePipelineBundle bundle;
+        std::uint64_t generation{};
+        VkResult result{VK_SUCCESS};
+    };
+
+    VkDevice device{};
+    VkPipelineCache pipeline_cache{};
+    VkPhysicalDeviceProperties properties{};
+    std::filesystem::path cache_path;
+    std::filesystem::path negative_path;
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<Job> jobs;
+    std::deque<Completion> completed;
+    std::unordered_set<std::uint64_t> persistent_negative;
+    std::thread worker;
+    std::size_t queued_bytes{};
+    std::uint64_t completed_since_save{};
+    bool stopping{};
+    bool cache_dirty{};
+};
+
+std::uint64_t AsyncPipelineDiskKey(
+    const Gen5ComputePipelineKey& key) {
+    std::uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    const auto mix = [&](const std::uint64_t value) {
+        hash ^= value + UINT64_C(0x9e3779b97f4a7c15) +
+            (hash << 6u) + (hash >> 2u);
+        hash *= UINT64_C(0x100000001b3);
+    };
+    mix(key.spirv_hash_low);
+    mix(key.spirv_hash_high);
+    mix(key.spirv_word_count);
+    mix(key.descriptor_layout_flags);
+    mix(key.pipeline_layout_flags);
+    mix(key.descriptor_set);
+    mix(key.push_constant_stage_flags);
+    mix(key.push_constant_offset);
+    mix(key.push_constant_size);
+    mix(key.shader_module_flags);
+    mix(key.shader_stage_flags);
+    mix(key.shader_stage);
+    for (const auto character : key.entry_point) {
+        mix(static_cast<unsigned char>(character));
+    }
+    mix(key.has_specialization_info ? 1u : 0u);
+    mix(key.pipeline_flags);
+    mix(reinterpret_cast<std::uintptr_t>(
+        key.base_pipeline_handle));
+    mix(static_cast<std::uint32_t>(key.base_pipeline_index));
+    mix(key.bindings.size());
+    for (const auto& binding : key.bindings) {
+        mix(binding.binding);
+        mix(binding.descriptor_type);
+        mix(binding.descriptor_count);
+        mix(binding.stage_flags);
+        mix(binding.immutable_samplers.size());
+        for (const auto sampler : binding.immutable_samplers) {
+            mix(reinterpret_cast<std::uintptr_t>(sampler));
+        }
+    }
+    return hash;
+}
+
+bool LoadPipelineCacheBlob(
+    const std::filesystem::path& path,
+    const VkPhysicalDeviceProperties& properties,
+    std::vector<std::uint8_t>& data) {
+    std::ifstream input(path, std::ios::binary);
+    PipelineCacheDiskHeader header{};
+    if (!input.read(
+            reinterpret_cast<char*>(&header),
+            sizeof(header)) ||
+        header.magic != PipelineCacheDiskHeader{}.magic ||
+        header.version != 1u ||
+        header.vendor_id != properties.vendorID ||
+        header.device_id != properties.deviceID ||
+        header.driver_version != properties.driverVersion ||
+        !std::equal(
+            header.uuid.begin(), header.uuid.end(),
+            properties.pipelineCacheUUID) ||
+        header.data_size > 64u * 1024u * 1024u) {
+        return false;
+    }
+    data.resize(static_cast<std::size_t>(header.data_size));
+    return data.empty() ||
+        static_cast<bool>(input.read(
+            reinterpret_cast<char*>(data.data()),
+            static_cast<std::streamsize>(data.size())));
+}
+
+void SavePipelineCache(AsyncPipelineState& state) {
+    if (state.pipeline_cache == VK_NULL_HANDLE ||
+        state.cache_path.empty() || !state.cache_dirty) {
+        return;
+    }
+    std::size_t size{};
+    if (vkGetPipelineCacheData(
+            state.device, state.pipeline_cache,
+            &size, nullptr) != VK_SUCCESS ||
+        size == 0u || size > 64u * 1024u * 1024u) {
+        return;
+    }
+    std::vector<std::uint8_t> data(size);
+    if (vkGetPipelineCacheData(
+            state.device, state.pipeline_cache,
+            &size, data.data()) != VK_SUCCESS) {
+        return;
+    }
+    data.resize(size);
+    std::error_code error;
+    std::filesystem::create_directories(
+        state.cache_path.parent_path(), error);
+    if (error) {
+        return;
+    }
+    const auto temporary =
+        state.cache_path.string() + ".tmp";
+    PipelineCacheDiskHeader header{};
+    header.vendor_id = state.properties.vendorID;
+    header.device_id = state.properties.deviceID;
+    header.driver_version = state.properties.driverVersion;
+    std::copy_n(
+        state.properties.pipelineCacheUUID, VK_UUID_SIZE,
+        header.uuid.begin());
+    header.data_size = data.size();
+    {
+        std::ofstream output(
+            temporary, std::ios::binary | std::ios::trunc);
+        if (!output.write(
+                reinterpret_cast<const char*>(&header),
+                sizeof(header)) ||
+            (!data.empty() && !output.write(
+                reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size())))) {
+            return;
+        }
+    }
+    std::filesystem::rename(
+        temporary, state.cache_path, error);
+    if (error) {
+        error.clear();
+        std::filesystem::remove(state.cache_path, error);
+        error.clear();
+        std::filesystem::rename(
+            temporary, state.cache_path, error);
+    }
+    if (!error) {
+        state.cache_dirty = false;
+        state.completed_since_save = 0u;
+        g_async_pipeline_stats.disk_cache_writes.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+}
+
+void SaveNegativeCache(const AsyncPipelineState& state) {
+    if (state.negative_path.empty()) {
+        return;
+    }
+    std::error_code error;
+    std::filesystem::create_directories(
+        state.negative_path.parent_path(), error);
+    if (error) {
+        return;
+    }
+    std::ofstream output(
+        state.negative_path,
+        std::ios::binary | std::ios::trunc);
+    const std::uint32_t count =
+        static_cast<std::uint32_t>(
+            std::min<std::size_t>(
+                state.persistent_negative.size(), 4096u));
+    output.write(
+        reinterpret_cast<const char*>(&count), sizeof(count));
+    std::uint32_t written{};
+    for (const auto key : state.persistent_negative) {
+        if (written++ == count) {
+            break;
+        }
+        output.write(
+            reinterpret_cast<const char*>(&key), sizeof(key));
+    }
+}
+
+void AsyncPipelineWorker(AsyncPipelineState* const state) {
+    for (;;) {
+        AsyncPipelineState::Job job;
+        {
+            std::unique_lock lock{state->mutex};
+            state->wake.wait(lock, [&] {
+                return state->stopping || !state->jobs.empty();
+            });
+            if (state->stopping && state->jobs.empty()) {
+                break;
+            }
+            job = std::move(state->jobs.front());
+            state->jobs.pop_front();
+            state->queued_bytes -= job.bytes;
+        }
+        AsyncPipelineState::Completion completion{};
+        completion.key = job.key;
+        completion.spirv = std::move(job.spirv);
+        completion.generation = job.generation;
+        completion.result = BuildGen5ComputePipelineBundle(
+            state->device, state->pipeline_cache,
+            completion.key, completion.spirv,
+            job.bindings, false, completion.bundle);
+        {
+            const std::lock_guard lock{state->mutex};
+            if (completion.result == VK_SUCCESS) {
+                state->cache_dirty = true;
+                ++state->completed_since_save;
+                g_async_pipeline_stats.optimized_completed.fetch_add(
+                    1u, std::memory_order_relaxed);
+            } else {
+                state->persistent_negative.insert(
+                    AsyncPipelineDiskKey(completion.key));
+                g_async_pipeline_stats.build_failures.fetch_add(
+                    1u, std::memory_order_relaxed);
+            }
+            state->completed.push_back(std::move(completion));
+        }
+    }
+}
+
+std::shared_ptr<AsyncPipelineState> CreateAsyncPipelineState(
+    const Presenter& presenter) {
+    auto state = std::make_shared<AsyncPipelineState>();
+    state->device = presenter.device;
+    state->properties = presenter.physical_properties;
+    if (g_pipeline_cache_disk_enabled &&
+        !g_pipeline_cache_root.empty()) {
+        const auto directory =
+            std::filesystem::path{g_pipeline_cache_root} /
+            "native" / "cache" /
+            SanitizeCacheComponent(g_pipeline_cache_title);
+        const auto gpu_key =
+            std::to_string(state->properties.vendorID) + "-" +
+            std::to_string(state->properties.deviceID) + "-" +
+            std::to_string(state->properties.driverVersion);
+        state->cache_path =
+            directory / ("ps5-vulkan-" + gpu_key + ".bin");
+        state->negative_path =
+            directory / ("ps5-vulkan-" + gpu_key + ".negative");
+    }
+    std::vector<std::uint8_t> initial_data;
+    if (LoadPipelineCacheBlob(
+            state->cache_path, state->properties,
+            initial_data)) {
+        g_async_pipeline_stats.disk_cache_loads.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    const VkPipelineCacheCreateInfo cache_info{
+        VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+        nullptr, 0, initial_data.size(), initial_data.data()};
+    auto result = vkCreatePipelineCache(
+        state->device, &cache_info, nullptr,
+        &state->pipeline_cache);
+    if (result != VK_SUCCESS && !initial_data.empty()) {
+        const VkPipelineCacheCreateInfo empty_info{
+            VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        result = vkCreatePipelineCache(
+            state->device, &empty_info, nullptr,
+            &state->pipeline_cache);
+    }
+    if (result != VK_SUCCESS) {
+        LogFailure("vkCreatePipelineCache(ps5 async)", result);
+        return nullptr;
+    }
+    if (!state->negative_path.empty()) {
+        std::ifstream input(
+            state->negative_path, std::ios::binary);
+        std::uint32_t count{};
+        if (input.read(
+                reinterpret_cast<char*>(&count), sizeof(count)) &&
+            count <= 4096u) {
+            for (std::uint32_t index = 0; index < count; ++index) {
+                std::uint64_t key{};
+                if (!input.read(
+                        reinterpret_cast<char*>(&key),
+                        sizeof(key))) {
+                    break;
+                }
+                state->persistent_negative.insert(key);
+            }
+        }
+    }
+    state->worker =
+        std::thread{AsyncPipelineWorker, state.get()};
+    return state;
+}
+
+void StopAsyncPipelineState(Presenter& presenter) {
+    auto state = std::move(presenter.async_pipeline);
+    if (!state) {
+        return;
+    }
+    {
+        const std::lock_guard lock{state->mutex};
+        state->stopping = true;
+        state->jobs.clear();
+        state->queued_bytes = 0u;
+    }
+    state->wake.notify_all();
+    if (state->worker.joinable()) {
+        state->worker.join();
+    }
+    for (auto& completion : state->completed) {
+        DestroyGen5ComputePipelineBundle(
+            state->device, completion.bundle);
+    }
+    SavePipelineCache(*state);
+    SaveNegativeCache(*state);
+    if (state->pipeline_cache != VK_NULL_HANDLE) {
+        vkDestroyPipelineCache(
+            state->device, state->pipeline_cache, nullptr);
+    }
+}
+
+void DrainAsyncPipelineCompletions(Presenter& presenter) {
+    if (!presenter.async_pipeline) {
+        return;
+    }
+    std::deque<AsyncPipelineState::Completion> completed;
+    {
+        const std::lock_guard lock{
+            presenter.async_pipeline->mutex};
+        completed.swap(presenter.async_pipeline->completed);
+    }
+    for (auto& completion : completed) {
+        auto found = std::find_if(
+            presenter.gen5_compute_pipeline_cache.begin(),
+            presenter.gen5_compute_pipeline_cache.end(),
+            [&](const auto& entry) {
+                return entry.generation == completion.generation &&
+                    SameGen5ComputePipelineKey(
+                        entry.key, completion.key) &&
+                    SameGen5ComputeSpirv(
+                        entry.spirv, completion.spirv);
+            });
+        if (completion.result == VK_SUCCESS &&
+            found != presenter.gen5_compute_pipeline_cache.end() &&
+            found->optimization_pending) {
+            presenter.gen5_compute_pipeline_retired_bundles.push_back(
+                found->bundle);
+            found->bundle = completion.bundle;
+            completion.bundle = {};
+            found->optimized = true;
+            found->optimization_pending = false;
+            g_async_pipeline_stats.optimized_replacements.fetch_add(
+                1u, std::memory_order_relaxed);
+        } else if (found !=
+                   presenter.gen5_compute_pipeline_cache.end()) {
+            found->optimization_pending = false;
+        }
+        DestroyGen5ComputePipelineBundle(
+            presenter.device, completion.bundle);
+    }
+}
+
+bool QueueOptimizedPipeline(
+    Presenter& presenter,
+    const Gen5ComputePipelineCacheEntry& entry,
+    const std::span<const VkDescriptorSetLayoutBinding> bindings) {
+    auto* const state = presenter.async_pipeline.get();
+    if (state == nullptr) {
+        return false;
+    }
+    const auto disk_key = AsyncPipelineDiskKey(entry.key);
+    const auto byte_count =
+        entry.spirv.size() * sizeof(std::uint32_t) +
+        bindings.size() * sizeof(VkDescriptorSetLayoutBinding);
+    {
+        const std::lock_guard lock{state->mutex};
+        if (state->persistent_negative.contains(disk_key)) {
+            g_async_pipeline_stats.negative_cache_hits.fetch_add(
+                1u, std::memory_order_relaxed);
+            return false;
+        }
+        if (state->stopping ||
+            state->jobs.size() >= AsyncPipelineQueueLimit ||
+            byte_count > AsyncPipelineQueueByteLimit ||
+            state->queued_bytes >
+                AsyncPipelineQueueByteLimit - byte_count) {
+            g_async_pipeline_stats.queue_drops.fetch_add(
+                1u, std::memory_order_relaxed);
+            return false;
+        }
+        AsyncPipelineState::Job job{};
+        job.key = entry.key;
+        job.spirv = entry.spirv;
+        job.bindings.assign(bindings.begin(), bindings.end());
+        for (std::size_t index = 0;
+             index < job.bindings.size(); ++index) {
+            // Immutable sampler arrays are copied into key.bindings. Current
+            // Gen5 descriptors never use them; reject rather than queue a job
+            // holding guest pointers if that contract changes.
+            if (job.bindings[index].pImmutableSamplers != nullptr) {
+                g_async_pipeline_stats.queue_drops.fetch_add(
+                    1u, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        job.generation = entry.generation;
+        job.bytes = byte_count;
+        state->queued_bytes += byte_count;
+        state->jobs.push_back(std::move(job));
+    }
+    g_async_pipeline_stats.optimized_queued.fetch_add(
+        1u, std::memory_order_relaxed);
+    state->wake.notify_one();
+    return true;
+}
+
+void DestroyGen5ComputePipelineCache(Presenter& presenter) {
+    for (auto& entry : presenter.gen5_compute_pipeline_cache) {
+        DestroyGen5ComputePipelineBundle(
+            presenter.device, entry.bundle);
+    }
+    for (auto& bundle :
+         presenter.gen5_compute_pipeline_retired_bundles) {
+        DestroyGen5ComputePipelineBundle(
+            presenter.device, bundle);
+    }
+    presenter.gen5_compute_pipeline_cache.clear();
+    presenter.gen5_compute_pipeline_negative_cache.clear();
+    presenter.gen5_compute_pipeline_retired_bundles.clear();
+    presenter.gen5_compute_pipeline_use_serial = 0u;
+    ++presenter.gen5_compute_pipeline_generation;
+}
+
+const Gen5ComputePipelineBundle* AcquireGen5ComputePipelineBundle(
+    Presenter& presenter,
+    const std::span<const std::uint32_t> spirv,
+    const std::span<const VkDescriptorSetLayoutBinding> bindings,
+    const std::uint32_t descriptor_set,
+    const std::uint32_t push_constant_offset,
+    const std::uint32_t push_constant_size,
+    const char* const descriptor_layout_operation,
+    const char* const pipeline_layout_operation,
+    const char* const shader_module_operation,
+    const char* const pipeline_operation) {
+    (void)descriptor_layout_operation;
+    (void)pipeline_layout_operation;
+    (void)shader_module_operation;
+    if (g_async_pipeline_enabled &&
+        presenter.async_pipeline == nullptr) {
+        presenter.async_pipeline =
+            CreateAsyncPipelineState(presenter);
+    } else if (!g_async_pipeline_enabled &&
+               presenter.async_pipeline != nullptr) {
+        StopAsyncPipelineState(presenter);
+    }
+    DrainAsyncPipelineCompletions(presenter);
+    auto key = MakeGen5ComputePipelineKey(
+        spirv, bindings, descriptor_set,
+        push_constant_offset, push_constant_size);
+    const auto serial =
+        ++presenter.gen5_compute_pipeline_use_serial;
+    for (auto& entry : presenter.gen5_compute_pipeline_cache) {
+        if (SameGen5ComputePipelineKey(entry.key, key) &&
+            SameGen5ComputeSpirv(entry.spirv, spirv)) {
+            entry.last_use = serial;
+            g_async_pipeline_stats.cache_hits.fetch_add(
+                1u, std::memory_order_relaxed);
+            return &entry.bundle;
+        }
+    }
+    for (auto& entry :
+         presenter.gen5_compute_pipeline_negative_cache) {
+        if (SameGen5ComputePipelineKey(entry.key, key) &&
+            SameGen5ComputeSpirv(entry.spirv, spirv)) {
+            entry.last_use = serial;
+            g_async_pipeline_stats.negative_cache_hits.fetch_add(
+                1u, std::memory_order_relaxed);
+            return nullptr;
+        }
+    }
+
+    g_async_pipeline_stats.compute_misses.fetch_add(
+        1u, std::memory_order_relaxed);
+    Gen5ComputePipelineBundle bundle{};
+    const auto remember_failure =
+        [&](const VkResult result)
+            -> const Gen5ComputePipelineBundle* {
+            LogFailure(pipeline_operation, result);
+            g_async_pipeline_stats.build_failures.fetch_add(
+                1u, std::memory_order_relaxed);
+            DestroyGen5ComputePipelineBundle(
+                presenter.device, bundle);
+            Gen5ComputePipelineNegativeEntry negative{
+                std::move(key),
+                std::vector<std::uint32_t>(
+                    spirv.begin(), spirv.end()),
+                serial};
+            auto& cache =
+                presenter.gen5_compute_pipeline_negative_cache;
+            if (cache.size() <
+                Gen5ComputePipelineCacheLimit) {
+                cache.push_back(std::move(negative));
+            } else {
+                const auto least = std::min_element(
+                    cache.begin(), cache.end(),
+                    [](const auto& left, const auto& right) {
+                        return left.last_use < right.last_use;
+                    });
+                *least = std::move(negative);
+            }
+            return nullptr;
+        };
+    const bool asynchronous =
+        g_async_pipeline_enabled &&
+        presenter.async_pipeline != nullptr;
+    auto result = BuildGen5ComputePipelineBundle(
+        presenter.device, VK_NULL_HANDLE, key, spirv,
+        bindings, asynchronous, bundle);
+    if (result != VK_SUCCESS && asynchronous) {
+        // A driver may reject DISABLE_OPTIMIZATION for a particular shader.
+        // Synchronously compile the normal form so the draw/dispatch is never
+        // dropped merely because the optional background tier is active.
+        result = BuildGen5ComputePipelineBundle(
+            presenter.device, VK_NULL_HANDLE, key, spirv,
+            bindings, false, bundle);
+    }
+    if (result != VK_SUCCESS) {
+        return remember_failure(result);
+    }
+    g_async_pipeline_stats.fast_completed.fetch_add(
+        asynchronous ? 1u : 0u, std::memory_order_relaxed);
+
+    Gen5ComputePipelineCacheEntry entry{
+        std::move(key),
+        std::vector<std::uint32_t>(spirv.begin(), spirv.end()),
+        bundle, serial,
+        ++presenter.gen5_compute_pipeline_generation,
+        !asynchronous, asynchronous};
+    auto& cache = presenter.gen5_compute_pipeline_cache;
+    Gen5ComputePipelineCacheEntry* published{};
+    if (cache.size() < Gen5ComputePipelineCacheLimit) {
+        cache.push_back(std::move(entry));
+        published = &cache.back();
+    } else {
+        const auto least = std::min_element(
+            cache.begin(), cache.end(),
+            [](const auto& left, const auto& right) {
+                return left.last_use < right.last_use;
+            });
+        // Preserve Vulkan lifetime until DestroyPresenter has completed its
+        // existing vkDeviceWaitIdle. Direct compute submission semantics stay
+        // untouched; only the 256-entry lookup working set is LRU-bounded.
+        presenter.gen5_compute_pipeline_retired_bundles.push_back(
+            least->bundle);
+        least->bundle = {};
+        *least = std::move(entry);
+        published = &*least;
+    }
+    g_async_pipeline_stats.published.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (asynchronous &&
+        !QueueOptimizedPipeline(
+            presenter, *published, bindings)) {
+        published->optimization_pending = false;
+    }
+    return &published->bundle;
 }
 
 std::uint32_t FindMemoryType(const Presenter& presenter,
@@ -187,30 +1190,127 @@ void DestroyStaging(Presenter& presenter) {
     presenter.staging_capacity = 0;
 }
 
+void DestroyFsrResources(Presenter& presenter) {
+    if (presenter.device == VK_NULL_HANDLE) {
+        return;
+    }
+    for (const auto framebuffer : presenter.fsr_framebuffers) {
+        if (framebuffer != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(
+                presenter.device, framebuffer, nullptr);
+        }
+    }
+    for (const auto view : presenter.fsr_swapchain_views) {
+        if (view != VK_NULL_HANDLE) {
+            vkDestroyImageView(
+                presenter.device, view, nullptr);
+        }
+    }
+    presenter.fsr_framebuffers.clear();
+    presenter.fsr_swapchain_views.clear();
+    if (presenter.fsr_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(
+            presenter.device, presenter.fsr_pipeline, nullptr);
+    }
+    if (presenter.fsr_pipeline_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(
+            presenter.device, presenter.fsr_pipeline_layout,
+            nullptr);
+    }
+    if (presenter.fsr_descriptor_pool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(
+            presenter.device, presenter.fsr_descriptor_pool,
+            nullptr);
+    }
+    if (presenter.fsr_descriptor_layout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(
+            presenter.device, presenter.fsr_descriptor_layout,
+            nullptr);
+    }
+    if (presenter.fsr_vertex_shader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(
+            presenter.device, presenter.fsr_vertex_shader, nullptr);
+    }
+    if (presenter.fsr_fragment_shader != VK_NULL_HANDLE) {
+        vkDestroyShaderModule(
+            presenter.device, presenter.fsr_fragment_shader, nullptr);
+    }
+    if (presenter.fsr_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(
+            presenter.device, presenter.fsr_sampler, nullptr);
+    }
+    if (presenter.fsr_render_pass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(
+            presenter.device, presenter.fsr_render_pass, nullptr);
+    }
+    presenter.fsr_render_pass = VK_NULL_HANDLE;
+    presenter.fsr_descriptor_layout = VK_NULL_HANDLE;
+    presenter.fsr_descriptor_pool = VK_NULL_HANDLE;
+    presenter.fsr_descriptor = VK_NULL_HANDLE;
+    presenter.fsr_pipeline_layout = VK_NULL_HANDLE;
+    presenter.fsr_pipeline = VK_NULL_HANDLE;
+    presenter.fsr_vertex_shader = VK_NULL_HANDLE;
+    presenter.fsr_fragment_shader = VK_NULL_HANDLE;
+    presenter.fsr_sampler = VK_NULL_HANDLE;
+    presenter.fsr_bound_source_view = VK_NULL_HANDLE;
+}
+
+void DestroyGuestTargetResource(
+    Presenter& presenter, GuestTargetResource& target) {
+    if (presenter.guest_descriptor_pool != VK_NULL_HANDLE) {
+        std::array<VkDescriptorSet, 2> descriptors{};
+        std::uint32_t descriptor_count{};
+        if (target.descriptor != VK_NULL_HANDLE) {
+            descriptors[descriptor_count++] = target.descriptor;
+        }
+        if (target.nearest_descriptor != VK_NULL_HANDLE) {
+            descriptors[descriptor_count++] =
+                target.nearest_descriptor;
+        }
+        if (descriptor_count != 0u) {
+            (void)vkFreeDescriptorSets(
+                presenter.device, presenter.guest_descriptor_pool,
+                descriptor_count, descriptors.data());
+        }
+    }
+    if (target.framebuffer != VK_NULL_HANDLE) {
+        vkDestroyFramebuffer(
+            presenter.device, target.framebuffer, nullptr);
+    }
+    if (target.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(
+            presenter.device, target.view, nullptr);
+    }
+    if (target.image != VK_NULL_HANDLE) {
+        vkDestroyImage(
+            presenter.device, target.image, nullptr);
+    }
+    if (target.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(
+            presenter.device, target.memory, nullptr);
+    }
+    presenter.guest_target_resident_bytes =
+        presenter.guest_target_resident_bytes >=
+                target.allocation_size
+        ? presenter.guest_target_resident_bytes -
+              target.allocation_size
+        : 0u;
+    target = {};
+}
+
 void DestroyGuestSwapchainResources(Presenter& presenter) {
     if (presenter.device == VK_NULL_HANDLE) {
         return;
     }
-    for (const auto& [key, target] : presenter.guest_targets) {
+    DestroyFsrResources(presenter);
+    for (auto& [key, target] : presenter.guest_targets) {
         (void)key;
-        if (target.framebuffer != VK_NULL_HANDLE) {
-            vkDestroyFramebuffer(
-                presenter.device, target.framebuffer, nullptr);
-        }
-        if (target.view != VK_NULL_HANDLE) {
-            vkDestroyImageView(
-                presenter.device, target.view, nullptr);
-        }
-        if (target.image != VK_NULL_HANDLE) {
-            vkDestroyImage(
-                presenter.device, target.image, nullptr);
-        }
-        if (target.memory != VK_NULL_HANDLE) {
-            vkFreeMemory(
-                presenter.device, target.memory, nullptr);
-        }
+        DestroyGuestTargetResource(presenter, target);
     }
     presenter.guest_targets.clear();
+    presenter.pending_guest_target_uses.clear();
+    presenter.in_flight_guest_target_uses.clear();
+    presenter.guest_target_resident_bytes = 0u;
     if (presenter.guest_target_framebuffer != VK_NULL_HANDLE) {
         vkDestroyFramebuffer(
             presenter.device, presenter.guest_target_framebuffer,
@@ -304,6 +1404,8 @@ void DestroyGuestResources(Presenter& presenter) {
         }
     }
     presenter.guest_textures.clear();
+    presenter.guest_texture_aliases.clear();
+    presenter.guest_texture_resident_bytes = 0u;
     if (presenter.guest_sampler != VK_NULL_HANDLE) {
         vkDestroySampler(
             presenter.device, presenter.guest_sampler, nullptr);
@@ -359,9 +1461,11 @@ void DestroyGuestResources(Presenter& presenter) {
 }
 
 void DestroyPresenter(Presenter& presenter) {
+    StopAsyncPipelineState(presenter);
     if (presenter.device != VK_NULL_HANDLE) {
         (void)vkDeviceWaitIdle(presenter.device);
     }
+    DestroyGen5ComputePipelineCache(presenter);
     DestroySource(presenter);
     DestroyStaging(presenter);
     DestroyGuestResources(presenter);
@@ -372,6 +1476,11 @@ void DestroyPresenter(Presenter& presenter) {
         if (presenter.rendered != VK_NULL_HANDLE) {
             vkDestroySemaphore(
                 presenter.device, presenter.rendered, nullptr);
+        }
+        if (presenter.retirement_timeline != VK_NULL_HANDLE) {
+            vkDestroySemaphore(
+                presenter.device, presenter.retirement_timeline,
+                nullptr);
         }
         if (presenter.acquired != VK_NULL_HANDLE) {
             vkDestroySemaphore(
@@ -488,11 +1597,61 @@ bool CreateDeviceAndSurface(Presenter& presenter,
         presenter.queue_family,
         1,
         &QueuePriority};
-    constexpr std::array DeviceExtensions{
+    std::uint32_t extension_count{};
+    (void)vkEnumerateDeviceExtensionProperties(
+        presenter.physical_device, nullptr,
+        &extension_count, nullptr);
+    std::vector<VkExtensionProperties> extension_properties(
+        extension_count);
+    if (extension_count != 0u) {
+        (void)vkEnumerateDeviceExtensionProperties(
+            presenter.physical_device, nullptr,
+            &extension_count, extension_properties.data());
+    }
+    const auto has_extension =
+        [&](const char* const name) {
+            return std::ranges::any_of(
+                extension_properties,
+                [&](const auto& extension) {
+                    return std::strcmp(
+                        extension.extensionName, name) == 0;
+                });
+        };
+    std::vector<const char*> device_extensions{
         VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    VkPhysicalDeviceFeatures supported_features{};
-    vkGetPhysicalDeviceFeatures(
-        presenter.physical_device, &supported_features);
+    const bool has_fragment_shading_rate =
+        has_extension(
+            VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+    if (has_fragment_shading_rate) {
+        device_extensions.push_back(
+            VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+    }
+    const bool has_timeline_semaphore =
+        has_extension(
+            VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+    if (has_timeline_semaphore) {
+        device_extensions.push_back(
+            VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+    }
+    VkPhysicalDeviceTimelineSemaphoreFeatures
+        timeline_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR
+        shading_rate_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    shading_rate_features.pNext =
+        has_timeline_semaphore ? &timeline_features : nullptr;
+    VkPhysicalDeviceFeatures2 supported_features2{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    supported_features2.pNext = has_fragment_shading_rate
+        ? static_cast<void*>(&shading_rate_features)
+        : has_timeline_semaphore
+        ? static_cast<void*>(&timeline_features)
+        : nullptr;
+    vkGetPhysicalDeviceFeatures2(
+        presenter.physical_device, &supported_features2);
+    const auto& supported_features =
+        supported_features2.features;
     VkPhysicalDeviceFeatures enabled_features{};
     enabled_features.shaderStorageImageReadWithoutFormat =
         supported_features.shaderStorageImageReadWithoutFormat;
@@ -502,16 +1661,35 @@ bool CreateDeviceAndSurface(Presenter& presenter,
         supported_features.shaderInt64;
     enabled_features.shaderFloat64 =
         supported_features.shaderFloat64;
+    enabled_features.samplerAnisotropy =
+        supported_features.samplerAnisotropy;
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR
+        enabled_shading_rate{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    enabled_shading_rate.pipelineFragmentShadingRate =
+        shading_rate_features.pipelineFragmentShadingRate;
+    VkPhysicalDeviceTimelineSemaphoreFeatures
+        enabled_timeline{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES};
+    enabled_timeline.timelineSemaphore =
+        timeline_features.timelineSemaphore;
+    enabled_shading_rate.pNext =
+        enabled_timeline.timelineSemaphore
+        ? &enabled_timeline : nullptr;
     const VkDeviceCreateInfo device_info{
         VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-        nullptr,
+        enabled_shading_rate.pipelineFragmentShadingRate
+            ? static_cast<const void*>(&enabled_shading_rate)
+            : enabled_timeline.timelineSemaphore
+            ? static_cast<const void*>(&enabled_timeline)
+            : nullptr,
         0,
         1,
         &queue_info,
         0,
         nullptr,
-        static_cast<std::uint32_t>(DeviceExtensions.size()),
-        DeviceExtensions.data(),
+        static_cast<std::uint32_t>(device_extensions.size()),
+        device_extensions.data(),
         &enabled_features};
     result = vkCreateDevice(
         presenter.physical_device, &device_info, nullptr,
@@ -523,6 +1701,97 @@ bool CreateDeviceAndSurface(Presenter& presenter,
     vkGetDeviceQueue(
         presenter.device, presenter.queue_family, 0,
         &presenter.queue);
+    vkGetPhysicalDeviceProperties(
+        presenter.physical_device,
+        &presenter.physical_properties);
+    vkGetPhysicalDeviceMemoryProperties(
+        presenter.physical_device,
+        &presenter.memory_properties);
+    presenter.sampler_anisotropy_supported =
+        supported_features.samplerAnisotropy == VK_TRUE;
+    presenter.fragment_shading_rate_supported =
+        enabled_shading_rate.pipelineFragmentShadingRate == VK_TRUE;
+    presenter.timeline_semaphore_supported =
+        enabled_timeline.timelineSemaphore == VK_TRUE;
+    if (presenter.timeline_semaphore_supported) {
+        presenter.wait_semaphores =
+            reinterpret_cast<PFN_vkWaitSemaphoresKHR>(
+                vkGetDeviceProcAddr(
+                    presenter.device,
+                    "vkWaitSemaphoresKHR"));
+        if (presenter.wait_semaphores == nullptr) {
+            presenter.wait_semaphores =
+                reinterpret_cast<PFN_vkWaitSemaphoresKHR>(
+                    vkGetDeviceProcAddr(
+                        presenter.device,
+                        "vkWaitSemaphores"));
+        }
+        presenter.timeline_semaphore_supported =
+            presenter.wait_semaphores != nullptr;
+    }
+    presenter.cmd_set_fragment_shading_rate =
+        presenter.fragment_shading_rate_supported
+        ? reinterpret_cast<PFN_vkCmdSetFragmentShadingRateKHR>(
+              vkGetDeviceProcAddr(
+                  presenter.device,
+                  "vkCmdSetFragmentShadingRateKHR"))
+        : nullptr;
+    if (presenter.fragment_shading_rate_supported) {
+        auto get_rates =
+            reinterpret_cast<
+                PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(
+                vkGetInstanceProcAddr(
+                    presenter.instance,
+                    "vkGetPhysicalDeviceFragmentShadingRatesKHR"));
+        std::uint32_t rate_count{};
+        if (get_rates != nullptr &&
+            get_rates(
+                presenter.physical_device,
+                &rate_count, nullptr) == VK_SUCCESS &&
+            rate_count != 0u) {
+            std::vector<VkPhysicalDeviceFragmentShadingRateKHR>
+                rates(
+                    rate_count,
+                    {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
+            if (get_rates(
+                    presenter.physical_device,
+                    &rate_count, rates.data()) == VK_SUCCESS) {
+                presenter.fragment_shading_rate_2x2 =
+                    std::ranges::any_of(
+                        rates, [](const auto& rate) {
+                            return rate.fragmentSize.width == 2u &&
+                                rate.fragmentSize.height == 2u;
+                        });
+            }
+        }
+    }
+    VkDeviceSize largest_local_heap{};
+    for (std::uint32_t index = 0;
+         index < presenter.memory_properties.memoryHeapCount;
+         ++index) {
+        const auto& heap =
+            presenter.memory_properties.memoryHeaps[index];
+        if ((heap.flags &
+             VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0u) {
+            largest_local_heap =
+                std::max(largest_local_heap, heap.size);
+        }
+    }
+    if (largest_local_heap != 0u) {
+        presenter.guest_resource_budget_bytes = std::clamp<VkDeviceSize>(
+            largest_local_heap / 8u,
+            128u * 1024u * 1024u,
+            512u * 1024u * 1024u);
+    }
+    presenter.mobile_scale_percent =
+        g_mobile_gpu_enabled ? 75u : 100u;
+    presenter.mobile_pending_scale_percent =
+        presenter.mobile_scale_percent;
+    g_mobile_gpu_stats.effective_scale_percent.store(
+        presenter.mobile_scale_percent,
+        std::memory_order_relaxed);
+    g_mobile_gpu_stats.physical_drs_available.store(
+        1u, std::memory_order_relaxed);
     presenter.window = window;
     return true;
 }
@@ -645,8 +1914,10 @@ bool CreateSwapchain(Presenter& presenter) {
         ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR
         : capabilities.currentTransform;
     VkImageUsageFlags image_usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-    if ((capabilities.supportedUsageFlags &
-         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0u) {
+    presenter.swapchain_color_attachment_supported =
+        (capabilities.supportedUsageFlags &
+         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0u;
+    if (presenter.swapchain_color_attachment_supported) {
         image_usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     }
     const VkSwapchainCreateInfoKHR info{
@@ -741,6 +2012,22 @@ bool CreateCommandsAndSync(Presenter& presenter) {
     if (result != VK_SUCCESS) {
         LogFailure("vkCreateSemaphore", result);
         return false;
+    }
+    if (presenter.timeline_semaphore_supported) {
+        const VkSemaphoreTypeCreateInfo timeline_type{
+            VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            nullptr, VK_SEMAPHORE_TYPE_TIMELINE, 0u};
+        const VkSemaphoreCreateInfo timeline_info{
+            VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+            &timeline_type, 0};
+        result = vkCreateSemaphore(
+            presenter.device, &timeline_info, nullptr,
+            &presenter.retirement_timeline);
+        if (result != VK_SUCCESS) {
+            presenter.retirement_timeline = VK_NULL_HANDLE;
+            presenter.timeline_semaphore_supported = false;
+            result = VK_SUCCESS;
+        }
     }
     const VkFenceCreateInfo fence_info{
         VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
@@ -909,17 +2196,27 @@ bool Initialize(Presenter& presenter, ANativeWindow* const window) {
         !CreateCommandsAndSync(presenter)) {
         return false;
     }
+    if (g_async_pipeline_enabled) {
+        presenter.async_pipeline =
+            CreateAsyncPipelineState(presenter);
+    }
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(
         presenter.physical_device, &properties);
     __android_log_print(
         ANDROID_LOG_INFO, "LSX4-PS5",
-        "vulkan presenter ready gpu=%s swapchain=%ux%u format=%d images=%zu",
+        "vulkan presenter ready gpu=%s swapchain=%ux%u format=%d images=%zu "
+        "async=%d mobile=%d scale=%u aniso=%.1f vrs2x2=%d",
         properties.deviceName,
         presenter.swapchain_extent.width,
         presenter.swapchain_extent.height,
         static_cast<int>(presenter.swapchain_format),
-        presenter.swapchain_images.size());
+        presenter.swapchain_images.size(),
+        presenter.async_pipeline != nullptr ? 1 : 0,
+        g_mobile_gpu_enabled ? 1 : 0,
+        presenter.mobile_scale_percent,
+        presenter.effective_anisotropy,
+        presenter.fragment_shading_rate_2x2 ? 1 : 0);
     return true;
 }
 
@@ -947,9 +2244,535 @@ void ImageBarrier(VkCommandBuffer command,
         0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+struct DriverImageBarrier {
+    VkImage image{};
+    VkImageLayout old_layout{};
+    VkImageLayout new_layout{};
+    VkAccessFlags source_access{};
+    VkAccessFlags destination_access{};
+    VkPipelineStageFlags source_stage{};
+    VkPipelineStageFlags destination_stage{};
+};
+
+bool SameDriverImageBarrier(const DriverImageBarrier& left,
+                            const DriverImageBarrier& right) {
+    return left.image == right.image &&
+        left.old_layout == right.old_layout &&
+        left.new_layout == right.new_layout &&
+        left.source_access == right.source_access &&
+        left.destination_access == right.destination_access &&
+        left.source_stage == right.source_stage &&
+        left.destination_stage == right.destination_stage;
+}
+
+void EmitDriverImageBarriers(
+    const VkCommandBuffer command,
+    const std::span<const DriverImageBarrier> requests) {
+    if (requests.empty()) {
+        return;
+    }
+    g_driver_optimization_stats.barrier_requests.fetch_add(
+        requests.size(), std::memory_order_relaxed);
+    if (!g_driver_optimization_enabled) {
+        g_driver_optimization_stats.barrier_batches.fetch_add(
+            requests.size(), std::memory_order_relaxed);
+        g_driver_optimization_stats.barrier_regions.fetch_add(
+            requests.size(), std::memory_order_relaxed);
+        for (const auto& request : requests) {
+            ImageBarrier(
+                command, request.image,
+                request.old_layout, request.new_layout,
+                request.source_access, request.destination_access,
+                request.source_stage, request.destination_stage);
+        }
+        return;
+    }
+
+    std::vector<DriverImageBarrier> unique;
+    unique.reserve(requests.size());
+    for (const auto& request : requests) {
+        if (std::ranges::none_of(
+                unique, [&](const DriverImageBarrier& existing) {
+                    return SameDriverImageBarrier(existing, request);
+                })) {
+            unique.push_back(request);
+        }
+    }
+    if (unique.empty()) {
+        return;
+    }
+    std::vector<VkImageMemoryBarrier> barriers;
+    barriers.reserve(unique.size());
+    VkPipelineStageFlags source_stages{};
+    VkPipelineStageFlags destination_stages{};
+    for (const auto& request : unique) {
+        source_stages |= request.source_stage;
+        destination_stages |= request.destination_stage;
+        barriers.push_back({
+            VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            nullptr,
+            request.source_access,
+            request.destination_access,
+            request.old_layout,
+            request.new_layout,
+            VK_QUEUE_FAMILY_IGNORED,
+            VK_QUEUE_FAMILY_IGNORED,
+            request.image,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}});
+    }
+    vkCmdPipelineBarrier(
+        command, source_stages, destination_stages, 0,
+        0, nullptr, 0, nullptr,
+        static_cast<std::uint32_t>(barriers.size()),
+        barriers.data());
+    g_driver_optimization_stats.barrier_batches.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_driver_optimization_stats.barrier_regions.fetch_add(
+        unique.size(), std::memory_order_relaxed);
+    const auto merged_regions = requests.size() - unique.size();
+    g_driver_optimization_stats.barrier_regions_merged.fetch_add(
+        merged_regions, std::memory_order_relaxed);
+    g_driver_optimization_stats.barriers_elided.fetch_add(
+        requests.size() - 1u, std::memory_order_relaxed);
+}
+
+struct DriverPushConstantState {
+    VkPipelineLayout layout{};
+    VkShaderStageFlags stages{};
+    std::uint32_t offset{};
+    std::vector<std::uint8_t> bytes;
+};
+
+struct DriverCommandState {
+    VkPipeline pipeline{};
+    VkPipelineBindPoint pipeline_bind_point{
+        VK_PIPELINE_BIND_POINT_GRAPHICS};
+    VkPipelineLayout descriptor_layout{};
+    VkDescriptorSet descriptor{};
+    VkPipelineBindPoint descriptor_bind_point{
+        VK_PIPELINE_BIND_POINT_GRAPHICS};
+    std::uint32_t descriptor_first_set{};
+    VkBuffer vertex_buffer{};
+    VkDeviceSize vertex_offset{};
+    VkBuffer index_buffer{};
+    VkDeviceSize index_offset{};
+    VkIndexType index_type{VK_INDEX_TYPE_UINT16};
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    bool has_pipeline{};
+    bool has_descriptor{};
+    bool has_vertex{};
+    bool has_index{};
+    bool has_viewport{};
+    bool has_scissor{};
+    std::vector<DriverPushConstantState> push_constants;
+};
+
+void DriverBindPipeline(DriverCommandState& state,
+                        const VkCommandBuffer command,
+                        const VkPipeline pipeline,
+                        const VkPipelineBindPoint bind_point =
+                            VK_PIPELINE_BIND_POINT_GRAPHICS) {
+    g_driver_optimization_stats.pipeline_bind_attempts.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (g_driver_optimization_enabled &&
+        state.has_pipeline && state.pipeline == pipeline &&
+        state.pipeline_bind_point == bind_point) {
+        g_driver_optimization_stats.pipeline_binds_elided.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+    vkCmdBindPipeline(
+        command, bind_point, pipeline);
+    state.pipeline = pipeline;
+    state.pipeline_bind_point = bind_point;
+    state.has_pipeline = true;
+}
+
+void DriverBindDescriptor(DriverCommandState& state,
+                          const VkCommandBuffer command,
+                          const VkPipelineLayout layout,
+                          const VkDescriptorSet descriptor,
+                          const VkPipelineBindPoint bind_point =
+                              VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          const std::uint32_t first_set = 0u) {
+    g_driver_optimization_stats.descriptor_bind_attempts.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (g_driver_optimization_enabled &&
+        state.has_descriptor &&
+        state.descriptor_layout == layout &&
+        state.descriptor == descriptor &&
+        state.descriptor_bind_point == bind_point &&
+        state.descriptor_first_set == first_set) {
+        g_driver_optimization_stats.descriptor_binds_elided.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+    vkCmdBindDescriptorSets(
+        command, bind_point,
+        layout, first_set, 1, &descriptor, 0, nullptr);
+    state.descriptor_layout = layout;
+    state.descriptor = descriptor;
+    state.descriptor_bind_point = bind_point;
+    state.descriptor_first_set = first_set;
+    state.has_descriptor = true;
+}
+
+void DriverPushConstants(DriverCommandState& state,
+                         const VkCommandBuffer command,
+                         const VkPipelineLayout layout,
+                         const VkShaderStageFlags stages,
+                         const std::uint32_t offset,
+                         const std::uint32_t size,
+                         const void* const data) {
+    g_driver_optimization_stats.push_constant_attempts.fetch_add(
+        1u, std::memory_order_relaxed);
+    const auto found = std::ranges::find_if(
+        state.push_constants,
+        [&](const DriverPushConstantState& cached) {
+            return cached.layout == layout &&
+                cached.stages == stages &&
+                cached.offset == offset &&
+                cached.bytes.size() == size;
+        });
+    if (g_driver_optimization_enabled &&
+        found != state.push_constants.end() &&
+        std::memcmp(found->bytes.data(), data, size) == 0) {
+        g_driver_optimization_stats.push_constants_elided.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+    vkCmdPushConstants(
+        command, layout, stages, offset, size, data);
+    if (found != state.push_constants.end()) {
+        found->bytes.assign(
+            static_cast<const std::uint8_t*>(data),
+            static_cast<const std::uint8_t*>(data) + size);
+    } else {
+        DriverPushConstantState cached{
+            layout, stages, offset, {}};
+        cached.bytes.assign(
+            static_cast<const std::uint8_t*>(data),
+            static_cast<const std::uint8_t*>(data) + size);
+        state.push_constants.push_back(std::move(cached));
+    }
+}
+
+void DriverSetViewport(DriverCommandState& state,
+                       const VkCommandBuffer command,
+                       const VkViewport& viewport) {
+    g_driver_optimization_stats.dynamic_state_commits.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (g_driver_optimization_enabled &&
+        state.has_viewport &&
+        std::memcmp(
+            &state.viewport, &viewport, sizeof(viewport)) == 0) {
+        return;
+    }
+    vkCmdSetViewport(command, 0, 1, &viewport);
+    state.viewport = viewport;
+    state.has_viewport = true;
+    g_driver_optimization_stats.dynamic_state_full_replays.fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+void DriverSetScissor(DriverCommandState& state,
+                      const VkCommandBuffer command,
+                      const VkRect2D& scissor) {
+    g_driver_optimization_stats.dynamic_state_commits.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (g_driver_optimization_enabled &&
+        state.has_scissor &&
+        std::memcmp(
+            &state.scissor, &scissor, sizeof(scissor)) == 0) {
+        return;
+    }
+    vkCmdSetScissor(command, 0, 1, &scissor);
+    state.scissor = scissor;
+    state.has_scissor = true;
+    g_driver_optimization_stats.dynamic_state_full_replays.fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+void DriverBindVertexBuffer(DriverCommandState& state,
+                            const VkCommandBuffer command,
+                            const VkBuffer buffer,
+                            const VkDeviceSize offset) {
+    g_driver_optimization_stats.vertex_bind_attempts.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (g_driver_optimization_enabled &&
+        state.has_vertex && state.vertex_buffer == buffer &&
+        state.vertex_offset == offset) {
+        g_driver_optimization_stats.vertex_binds_elided.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+    vkCmdBindVertexBuffers(command, 0, 1, &buffer, &offset);
+    state.vertex_buffer = buffer;
+    state.vertex_offset = offset;
+    state.has_vertex = true;
+}
+
+void DriverBindIndexBuffer(DriverCommandState& state,
+                           const VkCommandBuffer command,
+                           const VkBuffer buffer,
+                           const VkDeviceSize offset,
+                           const VkIndexType type) {
+    g_driver_optimization_stats.index_bind_attempts.fetch_add(
+        1u, std::memory_order_relaxed);
+    if (g_driver_optimization_enabled &&
+        state.has_index && state.index_buffer == buffer &&
+        state.index_offset == offset && state.index_type == type) {
+        g_driver_optimization_stats.index_binds_elided.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+    vkCmdBindIndexBuffer(command, buffer, offset, type);
+    state.index_buffer = buffer;
+    state.index_offset = offset;
+    state.index_type = type;
+    state.has_index = true;
+}
+
+void RecordDriverQueueSubmit(const std::uint64_t logical_packets,
+                             const std::uint64_t command_buffers,
+                             const bool forced_boundary) {
+    g_driver_optimization_stats.queue_submits.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_driver_optimization_stats.queue_submit_logical_packets.fetch_add(
+        logical_packets, std::memory_order_relaxed);
+    g_driver_optimization_stats.queue_submit_command_buffers.fetch_add(
+        command_buffers, std::memory_order_relaxed);
+    if (g_driver_optimization_enabled &&
+        logical_packets > 1u) {
+        g_driver_optimization_stats.queue_submit_calls_saved.fetch_add(
+            logical_packets - 1u, std::memory_order_relaxed);
+    }
+    if (forced_boundary) {
+        g_driver_optimization_stats.queue_submit_forced_boundaries.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+}
+
+void RecordDriverQueueSubmitElision() {
+    g_driver_optimization_stats.queue_submit_logical_packets.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_driver_optimization_stats.queue_submit_calls_saved.fetch_add(
+        1u, std::memory_order_relaxed);
+}
+
+VkResult SubmitCommandBuffersAndRetire(
+    Presenter& presenter,
+    const std::span<const VkCommandBuffer> command_buffers,
+    const VkFence fallback_fence,
+    const bool cpu_readback_boundary,
+    const std::uint64_t logical_packets,
+    const std::uint64_t timeout_ns) {
+    if (command_buffers.empty()) {
+        return VK_SUCCESS;
+    }
+    const bool use_timeline =
+        cpu_readback_boundary && g_readback_batch_enabled &&
+        presenter.timeline_semaphore_supported &&
+        presenter.retirement_timeline != VK_NULL_HANDLE &&
+        presenter.wait_semaphores != nullptr;
+    if (cpu_readback_boundary && g_readback_batch_enabled &&
+        !use_timeline) {
+        g_readback_batch_stats.fallbacks.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    std::uint64_t signal_value{};
+    VkTimelineSemaphoreSubmitInfo timeline_submit{
+        VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    VkSubmitInfo submit{
+        VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount =
+        static_cast<std::uint32_t>(command_buffers.size());
+    submit.pCommandBuffers = command_buffers.data();
+    if (use_timeline) {
+        signal_value = ++presenter.retirement_timeline_value;
+        timeline_submit.signalSemaphoreValueCount = 1u;
+        timeline_submit.pSignalSemaphoreValues = &signal_value;
+        submit.pNext = &timeline_submit;
+        submit.signalSemaphoreCount = 1u;
+        submit.pSignalSemaphores =
+            &presenter.retirement_timeline;
+    }
+    auto result = vkQueueSubmit(
+        presenter.queue, 1u, &submit,
+        use_timeline ? VK_NULL_HANDLE : fallback_fence);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
+    RecordDriverQueueSubmit(
+        std::max<std::uint64_t>(logical_packets, 1u),
+        command_buffers.size(), cpu_readback_boundary);
+    if (use_timeline) {
+        const VkSemaphoreWaitInfo wait_info{
+            VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
+            nullptr, 0, 1u, &presenter.retirement_timeline,
+            &signal_value};
+        result = presenter.wait_semaphores(
+            presenter.device, &wait_info, timeout_ns);
+        if (result == VK_SUCCESS) {
+            g_readback_batch_stats.retirement_waits.fetch_add(
+                1u, std::memory_order_relaxed);
+            return VK_SUCCESS;
+        }
+        // A failed host timeline wait must not allow local resources to be
+        // destroyed while the queue still owns them.
+        g_readback_batch_stats.fallbacks.fetch_add(
+            1u, std::memory_order_relaxed);
+        return vkQueueWaitIdle(presenter.queue);
+    }
+    return vkWaitForFences(
+        presenter.device, 1u, &fallback_fence, VK_TRUE,
+        timeout_ns);
+}
+
 VkDeviceSize AlignGuestOffset(const VkDeviceSize value,
                               const VkDeviceSize alignment) {
     return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+VkExtent2D MobileTargetExtent(const Presenter& presenter) {
+    if (!g_mobile_gpu_enabled ||
+        presenter.mobile_scale_percent >= 100u) {
+        return presenter.swapchain_extent;
+    }
+    const auto scaled = [&](const std::uint32_t value) {
+        const auto result = std::max(
+            1u, (value * presenter.mobile_scale_percent + 99u) /
+                    100u);
+        return value >= 2u ? result & ~1u : result;
+    };
+    return {
+        std::max(scaled(presenter.swapchain_extent.width), 1u),
+        std::max(scaled(presenter.swapchain_extent.height), 1u)};
+}
+
+std::size_t GuestFrameDrawCount(const VulkanGuestFrame& frame) {
+    std::size_t count = frame.draws.size();
+    for (const auto& pass : frame.passes) {
+        count += pass.draws.size();
+    }
+    return count;
+}
+
+bool GuestFrameCanRebuildTargets(const VulkanGuestFrame& frame) {
+    return !frame.preserve_target || frame.clear_target ||
+        frame.first_new_draw == 0u ||
+        frame.base_batch_id == 0u;
+}
+
+void UpdateMobileScalePolicy(
+    Presenter& presenter,
+    const VulkanGuestFrame& frame) {
+    if (!g_mobile_gpu_enabled) {
+        presenter.mobile_pending_scale_percent = 100u;
+        return;
+    }
+    ++presenter.mobile_frame_count;
+    const auto draw_count = GuestFrameDrawCount(frame);
+    if (draw_count >= 180u) {
+        ++presenter.mobile_pressure_frames;
+        presenter.mobile_relaxed_frames = 0u;
+    } else if (draw_count <= 48u) {
+        ++presenter.mobile_relaxed_frames;
+        presenter.mobile_pressure_frames = 0u;
+    } else {
+        presenter.mobile_pressure_frames = 0u;
+        presenter.mobile_relaxed_frames = 0u;
+    }
+    if (presenter.mobile_pressure_frames >= 45u &&
+        presenter.mobile_pending_scale_percent > 50u) {
+        presenter.mobile_pending_scale_percent =
+            std::max(
+                50u,
+                presenter.mobile_pending_scale_percent - 10u);
+        presenter.mobile_pressure_frames = 0u;
+    } else if (presenter.mobile_relaxed_frames >= 240u &&
+               presenter.mobile_pending_scale_percent < 100u) {
+        presenter.mobile_pending_scale_percent =
+            std::min(
+                100u,
+                presenter.mobile_pending_scale_percent + 5u);
+        presenter.mobile_relaxed_frames = 0u;
+    }
+}
+
+void ApplyPendingMobileScale(
+    Presenter& presenter,
+    const VulkanGuestFrame& frame) {
+    UpdateMobileScalePolicy(presenter, frame);
+    if (presenter.mobile_pending_scale_percent ==
+        presenter.mobile_scale_percent) {
+        return;
+    }
+    if (!GuestFrameCanRebuildTargets(frame)) {
+        g_mobile_gpu_stats.physical_scale_fallbacks.fetch_add(
+            1u, std::memory_order_relaxed);
+        return;
+    }
+    const auto previous = presenter.mobile_scale_percent;
+    presenter.mobile_scale_percent =
+        presenter.mobile_pending_scale_percent;
+    if (presenter.mobile_scale_percent < previous) {
+        g_mobile_gpu_stats.scale_down_events.fetch_add(
+            1u, std::memory_order_relaxed);
+    } else {
+        g_mobile_gpu_stats.scale_up_events.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    g_mobile_gpu_stats.effective_scale_percent.store(
+        presenter.mobile_scale_percent,
+        std::memory_order_relaxed);
+    DestroyGuestSwapchainResources(presenter);
+}
+
+void RecordMobileFrame(
+    const Presenter& presenter,
+    const std::size_t draw_count) {
+    if (!g_mobile_gpu_enabled) {
+        return;
+    }
+    const auto physical = MobileTargetExtent(presenter);
+    const auto logical_pixels =
+        static_cast<std::uint64_t>(
+            presenter.swapchain_extent.width) *
+        presenter.swapchain_extent.height;
+    const auto physical_pixels =
+        static_cast<std::uint64_t>(physical.width) *
+        physical.height;
+    if (physical_pixels < logical_pixels) {
+        g_mobile_gpu_stats.physical_scaled_draws.fetch_add(
+            draw_count, std::memory_order_relaxed);
+        g_mobile_gpu_stats.physical_pixels_saved.fetch_add(
+            logical_pixels - physical_pixels,
+            std::memory_order_relaxed);
+        g_mobile_gpu_stats.source_smaller_than_output_frames.fetch_add(
+            1u, std::memory_order_relaxed);
+    }
+    if (presenter.fragment_shading_rate_2x2) {
+        g_mobile_gpu_stats.coarse_rate_draws.fetch_add(
+            draw_count, std::memory_order_relaxed);
+    }
+}
+
+void SetMobileFragmentShadingRate(
+    const Presenter& presenter,
+    const VkCommandBuffer command_buffer) {
+    if (!g_mobile_gpu_enabled ||
+        !presenter.fragment_shading_rate_2x2 ||
+        presenter.cmd_set_fragment_shading_rate == nullptr) {
+        return;
+    }
+    const VkExtent2D fragment_size{2u, 2u};
+    const std::array combiners{
+        VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+        VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR};
+    presenter.cmd_set_fragment_shading_rate(
+        command_buffer, &fragment_size, combiners.data());
 }
 
 bool CreateGuestFixedResources(Presenter& presenter) {
@@ -980,7 +2803,7 @@ bool CreateGuestFixedResources(Presenter& presenter) {
     const VkDescriptorPoolCreateInfo pool_info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         nullptr,
-        0,
+        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
         1024,
         1,
         &pool_size};
@@ -1045,6 +2868,14 @@ bool CreateGuestFixedResources(Presenter& presenter) {
         LogFailure("vkCreateShaderModule(guest)", result);
         return false;
     }
+    presenter.effective_anisotropy =
+        presenter.sampler_anisotropy_supported &&
+            g_requested_max_anisotropy > 1u
+        ? std::min(
+              static_cast<float>(g_requested_max_anisotropy),
+              presenter.physical_properties.limits
+                  .maxSamplerAnisotropy)
+        : 1.0f;
     const VkSamplerCreateInfo sampler_info{
         VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
         nullptr,
@@ -1056,8 +2887,9 @@ bool CreateGuestFixedResources(Presenter& presenter) {
         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
         0.0f,
-        VK_FALSE,
-        1.0f,
+        presenter.effective_anisotropy > 1.0f
+            ? VK_TRUE : VK_FALSE,
+        presenter.effective_anisotropy,
         VK_FALSE,
         VK_COMPARE_OP_NEVER,
         0.0f,
@@ -1086,6 +2918,8 @@ bool CreateGuestFixedResources(Presenter& presenter) {
     auto nearest_sampler_info = sampler_info;
     nearest_sampler_info.magFilter = VK_FILTER_NEAREST;
     nearest_sampler_info.minFilter = VK_FILTER_NEAREST;
+    nearest_sampler_info.anisotropyEnable = VK_FALSE;
+    nearest_sampler_info.maxAnisotropy = 1.0f;
     result = vkCreateSampler(
         presenter.device, &nearest_sampler_info, nullptr,
         &presenter.guest_nearest_sampler);
@@ -1108,12 +2942,13 @@ bool CreateGuestFixedResources(Presenter& presenter) {
 }
 
 bool CreateGuestSwapchainResources(Presenter& presenter) {
+    const auto render_extent = MobileTargetExtent(presenter);
     if (presenter.guest_pipeline != VK_NULL_HANDLE &&
         presenter.guest_target_framebuffer != VK_NULL_HANDLE &&
         presenter.guest_target_extent.width ==
-            presenter.swapchain_extent.width &&
+            render_extent.width &&
         presenter.guest_target_extent.height ==
-            presenter.swapchain_extent.height) {
+            render_extent.height) {
         return true;
     }
     if (!CreateGuestFixedResources(presenter)) {
@@ -1265,13 +3100,15 @@ bool CreateGuestSwapchainResources(Presenter& presenter) {
         1,
         &blend_attachment,
         {0.0f, 0.0f, 0.0f, 0.0f}};
-    constexpr std::array dynamic_states{
-        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const std::array dynamic_states{
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_FRAGMENT_SHADING_RATE_KHR};
     const VkPipelineDynamicStateCreateInfo dynamic{
         VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
         nullptr,
         0,
-        static_cast<std::uint32_t>(dynamic_states.size()),
+        presenter.fragment_shading_rate_2x2 ? 3u : 2u,
         dynamic_states.data()};
     const VkGraphicsPipelineCreateInfo pipeline_info{
         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
@@ -1429,8 +3266,8 @@ bool CreateGuestSwapchainResources(Presenter& presenter) {
         0,
         VK_IMAGE_TYPE_2D,
         presenter.swapchain_format,
-        {presenter.swapchain_extent.width,
-         presenter.swapchain_extent.height, 1},
+        {render_extent.width,
+         render_extent.height, 1},
         1,
         1,
         VK_SAMPLE_COUNT_1_BIT,
@@ -1502,8 +3339,8 @@ bool CreateGuestSwapchainResources(Presenter& presenter) {
         presenter.guest_render_pass,
         1,
         &presenter.guest_target_view,
-        presenter.swapchain_extent.width,
-        presenter.swapchain_extent.height,
+        render_extent.width,
+        render_extent.height,
         1};
     result = vkCreateFramebuffer(
         presenter.device, &framebuffer_info, nullptr,
@@ -1512,53 +3349,507 @@ bool CreateGuestSwapchainResources(Presenter& presenter) {
         LogFailure("vkCreateFramebuffer(guest target)", result);
         return false;
     }
-    presenter.guest_target_extent = presenter.swapchain_extent;
+    presenter.guest_target_extent = render_extent;
     presenter.guest_target_initialized = false;
     presenter.last_guest_batch_id = 0;
     presenter.last_guest_target_key = 0;
     return true;
 }
 
+bool CreateFsrResources(Presenter& presenter) {
+    if (!g_mobile_gpu_enabled ||
+        presenter.mobile_scale_percent >= 100u ||
+        !presenter.swapchain_color_attachment_supported) {
+        return false;
+    }
+    if (presenter.fsr_pipeline != VK_NULL_HANDLE &&
+        presenter.fsr_framebuffers.size() ==
+            presenter.swapchain_images.size()) {
+        return true;
+    }
+    DestroyFsrResources(presenter);
+    const VkAttachmentDescription attachment{
+        0, presenter.swapchain_format,
+        VK_SAMPLE_COUNT_1_BIT,
+        VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        VK_ATTACHMENT_STORE_OP_STORE,
+        VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    const VkAttachmentReference color_reference{
+        0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    const VkSubpassDescription subpass{
+        0, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        0, nullptr, 1, &color_reference,
+        nullptr, nullptr, 0, nullptr};
+    const VkRenderPassCreateInfo render_pass_info{
+        VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+        nullptr, 0, 1, &attachment, 1, &subpass,
+        0, nullptr};
+    auto result = vkCreateRenderPass(
+        presenter.device, &render_pass_info, nullptr,
+        &presenter.fsr_render_pass);
+    if (result != VK_SUCCESS) {
+        LogFailure("vkCreateRenderPass(ps5 fsr)", result);
+        return false;
+    }
+    const VkDescriptorSetLayoutBinding binding{
+        0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+    const VkDescriptorSetLayoutCreateInfo descriptor_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        nullptr, 0, 1, &binding};
+    result = vkCreateDescriptorSetLayout(
+        presenter.device, &descriptor_info, nullptr,
+        &presenter.fsr_descriptor_layout);
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    const VkPushConstantRange push_range{
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+        sizeof(float) * 4u};
+    const VkPipelineLayoutCreateInfo layout_info{
+        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        nullptr, 0, 1, &presenter.fsr_descriptor_layout,
+        1, &push_range};
+    result = vkCreatePipelineLayout(
+        presenter.device, &layout_info, nullptr,
+        &presenter.fsr_pipeline_layout);
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    const VkShaderModuleCreateInfo vertex_info{
+        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        nullptr, 0, sizeof(VulkanFsrUpscaleVertexShader),
+        VulkanFsrUpscaleVertexShader};
+    const VkShaderModuleCreateInfo fragment_info{
+        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        nullptr, 0, sizeof(VulkanFsrUpscaleFragmentShader),
+        VulkanFsrUpscaleFragmentShader};
+    result = vkCreateShaderModule(
+        presenter.device, &vertex_info, nullptr,
+        &presenter.fsr_vertex_shader);
+    if (result == VK_SUCCESS) {
+        result = vkCreateShaderModule(
+            presenter.device, &fragment_info, nullptr,
+            &presenter.fsr_fragment_shader);
+    }
+    if (result != VK_SUCCESS) {
+        LogFailure("vkCreateShaderModule(ps5 fsr)", result);
+        return false;
+    }
+    const std::array stages{
+        VkPipelineShaderStageCreateInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT,
+            presenter.fsr_vertex_shader, "main", nullptr},
+        VkPipelineShaderStageCreateInfo{
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
+            presenter.fsr_fragment_shader, "main", nullptr}};
+    const VkPipelineVertexInputStateCreateInfo vertex_input{
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    const VkPipelineInputAssemblyStateCreateInfo assembly{
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        nullptr, 0, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+        VK_FALSE};
+    const VkPipelineViewportStateCreateInfo viewport_state{
+        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        nullptr, 0, 1, nullptr, 1, nullptr};
+    const VkPipelineRasterizationStateCreateInfo raster{
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        nullptr, 0, VK_FALSE, VK_FALSE,
+        VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE,
+        VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE,
+        0.0f, 0.0f, 0.0f, 1.0f};
+    const VkPipelineMultisampleStateCreateInfo multisample{
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        nullptr, 0, VK_SAMPLE_COUNT_1_BIT, VK_FALSE,
+        1.0f, nullptr, VK_FALSE, VK_FALSE};
+    const VkPipelineColorBlendAttachmentState blend_attachment{
+        VK_FALSE,
+        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO,
+        VK_BLEND_OP_ADD,
+        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO,
+        VK_BLEND_OP_ADD,
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+    const VkPipelineColorBlendStateCreateInfo blend{
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        nullptr, 0, VK_FALSE, VK_LOGIC_OP_COPY,
+        1, &blend_attachment, {0, 0, 0, 0}};
+    constexpr std::array dynamic_states{
+        VK_DYNAMIC_STATE_VIEWPORT,
+        VK_DYNAMIC_STATE_SCISSOR};
+    const VkPipelineDynamicStateCreateInfo dynamic{
+        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        nullptr, 0,
+        static_cast<std::uint32_t>(dynamic_states.size()),
+        dynamic_states.data()};
+    const VkGraphicsPipelineCreateInfo pipeline_info{
+        VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        nullptr, 0,
+        static_cast<std::uint32_t>(stages.size()),
+        stages.data(), &vertex_input, &assembly,
+        nullptr, &viewport_state, &raster, &multisample,
+        nullptr, &blend, &dynamic,
+        presenter.fsr_pipeline_layout,
+        presenter.fsr_render_pass, 0,
+        VK_NULL_HANDLE, -1};
+    result = vkCreateGraphicsPipelines(
+        presenter.device, VK_NULL_HANDLE, 1,
+        &pipeline_info, nullptr, &presenter.fsr_pipeline);
+    if (result != VK_SUCCESS) {
+        LogFailure("vkCreateGraphicsPipelines(ps5 fsr)", result);
+        return false;
+    }
+    const VkSamplerCreateInfo sampler_info{
+        VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        nullptr, 0, VK_FILTER_LINEAR, VK_FILTER_LINEAR,
+        VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        0.0f, VK_FALSE, 1.0f, VK_FALSE,
+        VK_COMPARE_OP_NEVER, 0.0f, 0.0f,
+        VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        VK_FALSE};
+    result = vkCreateSampler(
+        presenter.device, &sampler_info, nullptr,
+        &presenter.fsr_sampler);
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    const VkDescriptorPoolSize pool_size{
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    const VkDescriptorPoolCreateInfo pool_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        nullptr, 0, 1, 1, &pool_size};
+    result = vkCreateDescriptorPool(
+        presenter.device, &pool_info, nullptr,
+        &presenter.fsr_descriptor_pool);
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    const VkDescriptorSetAllocateInfo allocate_info{
+        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        nullptr, presenter.fsr_descriptor_pool,
+        1, &presenter.fsr_descriptor_layout};
+    result = vkAllocateDescriptorSets(
+        presenter.device, &allocate_info,
+        &presenter.fsr_descriptor);
+    if (result != VK_SUCCESS) {
+        return false;
+    }
+    presenter.fsr_swapchain_views.resize(
+        presenter.swapchain_images.size());
+    presenter.fsr_framebuffers.resize(
+        presenter.swapchain_images.size());
+    for (std::size_t index = 0;
+         index < presenter.swapchain_images.size(); ++index) {
+        const VkImageViewCreateInfo view_info{
+            VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            nullptr, 0, presenter.swapchain_images[index],
+            VK_IMAGE_VIEW_TYPE_2D,
+            presenter.swapchain_format,
+            {VK_COMPONENT_SWIZZLE_IDENTITY,
+             VK_COMPONENT_SWIZZLE_IDENTITY,
+             VK_COMPONENT_SWIZZLE_IDENTITY,
+             VK_COMPONENT_SWIZZLE_IDENTITY},
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        result = vkCreateImageView(
+            presenter.device, &view_info, nullptr,
+            &presenter.fsr_swapchain_views[index]);
+        if (result != VK_SUCCESS) {
+            return false;
+        }
+        const VkFramebufferCreateInfo framebuffer_info{
+            VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+            nullptr, 0, presenter.fsr_render_pass,
+            1, &presenter.fsr_swapchain_views[index],
+            presenter.swapchain_extent.width,
+            presenter.swapchain_extent.height, 1};
+        result = vkCreateFramebuffer(
+            presenter.device, &framebuffer_info, nullptr,
+            &presenter.fsr_framebuffers[index]);
+        if (result != VK_SUCCESS) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool RecordFsrUpscale(
+    Presenter& presenter,
+    const VkCommandBuffer command_buffer,
+    const std::uint32_t swapchain_image_index,
+    const VkImage source_image,
+    const VkImageView source_view,
+    const VkExtent2D source_extent) {
+    if (source_extent.width >= presenter.swapchain_extent.width &&
+        source_extent.height >= presenter.swapchain_extent.height) {
+        return false;
+    }
+    if (!CreateFsrResources(presenter) ||
+        swapchain_image_index >=
+            presenter.fsr_framebuffers.size()) {
+        return false;
+    }
+    if (presenter.fsr_bound_source_view != source_view) {
+        const VkDescriptorImageInfo image_info{
+            presenter.fsr_sampler, source_view,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        const VkWriteDescriptorSet write{
+            VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            nullptr, presenter.fsr_descriptor, 0, 0, 1,
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            &image_info, nullptr, nullptr};
+        vkUpdateDescriptorSets(
+            presenter.device, 1, &write, 0, nullptr);
+        presenter.fsr_bound_source_view = source_view;
+    }
+    ImageBarrier(
+        command_buffer, source_image,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    ImageBarrier(
+        command_buffer,
+        presenter.swapchain_images[swapchain_image_index],
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    const VkRenderPassBeginInfo render_begin{
+        VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        nullptr, presenter.fsr_render_pass,
+        presenter.fsr_framebuffers[swapchain_image_index],
+        {{0, 0}, presenter.swapchain_extent},
+        0, nullptr};
+    vkCmdBeginRenderPass(
+        command_buffer, &render_begin,
+        VK_SUBPASS_CONTENTS_INLINE);
+    const VkViewport viewport{
+        0.0f, 0.0f,
+        static_cast<float>(
+            presenter.swapchain_extent.width),
+        static_cast<float>(
+            presenter.swapchain_extent.height),
+        0.0f, 1.0f};
+    const VkRect2D scissor{
+        {0, 0}, presenter.swapchain_extent};
+    vkCmdSetViewport(command_buffer, 0, 1, &viewport);
+    vkCmdSetScissor(command_buffer, 0, 1, &scissor);
+    vkCmdBindPipeline(
+        command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        presenter.fsr_pipeline);
+    vkCmdBindDescriptorSets(
+        command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        presenter.fsr_pipeline_layout, 0, 1,
+        &presenter.fsr_descriptor, 0, nullptr);
+    const std::array<float, 4> parameters{
+        1.0f / static_cast<float>(source_extent.width),
+        1.0f / static_cast<float>(source_extent.height),
+        1.0f / static_cast<float>(
+            presenter.swapchain_extent.width),
+        1.0f / static_cast<float>(
+            presenter.swapchain_extent.height)};
+    vkCmdPushConstants(
+        command_buffer, presenter.fsr_pipeline_layout,
+        VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+        sizeof(parameters), parameters.data());
+    vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    vkCmdEndRenderPass(command_buffer);
+    ImageBarrier(
+        command_buffer,
+        presenter.swapchain_images[swapchain_image_index],
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    ImageBarrier(
+        command_buffer, source_image,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    g_mobile_gpu_stats.fsr_frames.fetch_add(
+        1u, std::memory_order_relaxed);
+    return true;
+}
+
+void DestroyGuestTextureEntry(
+    Presenter& presenter,
+    std::unordered_map<
+        std::uint64_t, GuestTextureResource>::iterator iterator);
+
+void DestroyGuestTargetEntry(
+    Presenter& presenter,
+    std::unordered_map<
+        std::uint64_t, GuestTargetResource>::iterator iterator) {
+    const auto key = iterator->first;
+    DestroyGuestTargetResource(presenter, iterator->second);
+    presenter.pending_guest_target_uses.erase(key);
+    presenter.in_flight_guest_target_uses.erase(key);
+    if (presenter.last_guest_target_key == key) {
+        presenter.last_guest_target_key = 0u;
+        presenter.last_guest_batch_id = 0u;
+    }
+    presenter.guest_targets.erase(iterator);
+}
+
+bool EnsureGuestResourceBudget(
+    Presenter& presenter,
+    const VkDeviceSize incoming,
+    const std::uint64_t protected_target_key = 0u,
+    const VkDeviceSize replacement_credit = 0u,
+    const std::uint64_t protected_texture_key = 0u) {
+    if (!g_mobile_gpu_enabled) {
+        return true;
+    }
+    const auto budget = presenter.guest_resource_budget_bytes;
+    if (incoming > budget) {
+        return false;
+    }
+    const auto over_budget = [&] {
+        const auto credited_target_bytes =
+            presenter.guest_target_resident_bytes >=
+                    replacement_credit
+            ? presenter.guest_target_resident_bytes -
+                  replacement_credit
+            : 0u;
+        if (presenter.guest_texture_resident_bytes > budget ||
+            credited_target_bytes >
+                budget - presenter.guest_texture_resident_bytes) {
+            return true;
+        }
+        const auto resident =
+            presenter.guest_texture_resident_bytes +
+            credited_target_bytes;
+        return incoming > budget - resident;
+    };
+    std::uint64_t evictions{};
+    while (over_budget()) {
+        auto oldest_texture =
+            presenter.guest_textures.end();
+        for (auto iterator = presenter.guest_textures.begin();
+             iterator != presenter.guest_textures.end();
+             ++iterator) {
+            if (iterator->first == protected_texture_key ||
+                iterator->second.last_use + 2u >=
+                presenter.guest_frame_serial) {
+                continue;
+            }
+            if (oldest_texture ==
+                    presenter.guest_textures.end() ||
+                iterator->second.last_use <
+                    oldest_texture->second.last_use) {
+                oldest_texture = iterator;
+            }
+        }
+        auto oldest_target =
+            presenter.guest_targets.end();
+        for (auto iterator = presenter.guest_targets.begin();
+             iterator != presenter.guest_targets.end();
+             ++iterator) {
+            const auto key = iterator->first;
+            const auto protected_by_retirement =
+                key == protected_target_key ||
+                presenter.pending_guest_target_uses.contains(key) ||
+                presenter.in_flight_guest_target_uses.contains(key) ||
+                (presenter.submission_in_flight &&
+                 presenter.in_flight_guest_target_uses.empty());
+            if (protected_by_retirement ||
+                iterator->second.last_use + 2u >=
+                    presenter.guest_frame_serial) {
+                continue;
+            }
+            if (oldest_target ==
+                    presenter.guest_targets.end() ||
+                iterator->second.last_use <
+                    oldest_target->second.last_use) {
+                oldest_target = iterator;
+            }
+        }
+        const bool evict_texture =
+            oldest_texture != presenter.guest_textures.end() &&
+            (oldest_target == presenter.guest_targets.end() ||
+             oldest_texture->second.last_use <=
+                 oldest_target->second.last_use);
+        if (evict_texture) {
+            DestroyGuestTextureEntry(
+                presenter, oldest_texture);
+        } else if (oldest_target !=
+                   presenter.guest_targets.end()) {
+            DestroyGuestTargetEntry(
+                presenter, oldest_target);
+        } else {
+            break;
+        }
+        ++evictions;
+    }
+    g_mobile_gpu_stats.residency_gc_evictions.fetch_add(
+        evictions, std::memory_order_relaxed);
+    return !over_budget();
+}
+
 GuestTargetResource* EnsureGuestTarget(
     Presenter& presenter,
     const std::uint64_t key) {
+    const auto render_extent = MobileTargetExtent(presenter);
     const auto target_key = key != 0u ? key : UINT64_MAX;
-    auto [iterator, inserted] =
-        presenter.guest_targets.try_emplace(target_key);
-    auto& target = iterator->second;
-    if (!inserted && target.image != VK_NULL_HANDLE &&
-        target.extent.width == presenter.swapchain_extent.width &&
-        target.extent.height == presenter.swapchain_extent.height) {
-        target.last_use = presenter.guest_frame_serial;
-        return &target;
+    auto existing =
+        presenter.guest_targets.find(target_key);
+    if (existing != presenter.guest_targets.end()) {
+        auto& target = existing->second;
+        const bool complete =
+            target.image != VK_NULL_HANDLE &&
+            target.memory != VK_NULL_HANDLE &&
+            target.view != VK_NULL_HANDLE &&
+            target.framebuffer != VK_NULL_HANDLE &&
+            target.descriptor != VK_NULL_HANDLE &&
+            target.nearest_descriptor != VK_NULL_HANDLE;
+        if (complete &&
+            target.extent.width == render_extent.width &&
+            target.extent.height == render_extent.height) {
+            target.last_use = presenter.guest_frame_serial;
+            presenter.pending_guest_target_uses.insert(
+                target_key);
+            return &target;
+        }
+        if (presenter.pending_guest_target_uses.contains(
+                target_key) ||
+            presenter.in_flight_guest_target_uses.contains(
+                target_key)) {
+            return nullptr;
+        }
+        if (!complete) {
+            DestroyGuestTargetEntry(presenter, existing);
+            existing = presenter.guest_targets.end();
+        }
     }
-    if (!inserted) {
-        if (target.framebuffer != VK_NULL_HANDLE) {
-            vkDestroyFramebuffer(
-                presenter.device, target.framebuffer, nullptr);
-        }
-        if (target.view != VK_NULL_HANDLE) {
-            vkDestroyImageView(
-                presenter.device, target.view, nullptr);
-        }
-        if (target.image != VK_NULL_HANDLE) {
-            vkDestroyImage(
-                presenter.device, target.image, nullptr);
-        }
-        if (target.memory != VK_NULL_HANDLE) {
-            vkFreeMemory(
-                presenter.device, target.memory, nullptr);
-        }
-        target = {};
-    }
+    GuestTargetResource candidate{};
+    const auto cleanup_candidate = [&] {
+        // Candidate memory is not resident/accounted until publication.
+        candidate.allocation_size = 0u;
+        DestroyGuestTargetResource(presenter, candidate);
+    };
     const VkImageCreateInfo image_info{
         VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         nullptr,
         0,
         VK_IMAGE_TYPE_2D,
         presenter.swapchain_format,
-        {presenter.swapchain_extent.width,
-         presenter.swapchain_extent.height, 1},
+        {render_extent.width,
+         render_extent.height, 1},
         1,
         1,
         VK_SAMPLE_COUNT_1_BIT,
@@ -1572,18 +3863,29 @@ GuestTargetResource* EnsureGuestTarget(
         nullptr,
         VK_IMAGE_LAYOUT_UNDEFINED};
     auto result = vkCreateImage(
-        presenter.device, &image_info, nullptr, &target.image);
+        presenter.device, &image_info, nullptr,
+        &candidate.image);
     if (result != VK_SUCCESS) {
         LogFailure("vkCreateImage(guest keyed target)", result);
         return nullptr;
     }
     VkMemoryRequirements requirements{};
     vkGetImageMemoryRequirements(
-        presenter.device, target.image, &requirements);
+        presenter.device, candidate.image, &requirements);
     const auto memory_type = FindMemoryType(
         presenter, requirements.memoryTypeBits,
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     if (memory_type == std::numeric_limits<std::uint32_t>::max()) {
+        cleanup_candidate();
+        return nullptr;
+    }
+    const auto replacement_credit =
+        existing != presenter.guest_targets.end()
+        ? existing->second.allocation_size : 0u;
+    if (!EnsureGuestResourceBudget(
+            presenter, requirements.size, target_key,
+            replacement_credit)) {
+        cleanup_candidate();
         return nullptr;
     }
     const VkMemoryAllocateInfo allocation{
@@ -1592,20 +3894,23 @@ GuestTargetResource* EnsureGuestTarget(
         requirements.size,
         memory_type};
     result = vkAllocateMemory(
-        presenter.device, &allocation, nullptr, &target.memory);
+        presenter.device, &allocation, nullptr,
+        &candidate.memory);
     if (result == VK_SUCCESS) {
         result = vkBindImageMemory(
-            presenter.device, target.image, target.memory, 0);
+            presenter.device, candidate.image,
+            candidate.memory, 0);
     }
     if (result != VK_SUCCESS) {
         LogFailure("guest keyed target memory", result);
+        cleanup_candidate();
         return nullptr;
     }
     const VkImageViewCreateInfo view_info{
         VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         nullptr,
         0,
-        target.image,
+        candidate.image,
         VK_IMAGE_VIEW_TYPE_2D,
         presenter.swapchain_format,
         {VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -1614,9 +3919,11 @@ GuestTargetResource* EnsureGuestTarget(
          VK_COMPONENT_SWIZZLE_IDENTITY},
         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     result = vkCreateImageView(
-        presenter.device, &view_info, nullptr, &target.view);
+        presenter.device, &view_info, nullptr,
+        &candidate.view);
     if (result != VK_SUCCESS) {
         LogFailure("vkCreateImageView(guest keyed target)", result);
+        cleanup_candidate();
         return nullptr;
     }
     const VkFramebufferCreateInfo framebuffer_info{
@@ -1625,15 +3932,16 @@ GuestTargetResource* EnsureGuestTarget(
         0,
         presenter.guest_render_pass,
         1,
-        &target.view,
-        presenter.swapchain_extent.width,
-        presenter.swapchain_extent.height,
+        &candidate.view,
+        render_extent.width,
+        render_extent.height,
         1};
     result = vkCreateFramebuffer(
         presenter.device, &framebuffer_info, nullptr,
-        &target.framebuffer);
+        &candidate.framebuffer);
     if (result != VK_SUCCESS) {
         LogFailure("vkCreateFramebuffer(guest keyed target)", result);
+        cleanup_candidate();
         return nullptr;
     }
     const std::array descriptor_layouts{
@@ -1650,24 +3958,25 @@ GuestTargetResource* EnsureGuestTarget(
         presenter.device, &descriptor_info, descriptors.data());
     if (result != VK_SUCCESS) {
         LogFailure("vkAllocateDescriptorSets(guest target)", result);
+        cleanup_candidate();
         return nullptr;
     }
-    target.descriptor = descriptors[0];
-    target.nearest_descriptor = descriptors[1];
+    candidate.descriptor = descriptors[0];
+    candidate.nearest_descriptor = descriptors[1];
     const std::array image_descriptors{
         VkDescriptorImageInfo{
             presenter.guest_sampler,
-            target.view,
+            candidate.view,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
         VkDescriptorImageInfo{
             presenter.guest_nearest_sampler,
-            target.view,
+            candidate.view,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
     const std::array writes{
         VkWriteDescriptorSet{
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
-            target.descriptor,
+            candidate.descriptor,
             0,
             0,
             1,
@@ -1678,7 +3987,7 @@ GuestTargetResource* EnsureGuestTarget(
         VkWriteDescriptorSet{
             VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             nullptr,
-            target.nearest_descriptor,
+            candidate.nearest_descriptor,
             0,
             0,
             1,
@@ -1690,10 +3999,99 @@ GuestTargetResource* EnsureGuestTarget(
         presenter.device,
         static_cast<std::uint32_t>(writes.size()),
         writes.data(), 0, nullptr);
-    target.extent = presenter.swapchain_extent;
-    target.initialized = false;
-    target.last_use = presenter.guest_frame_serial;
-    return &target;
+    candidate.allocation_size = requirements.size;
+    candidate.extent = render_extent;
+    candidate.initialized = false;
+    candidate.last_use = presenter.guest_frame_serial;
+
+    try {
+        if (existing != presenter.guest_targets.end()) {
+            DestroyGuestTargetResource(
+                presenter, existing->second);
+            existing->second = std::move(candidate);
+        } else {
+            auto [inserted, accepted] =
+                presenter.guest_targets.emplace(
+                    target_key, std::move(candidate));
+            if (!accepted) {
+                cleanup_candidate();
+                return nullptr;
+            }
+            existing = inserted;
+        }
+    } catch (...) {
+        cleanup_candidate();
+        return nullptr;
+    }
+    presenter.guest_target_resident_bytes +=
+        existing->second.allocation_size;
+    presenter.pending_guest_target_uses.insert(target_key);
+    return &existing->second;
+}
+
+std::pair<std::uint64_t, std::uint64_t> HashGuestTexture(
+    const std::span<const std::uint8_t> bytes) {
+    std::uint64_t low = UINT64_C(1469598103934665603);
+    std::uint64_t high = UINT64_C(0x6a09e667f3bcc909);
+    for (const auto byte : bytes) {
+        low ^= byte;
+        low *= UINT64_C(1099511628211);
+        high ^= static_cast<std::uint64_t>(byte) +
+            UINT64_C(0x9e3779b97f4a7c15) +
+            (high << 6u) + (high >> 2u);
+        high = (high << 19u) | (high >> 45u);
+    }
+    low ^= bytes.size();
+    high ^= bytes.size() * UINT64_C(0x94d049bb133111eb);
+    return {low, high};
+}
+
+void DestroyGuestTextureEntry(
+    Presenter& presenter,
+    std::unordered_map<
+        std::uint64_t, GuestTextureResource>::iterator iterator) {
+    auto& texture = iterator->second;
+    if (texture.descriptor != VK_NULL_HANDLE &&
+        presenter.guest_descriptor_pool != VK_NULL_HANDLE) {
+        (void)vkFreeDescriptorSets(
+            presenter.device, presenter.guest_descriptor_pool,
+            1, &texture.descriptor);
+    }
+    if (texture.view != VK_NULL_HANDLE) {
+        vkDestroyImageView(
+            presenter.device, texture.view, nullptr);
+    }
+    if (texture.image != VK_NULL_HANDLE) {
+        vkDestroyImage(
+            presenter.device, texture.image, nullptr);
+    }
+    if (texture.memory != VK_NULL_HANDLE) {
+        vkFreeMemory(
+            presenter.device, texture.memory, nullptr);
+    }
+    presenter.guest_texture_resident_bytes =
+        presenter.guest_texture_resident_bytes >=
+                texture.allocation_size
+        ? presenter.guest_texture_resident_bytes -
+              texture.allocation_size
+        : 0u;
+    const auto erased_key = iterator->first;
+    std::erase_if(
+        presenter.guest_texture_aliases,
+        [&](const auto& alias) {
+            return alias.first == erased_key ||
+                alias.second == erased_key;
+        });
+    presenter.guest_textures.erase(iterator);
+}
+
+bool EnforceGuestTextureBudget(
+    Presenter& presenter,
+    const VkDeviceSize incoming,
+    const std::uint64_t protected_texture_key) {
+    return EnsureGuestResourceBudget(
+        presenter, incoming, 0u, 0u,
+        protected_texture_key);
 }
 
 GuestTextureResource* EnsureGuestTexture(
@@ -1704,6 +4102,65 @@ GuestTextureResource* EnsureGuestTexture(
     if (draw.texture_rgba == nullptr ||
         draw.texture_width == 0 || draw.texture_height == 0) {
         return nullptr;
+    }
+    const auto content_hash = HashGuestTexture(
+        std::span<const std::uint8_t>{
+            *draw.texture_rgba});
+    if (const auto alias =
+            presenter.guest_texture_aliases.find(
+                draw.texture_key);
+        alias != presenter.guest_texture_aliases.end()) {
+        const auto canonical =
+            presenter.guest_textures.find(alias->second);
+        if (canonical != presenter.guest_textures.end() &&
+            canonical->second.width == draw.texture_width &&
+            canonical->second.height == draw.texture_height &&
+            canonical->second.content_hash_low ==
+                content_hash.first &&
+            canonical->second.content_hash_high ==
+                content_hash.second &&
+            canonical->second.repeat_texture ==
+                draw.repeat_texture &&
+            canonical->second.nearest_texture ==
+                draw.nearest_texture) {
+            canonical->second.last_use =
+                presenter.guest_frame_serial;
+            g_mobile_gpu_stats.exact_surface_reuses.fetch_add(
+                1u, std::memory_order_relaxed);
+            g_mobile_gpu_stats.exact_surface_reuse_bytes.fetch_add(
+                draw.texture_rgba->size(),
+                std::memory_order_relaxed);
+            return &canonical->second;
+        }
+        presenter.guest_texture_aliases.erase(alias);
+    }
+    if (g_mobile_gpu_enabled) {
+        for (auto& [key, candidate] :
+             presenter.guest_textures) {
+            if (key == draw.texture_key ||
+                !candidate.initialized ||
+                candidate.width != draw.texture_width ||
+                candidate.height != draw.texture_height ||
+                candidate.content_hash_low !=
+                    content_hash.first ||
+                candidate.content_hash_high !=
+                    content_hash.second ||
+                candidate.repeat_texture !=
+                    draw.repeat_texture ||
+                candidate.nearest_texture !=
+                    draw.nearest_texture) {
+                continue;
+            }
+            presenter.guest_texture_aliases[
+                draw.texture_key] = key;
+            candidate.last_use = presenter.guest_frame_serial;
+            g_mobile_gpu_stats.exact_surface_reuses.fetch_add(
+                1u, std::memory_order_relaxed);
+            g_mobile_gpu_stats.exact_surface_reuse_bytes.fetch_add(
+                draw.texture_rgba->size(),
+                std::memory_order_relaxed);
+            return &candidate;
+        }
     }
     auto [iterator, inserted] = presenter.guest_textures.try_emplace(
         draw.texture_key);
@@ -1720,6 +4177,12 @@ GuestTextureResource* EnsureGuestTexture(
         if (texture.memory != VK_NULL_HANDLE) {
             vkFreeMemory(presenter.device, texture.memory, nullptr);
         }
+        presenter.guest_texture_resident_bytes =
+            presenter.guest_texture_resident_bytes >=
+                    texture.allocation_size
+            ? presenter.guest_texture_resident_bytes -
+                  texture.allocation_size
+            : 0u;
         const auto descriptor = texture.descriptor;
         texture = {};
         texture.descriptor = descriptor;
@@ -1746,6 +4209,7 @@ GuestTextureResource* EnsureGuestTexture(
             presenter.device, &image_info, nullptr, &texture.image);
         if (result != VK_SUCCESS) {
             LogFailure("vkCreateImage(guest texture)", result);
+            DestroyGuestTextureEntry(presenter, iterator);
             return nullptr;
         }
         VkMemoryRequirements requirements{};
@@ -1755,6 +4219,7 @@ GuestTextureResource* EnsureGuestTexture(
             presenter, requirements.memoryTypeBits,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         if (memory_type == std::numeric_limits<std::uint32_t>::max()) {
+            DestroyGuestTextureEntry(presenter, iterator);
             return nullptr;
         }
         const VkMemoryAllocateInfo allocation{
@@ -1762,6 +4227,12 @@ GuestTextureResource* EnsureGuestTexture(
             nullptr,
             requirements.size,
             memory_type};
+        if (!EnforceGuestTextureBudget(
+                presenter, requirements.size,
+                draw.texture_key)) {
+            DestroyGuestTextureEntry(presenter, iterator);
+            return nullptr;
+        }
         result = vkAllocateMemory(
             presenter.device, &allocation, nullptr, &texture.memory);
         if (result == VK_SUCCESS) {
@@ -1770,6 +4241,7 @@ GuestTextureResource* EnsureGuestTexture(
         }
         if (result != VK_SUCCESS) {
             LogFailure("guest texture memory", result);
+            DestroyGuestTextureEntry(presenter, iterator);
             return nullptr;
         }
         const VkImageViewCreateInfo view_info{
@@ -1788,6 +4260,7 @@ GuestTextureResource* EnsureGuestTexture(
             presenter.device, &view_info, nullptr, &texture.view);
         if (result != VK_SUCCESS) {
             LogFailure("vkCreateImageView(guest texture)", result);
+            DestroyGuestTextureEntry(presenter, iterator);
             return nullptr;
         }
         if (texture.descriptor == VK_NULL_HANDLE) {
@@ -1802,6 +4275,7 @@ GuestTextureResource* EnsureGuestTexture(
                 &texture.descriptor);
             if (result != VK_SUCCESS) {
                 LogFailure("vkAllocateDescriptorSets(guest)", result);
+                DestroyGuestTextureEntry(presenter, iterator);
                 return nullptr;
             }
         }
@@ -1829,6 +4303,9 @@ GuestTextureResource* EnsureGuestTexture(
         vkUpdateDescriptorSets(
             presenter.device, 1, &write, 0, nullptr);
         texture.key = draw.texture_key;
+        texture.allocation_size = requirements.size;
+        presenter.guest_texture_resident_bytes +=
+            requirements.size;
         texture.width = draw.texture_width;
         texture.height = draw.texture_height;
         texture.repeat_texture = draw.repeat_texture;
@@ -1866,6 +4343,8 @@ GuestTextureResource* EnsureGuestTexture(
         texture.signature != draw.texture_signature ||
         !texture.initialized;
     texture.signature = draw.texture_signature;
+    texture.content_hash_low = content_hash.first;
+    texture.content_hash_high = content_hash.second;
     texture.last_use = presenter.guest_frame_serial;
     return &texture;
 }
@@ -1892,12 +4371,167 @@ struct GuestPassUpload {
     bool upload_texture{};
 };
 
+template <typename Upload>
+void RecordGuestTextureUploads(
+    Presenter& presenter,
+    const std::vector<Upload>& uploads) {
+    const auto record_pre_barrier =
+        [&](const Upload& upload) {
+            const std::array<DriverImageBarrier, 1> barrier{{
+                {upload.texture->image,
+                 upload.texture->initialized
+                     ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                     : VK_IMAGE_LAYOUT_UNDEFINED,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 upload.texture->initialized
+                     ? VK_ACCESS_SHADER_READ_BIT
+                     : VkAccessFlags{},
+                 VK_ACCESS_TRANSFER_WRITE_BIT,
+                 upload.texture->initialized
+                     ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                     : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT}}};
+            EmitDriverImageBarriers(
+                presenter.command_buffer, barrier);
+        };
+    const auto record_copy =
+        [&](const Upload& upload) {
+            const VkBufferImageCopy copy{
+                upload.texture_offset, 0, 0,
+                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                {0, 0, 0},
+                {upload.draw->texture_width,
+                 upload.draw->texture_height, 1}};
+            vkCmdCopyBufferToImage(
+                presenter.command_buffer, presenter.staging,
+                upload.texture->image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, &copy);
+        };
+    const auto record_post_barrier =
+        [&](const Upload& upload) {
+            const std::array<DriverImageBarrier, 1> barrier{{
+                {upload.texture->image,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                 VK_ACCESS_TRANSFER_WRITE_BIT,
+                 VK_ACCESS_SHADER_READ_BIT,
+                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT}}};
+            EmitDriverImageBarriers(
+                presenter.command_buffer, barrier);
+            upload.texture->initialized = true;
+        };
+
+    const auto request_count = static_cast<std::uint64_t>(
+        std::ranges::count_if(
+            uploads, [](const Upload& upload) {
+                return upload.upload_texture;
+            }));
+    g_driver_optimization_stats.transfer_requests.fetch_add(
+        request_count, std::memory_order_relaxed);
+    g_driver_optimization_stats.transfer_regions.fetch_add(
+        request_count, std::memory_order_relaxed);
+    if (request_count == 0u) {
+        return;
+    }
+
+    if (!g_driver_optimization_enabled) {
+        for (const auto& upload : uploads) {
+            if (!upload.upload_texture) {
+                continue;
+            }
+            record_pre_barrier(upload);
+            record_copy(upload);
+            record_post_barrier(upload);
+        }
+        g_driver_optimization_stats.transfer_flushes.fetch_add(
+            request_count, std::memory_order_relaxed);
+        g_driver_optimization_stats.transfer_copy_calls.fetch_add(
+            request_count, std::memory_order_relaxed);
+        return;
+    }
+
+    std::vector<DriverImageBarrier> barriers;
+    barriers.reserve(request_count);
+    for (const auto& upload : uploads) {
+        if (!upload.upload_texture) {
+            continue;
+        }
+        barriers.push_back({
+            upload.texture->image,
+            upload.texture->initialized
+                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            upload.texture->initialized
+                ? VK_ACCESS_SHADER_READ_BIT
+                : VkAccessFlags{},
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            upload.texture->initialized
+                ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT});
+    }
+    EmitDriverImageBarriers(
+        presenter.command_buffer, barriers);
+
+    std::vector<const Upload*> copies;
+    copies.reserve(request_count);
+    for (const auto& upload : uploads) {
+        if (!upload.upload_texture) {
+            continue;
+        }
+        const auto existing = std::ranges::find_if(
+            copies, [&](const Upload* const queued) {
+                return queued->texture == upload.texture;
+            });
+        if (existing != copies.end()) {
+            *existing = &upload;
+        } else {
+            copies.push_back(&upload);
+        }
+    }
+    for (const auto* const upload : copies) {
+        record_copy(*upload);
+    }
+
+    barriers.clear();
+    for (const auto& upload : uploads) {
+        if (!upload.upload_texture) {
+            continue;
+        }
+        barriers.push_back({
+            upload.texture->image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT});
+        upload.texture->initialized = true;
+    }
+    EmitDriverImageBarriers(
+        presenter.command_buffer, barriers);
+    g_driver_optimization_stats.transfer_flushes.fetch_add(
+        1u, std::memory_order_relaxed);
+    g_driver_optimization_stats.transfer_copy_calls.fetch_add(
+        copies.size(), std::memory_order_relaxed);
+}
+
 bool SubmitGuestPasses(Presenter& presenter,
                        const VulkanGuestFrame& frame) {
     if (presenter.submission_in_flight) {
         const auto fence_status = vkGetFenceStatus(
             presenter.device, presenter.fence);
         if (fence_status == VK_NOT_READY) {
+            const auto backlog =
+                g_mobile_gpu_stats.max_gpu_backlog.load(
+                    std::memory_order_relaxed);
+            if (backlog < 1u) {
+                g_mobile_gpu_stats.max_gpu_backlog.store(
+                    1u, std::memory_order_relaxed);
+            }
             return true;
         }
         if (fence_status != VK_SUCCESS) {
@@ -1905,9 +4539,18 @@ bool SubmitGuestPasses(Presenter& presenter,
             return false;
         }
         presenter.submission_in_flight = false;
+        presenter.in_flight_guest_target_uses.clear();
     }
-    if (!EnsureSwapchain(presenter, frame.width, frame.height) ||
-        !CreateGuestSwapchainResources(presenter)) {
+    presenter.pending_guest_target_uses.clear();
+    if (!presenter.submission_in_flight) {
+        presenter.in_flight_guest_target_uses.clear();
+    }
+    if (!EnsureSwapchain(
+            presenter, frame.width, frame.height)) {
+        return false;
+    }
+    ApplyPendingMobileScale(presenter, frame);
+    if (!CreateGuestSwapchainResources(presenter)) {
         return false;
     }
     ++presenter.guest_frame_serial;
@@ -1915,6 +4558,14 @@ bool SubmitGuestPasses(Presenter& presenter,
         EnsureGuestTarget(presenter, frame.target_key);
     if (final_target == nullptr) {
         return false;
+    }
+    if (g_driver_optimization_enabled &&
+        frame.batch_id != 0u &&
+        frame.batch_id == presenter.last_guest_batch_id &&
+        frame.target_key == presenter.last_guest_target_key &&
+        final_target->initialized) {
+        RecordDriverQueueSubmitElision();
+        return true;
     }
     std::vector<GuestTargetResource*> pass_targets(
         frame.passes.size(), nullptr);
@@ -1954,6 +4605,10 @@ bool SubmitGuestPasses(Presenter& presenter,
                 (draw.require_target_source ||
                  source->second.initialized)) {
                 upload.source_target = &source->second;
+                source->second.last_use =
+                    presenter.guest_frame_serial;
+                presenter.pending_guest_target_uses.insert(
+                    source->first);
             } else if (draw.require_target_source) {
                 continue;
             } else {
@@ -2021,45 +4676,11 @@ bool SubmitGuestPasses(Presenter& presenter,
         LogFailure("vkBeginCommandBuffer(guest passes)", result);
         return false;
     }
-    for (const auto& upload : uploads) {
-        if (!upload.upload_texture) {
-            continue;
-        }
-        ImageBarrier(
-            presenter.command_buffer, upload.texture->image,
-            upload.texture->initialized
-                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                : VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            upload.texture->initialized
-                ? VK_ACCESS_SHADER_READ_BIT : 0,
-            VK_ACCESS_TRANSFER_WRITE_BIT,
-            upload.texture->initialized
-                ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
-        const VkBufferImageCopy copy{
-            upload.texture_offset, 0, 0,
-            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-            {0, 0, 0},
-            {upload.draw->texture_width,
-             upload.draw->texture_height, 1}};
-        vkCmdCopyBufferToImage(
-            presenter.command_buffer, presenter.staging,
-            upload.texture->image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        ImageBarrier(
-            presenter.command_buffer, upload.texture->image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_ACCESS_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-        upload.texture->initialized = true;
-    }
+    DriverCommandState driver_state{};
+    RecordGuestTextureUploads(presenter, uploads);
 
     std::vector<GuestTargetResource*> targets_seen_this_frame;
+    bool render_scope_open{};
     for (std::size_t pass_index = 0;
          pass_index < frame.passes.size(); ++pass_index) {
         const auto& pass = frame.passes[pass_index];
@@ -2113,6 +4734,7 @@ bool SubmitGuestPasses(Presenter& presenter,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
         }
         std::vector<GuestTargetResource*> sampled_targets;
+        std::vector<DriverImageBarrier> sampled_target_barriers;
         for (const auto& upload : uploads) {
             if (upload.pass_index != pass_index ||
                 upload.source_target == nullptr ||
@@ -2122,40 +4744,46 @@ bool SubmitGuestPasses(Presenter& presenter,
                 continue;
             }
             sampled_targets.push_back(upload.source_target);
-            ImageBarrier(
-                presenter.command_buffer,
+            sampled_target_barriers.push_back({
                 upload.source_target->image,
                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT});
         }
+        EmitDriverImageBarriers(
+            presenter.command_buffer, sampled_target_barriers);
         const VkRenderPassBeginInfo render_begin{
             VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             nullptr, presenter.guest_render_pass,
             target->framebuffer, {{0, 0}, target->extent},
             0, nullptr};
-        vkCmdBeginRenderPass(
-            presenter.command_buffer, &render_begin,
-            VK_SUBPASS_CONTENTS_INLINE);
+        if (!render_scope_open) {
+            vkCmdBeginRenderPass(
+                presenter.command_buffer, &render_begin,
+                VK_SUBPASS_CONTENTS_INLINE);
+            SetMobileFragmentShadingRate(
+                presenter, presenter.command_buffer);
+            render_scope_open = true;
+        }
         const VkViewport viewport{
             0.0f, 0.0f,
             static_cast<float>(target->extent.width),
             static_cast<float>(target->extent.height),
             0.0f, 1.0f};
         const VkRect2D scissor{{0, 0}, target->extent};
-        vkCmdSetViewport(
-            presenter.command_buffer, 0, 1, &viewport);
-        vkCmdSetScissor(
-            presenter.command_buffer, 0, 1, &scissor);
+        DriverSetViewport(
+            driver_state, presenter.command_buffer, viewport);
+        DriverSetScissor(
+            driver_state, presenter.command_buffer, scissor);
         const std::array<float, 4> transform{
             2.0f / static_cast<float>(frame.width),
             2.0f / static_cast<float>(frame.height),
             -1.0f, -1.0f};
-        vkCmdPushConstants(
-            presenter.command_buffer,
+        DriverPushConstants(
+            driver_state, presenter.command_buffer,
             presenter.guest_pipeline_layout,
             VK_SHADER_STAGE_VERTEX_BIT, 0,
             sizeof(transform), transform.data());
@@ -2163,9 +4791,8 @@ bool SubmitGuestPasses(Presenter& presenter,
             if (upload.pass_index != pass_index) {
                 continue;
             }
-            vkCmdBindPipeline(
-                presenter.command_buffer,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
+            DriverBindPipeline(
+                driver_state, presenter.command_buffer,
                 upload.draw->opaque
                     ? presenter.guest_opaque_pipeline
                     : upload.draw->destination_source_alpha
@@ -2181,8 +4808,8 @@ bool SubmitGuestPasses(Presenter& presenter,
                     ? presenter.guest_premultiplied_pipeline
                     : presenter.guest_pipeline);
             if (upload.draw->wave_effect) {
-                vkCmdPushConstants(
-                    presenter.command_buffer,
+                DriverPushConstants(
+                    driver_state, presenter.command_buffer,
                     presenter.guest_pipeline_layout,
                     VK_SHADER_STAGE_FRAGMENT_BIT,
                     sizeof(float) * 4u,
@@ -2195,16 +4822,16 @@ bool SubmitGuestPasses(Presenter& presenter,
                         ? upload.source_target->nearest_descriptor
                         : upload.source_target->descriptor
                     : upload.texture->descriptor;
-            vkCmdBindDescriptorSets(
-                presenter.command_buffer,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
+            DriverBindDescriptor(
+                driver_state, presenter.command_buffer,
                 presenter.guest_pipeline_layout,
-                0, 1, &descriptor, 0, nullptr);
-            vkCmdBindVertexBuffers(
-                presenter.command_buffer, 0, 1,
-                &presenter.staging, &upload.vertex_offset);
-            vkCmdBindIndexBuffer(
-                presenter.command_buffer, presenter.staging,
+                descriptor);
+            DriverBindVertexBuffer(
+                driver_state, presenter.command_buffer,
+                presenter.staging, upload.vertex_offset);
+            DriverBindIndexBuffer(
+                driver_state, presenter.command_buffer,
+                presenter.staging,
                 upload.index_offset, VK_INDEX_TYPE_UINT32);
             vkCmdDrawIndexed(
                 presenter.command_buffer,
@@ -2213,39 +4840,70 @@ bool SubmitGuestPasses(Presenter& presenter,
                 std::max(upload.draw->instance_count, 1u),
                 0, 0, 0);
         }
-        vkCmdEndRenderPass(presenter.command_buffer);
-        for (auto* const sampled_target : sampled_targets) {
-            ImageBarrier(
-                presenter.command_buffer, sampled_target->image,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                VK_ACCESS_SHADER_READ_BIT,
-                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        const bool next_samples_target =
+            pass_index + 1u < frame.passes.size() &&
+            std::ranges::any_of(
+                uploads, [&](const GuestPassUpload& upload) {
+                    return upload.pass_index == pass_index + 1u &&
+                        upload.source_target != nullptr;
+                });
+        const bool reuse_render_scope =
+            g_driver_optimization_enabled &&
+            pass_index + 1u < frame.passes.size() &&
+            pass_targets[pass_index + 1u] == target &&
+            !frame.passes[pass_index + 1u].clear_target &&
+            sampled_targets.empty() &&
+            !next_samples_target;
+        if (reuse_render_scope) {
+            g_driver_optimization_stats.render_scope_reuses.fetch_add(
+                1u, std::memory_order_relaxed);
+        } else {
+            vkCmdEndRenderPass(presenter.command_buffer);
+            render_scope_open = false;
+            sampled_target_barriers.clear();
+            for (auto* const sampled_target : sampled_targets) {
+                sampled_target_barriers.push_back({
+                    sampled_target->image,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    VK_ACCESS_SHADER_READ_BIT,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT});
+            }
+            EmitDriverImageBarriers(
+                presenter.command_buffer, sampled_target_barriers);
         }
         target->initialized = true;
         target->last_use = presenter.guest_frame_serial;
     }
+    if (render_scope_open) {
+        vkCmdEndRenderPass(presenter.command_buffer);
+    }
     if (!final_target->initialized) {
         return false;
     }
-    ImageBarrier(
-        presenter.command_buffer, final_target->image,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_ACCESS_TRANSFER_READ_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT);
-    ImageBarrier(
-        presenter.command_buffer,
-        presenter.swapchain_images[image_index],
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        0, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT);
+    const bool used_fsr = RecordFsrUpscale(
+        presenter, presenter.command_buffer, image_index,
+        final_target->image, final_target->view,
+        final_target->extent);
+    if (!used_fsr) {
+    const std::array<DriverImageBarrier, 2> present_pre_barriers{{
+        {final_target->image,
+         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         VK_ACCESS_TRANSFER_READ_BIT,
+         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         VK_PIPELINE_STAGE_TRANSFER_BIT},
+        {presenter.swapchain_images[image_index],
+         VK_IMAGE_LAYOUT_UNDEFINED,
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         0, VK_ACCESS_TRANSFER_WRITE_BIT,
+         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+         VK_PIPELINE_STAGE_TRANSFER_BIT}}};
+    EmitDriverImageBarriers(
+        presenter.command_buffer, present_pre_barriers);
     const VkImageBlit blit{
         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         {{0, 0, 0},
@@ -2262,30 +4920,36 @@ bool SubmitGuestPasses(Presenter& presenter,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         presenter.swapchain_images[image_index],
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1, &blit, VK_FILTER_NEAREST);
-    ImageBarrier(
-        presenter.command_buffer,
-        presenter.swapchain_images[image_index],
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        VK_ACCESS_TRANSFER_WRITE_BIT, 0,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    ImageBarrier(
-        presenter.command_buffer, final_target->image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_ACCESS_TRANSFER_READ_BIT,
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        1, &blit,
+        final_target->extent.width <
+                    presenter.swapchain_extent.width ||
+                final_target->extent.height <
+                    presenter.swapchain_extent.height
+            ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    const std::array<DriverImageBarrier, 2> present_post_barriers{{
+        {presenter.swapchain_images[image_index],
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+         VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+         VK_PIPELINE_STAGE_TRANSFER_BIT,
+         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT},
+        {final_target->image,
+         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_ACCESS_TRANSFER_READ_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         VK_PIPELINE_STAGE_TRANSFER_BIT,
+         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT}}};
+    EmitDriverImageBarriers(
+        presenter.command_buffer, present_post_barriers);
+    }
     result = vkEndCommandBuffer(presenter.command_buffer);
     if (result != VK_SUCCESS) {
         LogFailure("vkEndCommandBuffer(guest passes)", result);
         return false;
     }
     constexpr VkPipelineStageFlags WaitStage =
-        VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     const VkSubmitInfo submit{
         VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
         1, &presenter.acquired, &WaitStage,
@@ -2297,7 +4961,19 @@ bool SubmitGuestPasses(Presenter& presenter,
         LogFailure("vkQueueSubmit(guest passes)", result);
         return false;
     }
+    RecordDriverQueueSubmit(
+        std::max<std::uint64_t>(
+            1u, frame.passes.size() + 1u),
+        1u, true);
+    presenter.in_flight_guest_target_uses.clear();
+    presenter.in_flight_guest_target_uses.swap(
+        presenter.pending_guest_target_uses);
     presenter.submission_in_flight = true;
+    g_mobile_gpu_stats.physical_resolve_blits.fetch_add(
+        g_mobile_gpu_enabled ? 1u : 0u,
+        std::memory_order_relaxed);
+    RecordMobileFrame(
+        presenter, GuestFrameDrawCount(frame));
     presenter.last_guest_batch_id = frame.batch_id;
     presenter.last_guest_target_key = frame.target_key;
     const VkPresentInfoKHR present{
@@ -2322,6 +4998,13 @@ bool SubmitGuestFrame(Presenter& presenter,
         const auto fence_status = vkGetFenceStatus(
             presenter.device, presenter.fence);
         if (fence_status == VK_NOT_READY) {
+            const auto backlog =
+                g_mobile_gpu_stats.max_gpu_backlog.load(
+                    std::memory_order_relaxed);
+            if (backlog < 1u) {
+                g_mobile_gpu_stats.max_gpu_backlog.store(
+                    1u, std::memory_order_relaxed);
+            }
             return true;
         }
         if (fence_status != VK_SUCCESS) {
@@ -2329,9 +5012,18 @@ bool SubmitGuestFrame(Presenter& presenter,
             return false;
         }
         presenter.submission_in_flight = false;
+        presenter.in_flight_guest_target_uses.clear();
     }
-    if (!EnsureSwapchain(presenter, frame.width, frame.height) ||
-        !CreateGuestSwapchainResources(presenter)) {
+    presenter.pending_guest_target_uses.clear();
+    if (!presenter.submission_in_flight) {
+        presenter.in_flight_guest_target_uses.clear();
+    }
+    if (!EnsureSwapchain(
+            presenter, frame.width, frame.height)) {
+        return false;
+    }
+    ApplyPendingMobileScale(presenter, frame);
+    if (!CreateGuestSwapchainResources(presenter)) {
         return false;
     }
     ++presenter.guest_frame_serial;
@@ -2339,6 +5031,14 @@ bool SubmitGuestFrame(Presenter& presenter,
         EnsureGuestTarget(presenter, frame.target_key);
     if (target == nullptr) {
         return false;
+    }
+    if (g_driver_optimization_enabled &&
+        frame.batch_id != 0u &&
+        frame.batch_id == presenter.last_guest_batch_id &&
+        frame.target_key == presenter.last_guest_target_key &&
+        target->initialized) {
+        RecordDriverQueueSubmitElision();
+        return true;
     }
     const bool render_batch =
         frame.batch_id == 0 ||
@@ -2403,6 +5103,10 @@ bool SubmitGuestFrame(Presenter& presenter,
                 source->second.initialized &&
                 &source->second != target) {
                 upload.source_target = &source->second;
+                source->second.last_use =
+                    presenter.guest_frame_serial;
+                presenter.pending_guest_target_uses.insert(
+                    source->first);
             } else {
                 if (draw.require_target_source) {
                     continue;
@@ -2492,51 +5196,10 @@ bool SubmitGuestFrame(Presenter& presenter,
         LogFailure("vkBeginCommandBuffer(guest)", result);
         return false;
     }
-    for (const auto& upload : uploads) {
-        if (!upload.upload_texture) {
-            continue;
-        }
-        ImageBarrier(
-            presenter.command_buffer,
-            upload.texture->image,
-            upload.texture->initialized
-                ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                : VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            upload.texture->initialized
-                ? VK_ACCESS_SHADER_READ_BIT : 0,
-            VK_ACCESS_TRANSFER_WRITE_BIT,
-            upload.texture->initialized
-                ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
-        const VkBufferImageCopy copy{
-            upload.texture_offset,
-            0,
-            0,
-            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-            {0, 0, 0},
-            {upload.draw->texture_width,
-             upload.draw->texture_height, 1}};
-        vkCmdCopyBufferToImage(
-            presenter.command_buffer,
-            presenter.staging,
-            upload.texture->image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1,
-            &copy);
-        ImageBarrier(
-            presenter.command_buffer,
-            upload.texture->image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_ACCESS_SHADER_READ_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-        upload.texture->initialized = true;
-    }
+    DriverCommandState driver_state{};
+    RecordGuestTextureUploads(presenter, uploads);
     std::vector<GuestTargetResource*> sampled_targets;
+    std::vector<DriverImageBarrier> sampled_target_barriers;
     for (const auto& upload : uploads) {
         if (upload.source_target == nullptr ||
             std::ranges::find(
@@ -2545,16 +5208,17 @@ bool SubmitGuestFrame(Presenter& presenter,
             continue;
         }
         sampled_targets.push_back(upload.source_target);
-        ImageBarrier(
-            presenter.command_buffer,
+        sampled_target_barriers.push_back({
             upload.source_target->image,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             VK_ACCESS_SHADER_READ_BIT,
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT});
     }
+    EmitDriverImageBarriers(
+        presenter.command_buffer, sampled_target_barriers);
     if (render_batch && !preserve_target) {
         ImageBarrier(
             presenter.command_buffer,
@@ -2607,6 +5271,8 @@ bool SubmitGuestFrame(Presenter& presenter,
         vkCmdBeginRenderPass(
             presenter.command_buffer, &render_begin,
             VK_SUBPASS_CONTENTS_INLINE);
+        SetMobileFragmentShadingRate(
+            presenter, presenter.command_buffer);
         const VkViewport viewport{
             0.0f,
             0.0f,
@@ -2616,26 +5282,23 @@ bool SubmitGuestFrame(Presenter& presenter,
             1.0f};
         const VkRect2D scissor{
             {0, 0}, target->extent};
-        vkCmdSetViewport(
-            presenter.command_buffer, 0, 1, &viewport);
-        vkCmdSetScissor(
-            presenter.command_buffer, 0, 1, &scissor);
+        DriverSetViewport(
+            driver_state, presenter.command_buffer, viewport);
+        DriverSetScissor(
+            driver_state, presenter.command_buffer, scissor);
         const std::array<float, 4> transform{
             2.0f / static_cast<float>(frame.width),
             2.0f / static_cast<float>(frame.height),
             -1.0f,
             -1.0f};
-        vkCmdPushConstants(
-            presenter.command_buffer,
+        DriverPushConstants(
+            driver_state, presenter.command_buffer,
             presenter.guest_pipeline_layout,
-            VK_SHADER_STAGE_VERTEX_BIT,
-            0,
-            sizeof(transform),
-            transform.data());
+            VK_SHADER_STAGE_VERTEX_BIT, 0,
+            sizeof(transform), transform.data());
         for (const auto& upload : uploads) {
-            vkCmdBindPipeline(
-                presenter.command_buffer,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
+            DriverBindPipeline(
+                driver_state, presenter.command_buffer,
                 !upload.draw->extended_blend_contract
                     ? presenter.guest_pipeline
                     : upload.draw->opaque
@@ -2653,8 +5316,8 @@ bool SubmitGuestFrame(Presenter& presenter,
                     ? presenter.guest_premultiplied_pipeline
                     : presenter.guest_pipeline);
             if (upload.draw->wave_effect) {
-                vkCmdPushConstants(
-                    presenter.command_buffer,
+                DriverPushConstants(
+                    driver_state, presenter.command_buffer,
                     presenter.guest_pipeline_layout,
                     VK_SHADER_STAGE_FRAGMENT_BIT,
                     sizeof(float) * 4u,
@@ -2667,20 +5330,15 @@ bool SubmitGuestFrame(Presenter& presenter,
                     ? upload.source_target->nearest_descriptor
                     : upload.source_target->descriptor
                 : upload.texture->descriptor;
-            vkCmdBindDescriptorSets(
-                presenter.command_buffer,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
+            DriverBindDescriptor(
+                driver_state, presenter.command_buffer,
                 presenter.guest_pipeline_layout,
-                0,
-                1,
-                &descriptor,
-                0,
-                nullptr);
-            vkCmdBindVertexBuffers(
-                presenter.command_buffer, 0, 1,
-                &presenter.staging, &upload.vertex_offset);
-            vkCmdBindIndexBuffer(
-                presenter.command_buffer,
+                descriptor);
+            DriverBindVertexBuffer(
+                driver_state, presenter.command_buffer,
+                presenter.staging, upload.vertex_offset);
+            DriverBindIndexBuffer(
+                driver_state, presenter.command_buffer,
                 presenter.staging,
                 upload.index_offset,
                 VK_INDEX_TYPE_UINT32);
@@ -2695,37 +5353,43 @@ bool SubmitGuestFrame(Presenter& presenter,
         }
         vkCmdEndRenderPass(presenter.command_buffer);
     }
+    sampled_target_barriers.clear();
     for (auto* const sampled_target : sampled_targets) {
-        ImageBarrier(
-            presenter.command_buffer,
+        sampled_target_barriers.push_back({
             sampled_target->image,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_ACCESS_SHADER_READ_BIT,
             VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT});
     }
-    ImageBarrier(
-        presenter.command_buffer,
-        target->image,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        render_batch ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0,
-        VK_ACCESS_TRANSFER_READ_BIT,
-        render_batch
-            ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-            : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT);
-    ImageBarrier(
-        presenter.command_buffer,
-        presenter.swapchain_images[image_index],
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        0,
-        VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT);
+    EmitDriverImageBarriers(
+        presenter.command_buffer, sampled_target_barriers);
+    const bool used_fsr = RecordFsrUpscale(
+        presenter, presenter.command_buffer, image_index,
+        target->image, target->view, target->extent);
+    if (!used_fsr) {
+    const std::array<DriverImageBarrier, 2> present_pre_barriers{{
+        {target->image,
+         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         render_batch
+             ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+             : VkAccessFlags{},
+         VK_ACCESS_TRANSFER_READ_BIT,
+         render_batch
+             ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+             : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+         VK_PIPELINE_STAGE_TRANSFER_BIT},
+        {presenter.swapchain_images[image_index],
+         VK_IMAGE_LAYOUT_UNDEFINED,
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         0, VK_ACCESS_TRANSFER_WRITE_BIT,
+         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+         VK_PIPELINE_STAGE_TRANSFER_BIT}}};
+    EmitDriverImageBarriers(
+        presenter.command_buffer, present_pre_barriers);
     const VkImageBlit blit{
         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
         {{0, 0, 0},
@@ -2745,32 +5409,36 @@ bool SubmitGuestFrame(Presenter& presenter,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         presenter.swapchain_images[image_index],
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1, &blit, VK_FILTER_NEAREST);
-    ImageBarrier(
-        presenter.command_buffer,
-        presenter.swapchain_images[image_index],
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-        VK_ACCESS_TRANSFER_WRITE_BIT,
-        0,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-    ImageBarrier(
-        presenter.command_buffer,
-        target->image,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_ACCESS_TRANSFER_READ_BIT,
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        1, &blit,
+        target->extent.width <
+                    presenter.swapchain_extent.width ||
+                target->extent.height <
+                    presenter.swapchain_extent.height
+            ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    const std::array<DriverImageBarrier, 2> present_post_barriers{{
+        {presenter.swapchain_images[image_index],
+         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+         VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+         VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+         VK_PIPELINE_STAGE_TRANSFER_BIT,
+         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT},
+        {target->image,
+         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+         VK_ACCESS_TRANSFER_READ_BIT,
+         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+         VK_PIPELINE_STAGE_TRANSFER_BIT,
+         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT}}};
+    EmitDriverImageBarriers(
+        presenter.command_buffer, present_post_barriers);
+    }
     result = vkEndCommandBuffer(presenter.command_buffer);
     if (result != VK_SUCCESS) {
         LogFailure("vkEndCommandBuffer(guest)", result);
         return false;
     }
     constexpr VkPipelineStageFlags WaitStage =
-        VK_PIPELINE_STAGE_TRANSFER_BIT;
+        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
     const VkSubmitInfo submit{
         VK_STRUCTURE_TYPE_SUBMIT_INFO,
         nullptr,
@@ -2787,7 +5455,17 @@ bool SubmitGuestFrame(Presenter& presenter,
         LogFailure("vkQueueSubmit(guest)", result);
         return false;
     }
+    RecordDriverQueueSubmit(
+        render_batch ? 2u : 1u, 1u, true);
+    presenter.in_flight_guest_target_uses.clear();
+    presenter.in_flight_guest_target_uses.swap(
+        presenter.pending_guest_target_uses);
     presenter.submission_in_flight = true;
+    g_mobile_gpu_stats.physical_resolve_blits.fetch_add(
+        g_mobile_gpu_enabled ? 1u : 0u,
+        std::memory_order_relaxed);
+    RecordMobileFrame(
+        presenter, GuestFrameDrawCount(frame));
     target->initialized = true;
     if (render_batch) {
         target->last_batch_id = frame.batch_id;
@@ -2829,6 +5507,12 @@ bool SubmitFrame(Presenter& presenter,
             LogFailure("vkGetFenceStatus", fence_status);
             return false;
         }
+        presenter.submission_in_flight = false;
+        presenter.in_flight_guest_target_uses.clear();
+    }
+    presenter.pending_guest_target_uses.clear();
+    if (!presenter.submission_in_flight) {
+        presenter.in_flight_guest_target_uses.clear();
     }
     if (!EnsureStaging(presenter, byte_count) ||
         !EnsureSwapchain(presenter, width, height)) {
@@ -2968,6 +5652,9 @@ bool SubmitFrame(Presenter& presenter,
         LogFailure("vkQueueSubmit", result);
         return false;
     }
+    RecordDriverQueueSubmit(2u, 1u, true);
+    presenter.in_flight_guest_target_uses.clear();
+    presenter.pending_guest_target_uses.clear();
     presenter.submission_in_flight = true;
     presenter.source_initialized = true;
     const VkPresentInfoKHR present{
@@ -3150,7 +5837,9 @@ bool ExecuteVulkanGen5ComputeBuffers(
         presenter.permanently_failed) {
         return false;
     }
-
+    const bool batch_buffer_readback =
+        g_driver_optimization_enabled ||
+        g_readback_batch_enabled;
     struct HostBuffer {
         VkBuffer buffer{};
         VkDeviceMemory memory{};
@@ -3160,10 +5849,6 @@ bool ExecuteVulkanGen5ComputeBuffers(
         bool written{};
     };
     std::vector<HostBuffer> buffers;
-    VkShaderModule module{};
-    VkDescriptorSetLayout set_layout{};
-    VkPipelineLayout pipeline_layout{};
-    VkPipeline pipeline{};
     VkDescriptorPool descriptor_pool{};
     VkCommandBuffer command_buffer{};
     VkFence fence{};
@@ -3182,20 +5867,6 @@ bool ExecuteVulkanGen5ComputeBuffers(
         if (descriptor_pool != VK_NULL_HANDLE) {
             vkDestroyDescriptorPool(
                 presenter.device, descriptor_pool, nullptr);
-        }
-        if (pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(presenter.device, pipeline, nullptr);
-        }
-        if (pipeline_layout != VK_NULL_HANDLE) {
-            vkDestroyPipelineLayout(
-                presenter.device, pipeline_layout, nullptr);
-        }
-        if (set_layout != VK_NULL_HANDLE) {
-            vkDestroyDescriptorSetLayout(
-                presenter.device, set_layout, nullptr);
-        }
-        if (module != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(presenter.device, module, nullptr);
         }
         for (auto& buffer : buffers) {
             if (buffer.map != nullptr) {
@@ -3233,7 +5904,9 @@ bool ExecuteVulkanGen5ComputeBuffers(
             const VkBufferCreateInfo info{
                 VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                 nullptr, 0, host.size,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VK_SHARING_MODE_EXCLUSIVE, 0, nullptr};
             auto result = vkCreateBuffer(
                 presenter.device, &info, nullptr, &host.buffer);
@@ -3376,59 +6049,32 @@ bool ExecuteVulkanGen5ComputeBuffers(
             count, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
         descriptor_count += count;
     }
-    const VkDescriptorSetLayoutCreateInfo set_info{
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        nullptr, 0,
-        static_cast<std::uint32_t>(layout_bindings.size()),
-        layout_bindings.data()};
-    auto result = vkCreateDescriptorSetLayout(
-        presenter.device, &set_info, nullptr, &set_layout);
-    if (result != VK_SUCCESS) {
-        return fail("gen5 vkCreateDescriptorSetLayout", result);
+    const auto* const pipeline_bundle =
+        AcquireGen5ComputePipelineBundle(
+            presenter, spirv,
+            std::span<const VkDescriptorSetLayoutBinding>{
+                layout_bindings},
+            program.descriptor_set,
+            program.push_constant_offset,
+            program.push_constant_size,
+            "gen5 vkCreateDescriptorSetLayout",
+            "gen5 vkCreatePipelineLayout",
+            "gen5 vkCreateShaderModule",
+            "gen5 vkCreateComputePipelines");
+    if (pipeline_bundle == nullptr) {
+        cleanup();
+        return false;
     }
-    VkPushConstantRange push_range{};
-    push_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    push_range.offset = program.push_constant_offset;
-    push_range.size = program.push_constant_size;
-    const VkPipelineLayoutCreateInfo pipeline_layout_info{
-        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        nullptr, 0, 1, &set_layout,
-        push_range.size == 0 ? 0u : 1u,
-        push_range.size == 0 ? nullptr : &push_range};
-    result = vkCreatePipelineLayout(
-        presenter.device, &pipeline_layout_info, nullptr,
-        &pipeline_layout);
-    if (result != VK_SUCCESS) {
-        return fail("gen5 vkCreatePipelineLayout", result);
-    }
-    const VkShaderModuleCreateInfo module_info{
-        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        nullptr, 0, spirv.size_bytes(), spirv.data()};
-    result = vkCreateShaderModule(
-        presenter.device, &module_info, nullptr, &module);
-    if (result != VK_SUCCESS) {
-        return fail("gen5 vkCreateShaderModule", result);
-    }
-    const VkPipelineShaderStageCreateInfo stage{
-        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module,
-        "main", nullptr};
-    const VkComputePipelineCreateInfo pipeline_info{
-        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        nullptr, 0, stage, pipeline_layout, VK_NULL_HANDLE, 0};
-    result = vkCreateComputePipelines(
-        presenter.device, VK_NULL_HANDLE, 1, &pipeline_info,
-        nullptr, &pipeline);
-    if (result != VK_SUCCESS) {
-        return fail("gen5 vkCreateComputePipelines", result);
-    }
+    const auto set_layout = pipeline_bundle->set_layout;
+    const auto pipeline_layout = pipeline_bundle->pipeline_layout;
+    const auto pipeline = pipeline_bundle->pipeline;
     const VkDescriptorPoolSize pool_size{
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
         std::max(descriptor_count, 1u)};
     const VkDescriptorPoolCreateInfo pool_info{
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
         nullptr, 0, 1, 1, &pool_size};
-    result = vkCreateDescriptorPool(
+    auto result = vkCreateDescriptorPool(
         presenter.device, &pool_info, nullptr,
         &descriptor_pool);
     if (result != VK_SUCCESS) {
@@ -3487,6 +6133,37 @@ bool ExecuteVulkanGen5ComputeBuffers(
         static_cast<std::uint32_t>(writes.size()),
         writes.data(), 0, nullptr);
 
+    const auto written_buffer_count =
+        std::ranges::count_if(
+            program.buffers,
+            [](const auto& buffer) {
+                return buffer.written;
+            });
+    std::vector<VkDeviceSize> readback_offsets(
+        program.buffers.size(), VK_WHOLE_SIZE);
+    std::size_t readback_index = SIZE_MAX;
+    VkDeviceSize readback_size{};
+    if (batch_buffer_readback &&
+        written_buffer_count != 0u) {
+        for (std::size_t index = 0;
+             index < program.buffers.size(); ++index) {
+            if (!program.buffers[index].written) {
+                continue;
+            }
+            readback_size =
+                AlignGuestOffset(readback_size, 16u);
+            readback_offsets[index] = readback_size;
+            readback_size += program.buffers[index].byte_count;
+        }
+        readback_index = buffers.size();
+        if (!create_buffer(
+                0u, std::max<VkDeviceSize>(readback_size, 16u),
+                false, false, nullptr)) {
+            cleanup();
+            return false;
+        }
+    }
+
     const VkCommandBufferAllocateInfo command_info{
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
         nullptr, presenter.command_pool,
@@ -3511,13 +6188,14 @@ bool ExecuteVulkanGen5ComputeBuffers(
     if (result != VK_SUCCESS) {
         return fail("gen5 vkBeginCommandBuffer", result);
     }
-    vkCmdBindPipeline(
-        command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline);
-    vkCmdBindDescriptorSets(
-        command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-        pipeline_layout, program.descriptor_set, 1,
-        &descriptor_set, 0, nullptr);
+    DriverCommandState driver_state{};
+    DriverBindPipeline(
+        driver_state, command_buffer, pipeline,
+        VK_PIPELINE_BIND_POINT_COMPUTE);
+    DriverBindDescriptor(
+        driver_state, command_buffer, pipeline_layout,
+        descriptor_set, VK_PIPELINE_BIND_POINT_COMPUTE,
+        program.descriptor_set);
     if (program.push_constant_size != 0) {
         if (program.packed_user_data.size() *
                 sizeof(std::uint32_t) !=
@@ -3525,8 +6203,8 @@ bool ExecuteVulkanGen5ComputeBuffers(
             cleanup();
             return false;
         }
-        vkCmdPushConstants(
-            command_buffer, pipeline_layout,
+        DriverPushConstants(
+            driver_state, command_buffer, pipeline_layout,
             VK_SHADER_STAGE_COMPUTE_BIT,
             program.push_constant_offset,
             program.push_constant_size,
@@ -3534,36 +6212,92 @@ bool ExecuteVulkanGen5ComputeBuffers(
     }
     vkCmdDispatch(
         command_buffer, groups[0], groups[1], groups[2]);
+    if (batch_buffer_readback &&
+        written_buffer_count != 0u) {
+        const VkMemoryBarrier transfer_barrier{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT};
+        vkCmdPipelineBarrier(
+            command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            1u, &transfer_barrier, 0u, nullptr, 0u, nullptr);
+        const auto& readback = buffers[readback_index];
+        for (std::size_t index = 0;
+             index < program.buffers.size(); ++index) {
+            const auto& guest = program.buffers[index];
+            if (!guest.written) {
+                continue;
+            }
+            const VkBufferCopy copy{
+                0u, readback_offsets[index],
+                guest.byte_count};
+            vkCmdCopyBuffer(
+                command_buffer, buffers[index].buffer,
+                readback.buffer, 1u, &copy);
+        }
+        const VkMemoryBarrier host_barrier{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_HOST_READ_BIT};
+        vkCmdPipelineBarrier(
+            command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT, 0,
+            1u, &host_barrier, 0u, nullptr, 0u, nullptr);
+    }
     result = vkEndCommandBuffer(command_buffer);
     if (result != VK_SUCCESS) {
         return fail("gen5 vkEndCommandBuffer", result);
     }
-    const VkSubmitInfo submit{
-        VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        nullptr, 0, nullptr, nullptr, 1,
-        &command_buffer, 0, nullptr};
-    result = vkQueueSubmit(
-        presenter.queue, 1, &submit, fence);
-    if (result != VK_SUCCESS) {
-        return fail("gen5 vkQueueSubmit", result);
-    }
-    result = vkWaitForFences(
-        presenter.device, 1, &fence, VK_TRUE,
+    const std::array submitted_commands{command_buffer};
+    result = SubmitCommandBuffersAndRetire(
+        presenter, submitted_commands, fence,
+        written_buffer_count != 0u, 1u,
         UINT64_C(5000000000));
     if (result != VK_SUCCESS) {
-        return fail("gen5 vkWaitForFences", result);
+        return fail("gen5 submit/retire", result);
+    }
+    if (g_readback_batch_enabled &&
+        written_buffer_count != 0u) {
+        g_readback_batch_stats.snapshots.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_readback_batch_stats.ranges.fetch_add(
+            static_cast<std::uint64_t>(
+                written_buffer_count),
+            std::memory_order_relaxed);
+        g_readback_batch_stats.copy_commands.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_readback_batch_stats.copy_regions.fetch_add(
+            static_cast<std::uint64_t>(
+                written_buffer_count),
+            std::memory_order_relaxed);
     }
     bool copied = true;
+    const auto* const readback_bytes =
+        readback_index != SIZE_MAX
+        ? static_cast<const std::uint8_t*>(
+              buffers[readback_index].map)
+        : nullptr;
     for (std::size_t index = 0;
          index < program.buffers.size(); ++index) {
         const auto& guest = program.buffers[index];
-        const auto& host = buffers[index];
+        const auto* const output =
+            readback_bytes != nullptr
+            ? readback_bytes + readback_offsets[index]
+            : static_cast<const std::uint8_t*>(
+                  buffers[index].map);
         if (guest.written &&
             !write_bytes(
-                memory_context, guest.guest_address, host.map,
+                memory_context, guest.guest_address,
+                output,
                 static_cast<std::size_t>(guest.byte_count))) {
             copied = false;
         }
+    }
+    if (g_readback_batch_enabled && !copied) {
+        g_readback_batch_stats.fallbacks.fetch_add(
+            1u, std::memory_order_relaxed);
     }
     cleanup();
     return copied;
@@ -3982,6 +6716,13 @@ bool ExecuteVulkanGen5ComputeImages(
         presenter.permanently_failed) {
         return false;
     }
+    const bool coalesce_stages =
+        g_driver_optimization_enabled ||
+        g_readback_batch_enabled;
+    // Upload, split dispatches and readback belong to one ordered guest
+    // packet and can share a command buffer.  Guest-visible writeback below
+    // remains the hard retirement boundary.  With both toggles OFF the
+    // original submit/fence/reset sequence is preserved exactly.
 
     struct NativeImage {
         VkImage image{};
@@ -4010,10 +6751,6 @@ bool ExecuteVulkanGen5ComputeImages(
     NativeBuffer staging{};
     NativeBuffer flattened{};
     NativeBuffer user_data{};
-    VkShaderModule module{};
-    VkDescriptorSetLayout set_layout{};
-    VkPipelineLayout pipeline_layout{};
-    VkPipeline pipeline{};
     VkDescriptorPool descriptor_pool{};
     VkCommandBuffer command_buffer{};
     VkFence fence{};
@@ -4046,20 +6783,6 @@ bool ExecuteVulkanGen5ComputeImages(
         if (descriptor_pool != VK_NULL_HANDLE) {
             vkDestroyDescriptorPool(
                 presenter.device, descriptor_pool, nullptr);
-        }
-        if (pipeline != VK_NULL_HANDLE) {
-            vkDestroyPipeline(presenter.device, pipeline, nullptr);
-        }
-        if (pipeline_layout != VK_NULL_HANDLE) {
-            vkDestroyPipelineLayout(
-                presenter.device, pipeline_layout, nullptr);
-        }
-        if (set_layout != VK_NULL_HANDLE) {
-            vkDestroyDescriptorSetLayout(
-                presenter.device, set_layout, nullptr);
-        }
-        if (module != VK_NULL_HANDLE) {
-            vkDestroyShaderModule(presenter.device, module, nullptr);
         }
         for (const auto sampler : samplers) {
             vkDestroySampler(presenter.device, sampler, nullptr);
@@ -4195,7 +6918,8 @@ bool ExecuteVulkanGen5ComputeImages(
             guest.byte_count > UINT32_C(0x10000000) ||
             !create_host_buffer(
                 guest_buffers[index], guest.byte_count,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                 nullptr) ||
             (guest.read &&
              !read_bytes(
@@ -4242,6 +6966,8 @@ bool ExecuteVulkanGen5ComputeImages(
     }
 
     std::size_t staging_size{};
+    std::vector<std::size_t> buffer_readback_offsets(
+        program.buffers.size(), SIZE_MAX);
     for (std::size_t index = 0;
          index < program.images.size(); ++index) {
         const auto& guest = program.images[index];
@@ -4310,6 +7036,26 @@ bool ExecuteVulkanGen5ComputeImages(
             return false;
         }
         staging_size += native.linear_size;
+    }
+    if (coalesce_stages) {
+        for (std::size_t index = 0;
+             index < program.buffers.size(); ++index) {
+            const auto& guest = program.buffers[index];
+            if (!guest.written) {
+                continue;
+            }
+            staging_size =
+                (staging_size + 255u) &
+                ~static_cast<std::size_t>(255u);
+            buffer_readback_offsets[index] = staging_size;
+            if (guest.byte_count >
+                SIZE_MAX - staging_size) {
+                cleanup();
+                return false;
+            }
+            staging_size +=
+                static_cast<std::size_t>(guest.byte_count);
+        }
     }
     if (staging_size == 0u ||
         staging_size > UINT32_C(0x20000000) ||
@@ -4560,56 +7306,25 @@ bool ExecuteVulkanGen5ComputeImages(
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
         }
     }
-    const VkDescriptorSetLayoutCreateInfo set_info{
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        nullptr, 0,
-        static_cast<std::uint32_t>(layout_bindings.size()),
-        layout_bindings.data()};
-    auto result = vkCreateDescriptorSetLayout(
-        presenter.device, &set_info, nullptr, &set_layout);
-    if (result != VK_SUCCESS) {
-        return fail(
-            "gen5 image vkCreateDescriptorSetLayout", result);
+    const auto* const pipeline_bundle =
+        AcquireGen5ComputePipelineBundle(
+            presenter, spirv,
+            std::span<const VkDescriptorSetLayoutBinding>{
+                layout_bindings},
+            program.descriptor_set,
+            program.push_constant_offset,
+            program.push_constant_size,
+            "gen5 image vkCreateDescriptorSetLayout",
+            "gen5 image vkCreatePipelineLayout",
+            "gen5 image vkCreateShaderModule",
+            "gen5 image vkCreateComputePipelines");
+    if (pipeline_bundle == nullptr) {
+        cleanup();
+        return false;
     }
-    VkPushConstantRange push_range{
-        VK_SHADER_STAGE_COMPUTE_BIT,
-        program.push_constant_offset,
-        program.push_constant_size};
-    const VkPipelineLayoutCreateInfo pipeline_layout_info{
-        VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        nullptr, 0, 1, &set_layout,
-        push_range.size == 0u ? 0u : 1u,
-        push_range.size == 0u ? nullptr : &push_range};
-    result = vkCreatePipelineLayout(
-        presenter.device, &pipeline_layout_info, nullptr,
-        &pipeline_layout);
-    if (result != VK_SUCCESS) {
-        return fail(
-            "gen5 image vkCreatePipelineLayout", result);
-    }
-    const VkShaderModuleCreateInfo module_info{
-        VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        nullptr, 0, spirv.size_bytes(), spirv.data()};
-    result = vkCreateShaderModule(
-        presenter.device, &module_info, nullptr, &module);
-    if (result != VK_SUCCESS) {
-        return fail("gen5 image vkCreateShaderModule", result);
-    }
-    const VkPipelineShaderStageCreateInfo stage{
-        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
-        module, "main", nullptr};
-    const VkComputePipelineCreateInfo pipeline_info{
-        VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        nullptr, 0, stage, pipeline_layout,
-        VK_NULL_HANDLE, 0};
-    result = vkCreateComputePipelines(
-        presenter.device, VK_NULL_HANDLE, 1,
-        &pipeline_info, nullptr, &pipeline);
-    if (result != VK_SUCCESS) {
-        return fail(
-            "gen5 image vkCreateComputePipelines", result);
-    }
+    const auto set_layout = pipeline_bundle->set_layout;
+    const auto pipeline_layout = pipeline_bundle->pipeline_layout;
+    const auto pipeline = pipeline_bundle->pipeline;
     std::vector<VkDescriptorPoolSize> pool_sizes;
     constexpr std::array PoolTypes{
         VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
@@ -4628,7 +7343,7 @@ bool ExecuteVulkanGen5ComputeImages(
         nullptr, 0, 1,
         static_cast<std::uint32_t>(pool_sizes.size()),
         pool_sizes.data()};
-    result = vkCreateDescriptorPool(
+    auto result = vkCreateDescriptorPool(
         presenter.device, &pool_info, nullptr,
         &descriptor_pool);
     if (result != VK_SUCCESS) {
@@ -4773,8 +7488,50 @@ bool ExecuteVulkanGen5ComputeImages(
         return fail(
             "gen5 image vkBeginCommandBuffer", result);
     }
-    for (std::size_t index = 0;
-         index < images.size(); ++index) {
+    std::uint64_t output_copy_count{};
+    if (g_driver_optimization_enabled) {
+        std::vector<DriverImageBarrier> upload_begin;
+        std::vector<DriverImageBarrier> upload_finish;
+        upload_begin.reserve(images.size());
+        upload_finish.reserve(images.size());
+        for (const auto& native : images) {
+            upload_begin.push_back({
+                native.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT});
+            upload_finish.push_back({
+                native.image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT});
+        }
+        EmitDriverImageBarriers(command_buffer, upload_begin);
+        for (std::size_t index = 0;
+             index < images.size(); ++index) {
+            const auto& guest = program.images[index];
+            const auto& native = images[index];
+            const VkBufferImageCopy copy{
+                native.staging_offset, 0, 0,
+                {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
+                 (guest.type == 11u || guest.type == 13u)
+                    ? guest.depth : 1u},
+                {0, 0, 0},
+                {guest.width, guest.height,
+                 guest.type == 10u ? guest.depth : 1u}};
+            vkCmdCopyBufferToImage(
+                command_buffer, staging.buffer, native.image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        }
+        EmitDriverImageBarriers(command_buffer, upload_finish);
+    } else {
+        for (std::size_t index = 0;
+             index < images.size(); ++index) {
         const auto& guest = program.images[index];
         const auto& native = images[index];
         ImageBarrier(
@@ -4804,35 +7561,39 @@ bool ExecuteVulkanGen5ComputeImages(
                 VK_ACCESS_SHADER_WRITE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        }
     }
-    result = vkEndCommandBuffer(command_buffer);
-    if (result != VK_SUCCESS) {
-        return fail("gen5 image upload end", result);
-    }
-    const VkSubmitInfo upload_submit{
-        VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
-        0, nullptr, nullptr, 1, &command_buffer,
-        0, nullptr};
-    result = vkQueueSubmit(
-        presenter.queue, 1, &upload_submit, fence);
-    if (result != VK_SUCCESS) {
-        return fail("gen5 image upload submit", result);
-    }
-    result = vkWaitForFences(
-        presenter.device, 1, &fence, VK_TRUE,
-        UINT64_C(10000000000));
-    if (result != VK_SUCCESS) {
-        return fail("gen5 image upload wait", result);
-    }
-    result = vkResetFences(presenter.device, 1, &fence);
-    if (result == VK_SUCCESS) {
-        result = vkResetCommandBuffer(command_buffer, 0);
-    }
-    if (result == VK_SUCCESS) {
-        result = vkBeginCommandBuffer(command_buffer, &begin);
-    }
-    if (result != VK_SUCCESS) {
-        return fail("gen5 image dispatch begin", result);
+    if (!coalesce_stages) {
+        result = vkEndCommandBuffer(command_buffer);
+        if (result != VK_SUCCESS) {
+            return fail("gen5 image upload end", result);
+        }
+        const VkSubmitInfo upload_submit{
+            VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
+            0, nullptr, nullptr, 1, &command_buffer,
+            0, nullptr};
+        result = vkQueueSubmit(
+            presenter.queue, 1, &upload_submit, fence);
+        if (result != VK_SUCCESS) {
+            return fail("gen5 image upload submit", result);
+        }
+        RecordDriverQueueSubmit(1u, 1u, true);
+        result = vkWaitForFences(
+            presenter.device, 1, &fence, VK_TRUE,
+            UINT64_C(10000000000));
+        if (result != VK_SUCCESS) {
+            return fail("gen5 image upload wait", result);
+        }
+        result = vkResetFences(presenter.device, 1, &fence);
+        if (result == VK_SUCCESS) {
+            result = vkResetCommandBuffer(command_buffer, 0);
+        }
+        if (result == VK_SUCCESS) {
+            result = vkBeginCommandBuffer(command_buffer, &begin);
+        }
+        if (result != VK_SUCCESS) {
+            return fail("gen5 image dispatch begin", result);
+        }
     }
     if (program.push_constant_size != 0u &&
         program.packed_user_data.size() *
@@ -4875,21 +7636,23 @@ bool ExecuteVulkanGen5ComputeImages(
             spirv.size(), groups[0], groups[1], groups[2],
             rows_per_dispatch, layers_per_dispatch);
     }
+    DriverCommandState driver_state{};
+    std::uint64_t dispatch_packet_count{};
     std::uint32_t base_z = 0u;
     bool dispatch_complete = false;
     do {
         std::uint32_t base_y = 0u;
         do {
-        vkCmdBindPipeline(
-            command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline);
-        vkCmdBindDescriptorSets(
-            command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline_layout, program.descriptor_set, 1,
-            &descriptor_set, 0, nullptr);
+        DriverBindPipeline(
+            driver_state, command_buffer, pipeline,
+            VK_PIPELINE_BIND_POINT_COMPUTE);
+        DriverBindDescriptor(
+            driver_state, command_buffer, pipeline_layout,
+            descriptor_set, VK_PIPELINE_BIND_POINT_COMPUTE,
+            program.descriptor_set);
         if (program.push_constant_size != 0u) {
-            vkCmdPushConstants(
-                command_buffer, pipeline_layout,
+            DriverPushConstants(
+                driver_state, command_buffer, pipeline_layout,
                 VK_SHADER_STAGE_COMPUTE_BIT,
                 program.push_constant_offset,
                 program.push_constant_size,
@@ -4909,49 +7672,116 @@ bool ExecuteVulkanGen5ComputeImages(
                 command_buffer, groups[0], groups[1],
                 groups[2]);
         }
-        result = vkEndCommandBuffer(command_buffer);
-        if (result != VK_SUCCESS) {
-            return fail("gen5 image dispatch end", result);
+        ++dispatch_packet_count;
+        if (coalesce_stages && split_dispatch) {
+            const VkMemoryBarrier chunk_barrier{
+                VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT};
+            vkCmdPipelineBarrier(
+                command_buffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                1u, &chunk_barrier, 0u, nullptr, 0u, nullptr);
         }
-        const VkSubmitInfo dispatch_submit{
-            VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
-            0, nullptr, nullptr, 1, &command_buffer,
-            0, nullptr};
-        result = vkQueueSubmit(
-            presenter.queue, 1, &dispatch_submit, fence);
-        if (result != VK_SUCCESS) {
-            return fail("gen5 image dispatch submit", result);
-        }
-        result = vkWaitForFences(
-            presenter.device, 1, &fence, VK_TRUE,
-            UINT64_C(10000000000));
-        if (result != VK_SUCCESS) {
-            return fail("gen5 image dispatch wait", result);
+        if (!coalesce_stages) {
+            result = vkEndCommandBuffer(command_buffer);
+            if (result != VK_SUCCESS) {
+                return fail("gen5 image dispatch end", result);
+            }
+            const VkSubmitInfo dispatch_submit{
+                VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
+                0, nullptr, nullptr, 1, &command_buffer,
+                0, nullptr};
+            result = vkQueueSubmit(
+                presenter.queue, 1, &dispatch_submit, fence);
+            if (result != VK_SUCCESS) {
+                return fail("gen5 image dispatch submit", result);
+            }
+            RecordDriverQueueSubmit(1u, 1u, true);
+            result = vkWaitForFences(
+                presenter.device, 1, &fence, VK_TRUE,
+                UINT64_C(10000000000));
+            if (result != VK_SUCCESS) {
+                return fail("gen5 image dispatch wait", result);
+            }
         }
         base_y += row_count;
         dispatch_complete =
             base_y >= groups[1] &&
             base_z + layer_count >= groups[2];
-        result = vkResetFences(presenter.device, 1, &fence);
-        if (result == VK_SUCCESS) {
-            result =
-                vkResetCommandBuffer(command_buffer, 0);
-        }
-        if (result == VK_SUCCESS) {
-            result =
-                vkBeginCommandBuffer(command_buffer, &begin);
-        }
-        if (result != VK_SUCCESS) {
-            return fail(
-                !dispatch_complete
-                    ? "gen5 image next dispatch begin"
-                    : "gen5 image readback begin",
-                result);
+        if (!coalesce_stages) {
+            result = vkResetFences(
+                presenter.device, 1, &fence);
+            if (result == VK_SUCCESS) {
+                result =
+                    vkResetCommandBuffer(command_buffer, 0);
+            }
+            if (result == VK_SUCCESS) {
+                result =
+                    vkBeginCommandBuffer(command_buffer, &begin);
+            }
+            if (result != VK_SUCCESS) {
+                return fail(
+                    !dispatch_complete
+                        ? "gen5 image next dispatch begin"
+                        : "gen5 image readback begin",
+                    result);
+            }
         }
         } while (base_y < groups[1]);
         base_z += std::min(
             layers_per_dispatch, groups[2] - base_z);
     } while (base_z < groups[2]);
+    if (coalesce_stages) {
+        const VkMemoryBarrier buffer_readback_barrier{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT};
+        vkCmdPipelineBarrier(
+            command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            1u, &buffer_readback_barrier,
+            0u, nullptr, 0u, nullptr);
+        for (std::size_t index = 0;
+             index < program.buffers.size(); ++index) {
+            const auto& guest = program.buffers[index];
+            if (!guest.written ||
+                buffer_readback_offsets[index] == SIZE_MAX) {
+                continue;
+            }
+            const VkBufferCopy copy{
+                0u, buffer_readback_offsets[index],
+                guest.byte_count};
+            vkCmdCopyBuffer(
+                command_buffer, guest_buffers[index].buffer,
+                staging.buffer, 1u, &copy);
+            ++output_copy_count;
+        }
+    }
+    if (g_driver_optimization_enabled) {
+        std::vector<DriverImageBarrier> readback_barriers;
+        readback_barriers.reserve(images.size());
+        for (std::size_t index = 0;
+             index < images.size(); ++index) {
+            if (!program.images[index].written) {
+                continue;
+            }
+            const auto& native = images[index];
+            readback_barriers.push_back({
+                native.image, VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT});
+        }
+        EmitDriverImageBarriers(
+            command_buffer, readback_barriers);
+    }
     for (std::size_t index = 0;
          index < images.size(); ++index) {
         if (!program.images[index].written) {
@@ -4959,14 +7789,16 @@ bool ExecuteVulkanGen5ComputeImages(
         }
         const auto& guest = program.images[index];
         const auto& native = images[index];
-        ImageBarrier(
-            command_buffer, native.image,
-            VK_IMAGE_LAYOUT_GENERAL,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_ACCESS_SHADER_WRITE_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
+        if (!g_driver_optimization_enabled) {
+            ImageBarrier(
+                command_buffer, native.image,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        }
         const VkBufferImageCopy copy{
             native.staging_offset, 0, 0,
             {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
@@ -4979,49 +7811,99 @@ bool ExecuteVulkanGen5ComputeImages(
             command_buffer, native.image,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             staging.buffer, 1, &copy);
-        result = vkEndCommandBuffer(command_buffer);
-        if (result != VK_SUCCESS) {
-            return fail("gen5 image output end", result);
+        ++output_copy_count;
+        if (!coalesce_stages) {
+            result = vkEndCommandBuffer(command_buffer);
+            if (result != VK_SUCCESS) {
+                return fail("gen5 image output end", result);
+            }
+            const VkSubmitInfo output_submit{
+                VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
+                0, nullptr, nullptr, 1, &command_buffer,
+                0, nullptr};
+            result = vkQueueSubmit(
+                presenter.queue, 1, &output_submit, fence);
+            if (result != VK_SUCCESS) {
+                return fail(
+                    "gen5 image output submit", result);
+            }
+            RecordDriverQueueSubmit(1u, 1u, true);
+            result = vkWaitForFences(
+                presenter.device, 1, &fence, VK_TRUE,
+                UINT64_C(10000000000));
+            if (result != VK_SUCCESS) {
+                return fail(
+                    "gen5 image output wait", result);
+            }
+            result = vkResetFences(
+                presenter.device, 1, &fence);
+            if (result == VK_SUCCESS) {
+                result = vkResetCommandBuffer(
+                    command_buffer, 0);
+            }
+            if (result == VK_SUCCESS) {
+                result = vkBeginCommandBuffer(
+                    command_buffer, &begin);
+            }
+            if (result != VK_SUCCESS) {
+                return fail(
+                    "gen5 image next output begin", result);
+            }
         }
-        const VkSubmitInfo output_submit{
-            VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
-            0, nullptr, nullptr, 1, &command_buffer,
-            0, nullptr};
-        result = vkQueueSubmit(
-            presenter.queue, 1, &output_submit, fence);
-        if (result != VK_SUCCESS) {
-            return fail("gen5 image output submit", result);
-        }
-        result = vkWaitForFences(
-            presenter.device, 1, &fence, VK_TRUE,
-            UINT64_C(10000000000));
-        if (result != VK_SUCCESS) {
-            return fail("gen5 image output wait", result);
-        }
-        result = vkResetFences(presenter.device, 1, &fence);
-        if (result == VK_SUCCESS) {
-            result = vkResetCommandBuffer(command_buffer, 0);
-        }
-        if (result == VK_SUCCESS) {
-            result = vkBeginCommandBuffer(
-                command_buffer, &begin);
-        }
-        if (result != VK_SUCCESS) {
-            return fail("gen5 image next output begin", result);
-        }
+    }
+    if (coalesce_stages && output_copy_count != 0u) {
+        const VkMemoryBarrier host_readback_barrier{
+            VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_HOST_READ_BIT};
+        vkCmdPipelineBarrier(
+            command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_HOST_BIT, 0,
+            1u, &host_readback_barrier,
+            0u, nullptr, 0u, nullptr);
     }
     result = vkEndCommandBuffer(command_buffer);
     if (result != VK_SUCCESS) {
         return fail("gen5 image readback finish", result);
     }
+    if (coalesce_stages) {
+        const auto logical_packets =
+            1u + dispatch_packet_count +
+            output_copy_count;
+        const std::array submitted_commands{command_buffer};
+        result = SubmitCommandBuffersAndRetire(
+            presenter, submitted_commands, fence,
+            output_copy_count != 0u, logical_packets,
+            UINT64_C(10000000000));
+        if (result != VK_SUCCESS) {
+            return fail("gen5 image coalesced submit/retire", result);
+        }
+    }
+    if (g_readback_batch_enabled &&
+        output_copy_count != 0u) {
+        g_readback_batch_stats.snapshots.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_readback_batch_stats.ranges.fetch_add(
+            output_copy_count, std::memory_order_relaxed);
+        g_readback_batch_stats.copy_commands.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_readback_batch_stats.copy_regions.fetch_add(
+            output_copy_count, std::memory_order_relaxed);
+    }
     bool copied = true;
     for (std::size_t index = 0;
          index < program.buffers.size(); ++index) {
         const auto& guest = program.buffers[index];
+        const void* output =
+            coalesce_stages &&
+                    buffer_readback_offsets[index] != SIZE_MAX
+            ? static_cast<const std::uint8_t*>(staging.map) +
+                  buffer_readback_offsets[index]
+            : guest_buffers[index].map;
         if (guest.written &&
             !write_bytes(
                 memory_context, guest.guest_address,
-                guest_buffers[index].map,
+                output,
                 static_cast<std::size_t>(
                     guest.byte_count))) {
             copied = false;
@@ -6131,9 +9013,21 @@ bool ExecuteVulkanGen5Graphics(
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         nullptr, 0, VK_FALSE, VK_LOGIC_OP_COPY,
         1, &blend_attachment, {0, 0, 0, 0}};
+    const VkPipelineFragmentShadingRateStateCreateInfoKHR
+        shading_rate{
+            VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR,
+            nullptr,
+            g_mobile_gpu_enabled &&
+                    presenter.fragment_shading_rate_2x2
+                ? VkExtent2D{2u, 2u}
+                : VkExtent2D{1u, 1u},
+            {VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR,
+             VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR}};
     const VkGraphicsPipelineCreateInfo pipeline_info{
         VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-        nullptr, 0,
+        presenter.fragment_shading_rate_supported
+            ? &shading_rate : nullptr,
+        0,
         static_cast<std::uint32_t>(stages.size()), stages.data(),
         &vertex_input, &assembly, nullptr, &viewport_state,
         &raster, &multisample, nullptr, &blend, nullptr,
@@ -6143,6 +9037,11 @@ bool ExecuteVulkanGen5Graphics(
         &pipeline_info, nullptr, &pipeline);
     if (result != VK_SUCCESS) {
         return fail("gen5 graphics pipeline", result);
+    }
+    if (g_mobile_gpu_enabled &&
+        presenter.fragment_shading_rate_2x2) {
+        g_mobile_gpu_stats.coarse_rate_draws.fetch_add(
+            1u, std::memory_order_relaxed);
     }
 
     std::vector<VkDescriptorPoolSize> pool_sizes;
@@ -6339,16 +9238,38 @@ bool ExecuteVulkanGen5Graphics(
     if (result != VK_SUCCESS) {
         return fail("gen5 graphics begin", result);
     }
-    for (std::size_t index = 0; index < images.size(); ++index) {
-        const auto& guest = pixel_program.images[index];
-        auto& native = images[index];
-        ImageBarrier(
-            command_buffer, native.image,
-            VK_IMAGE_LAYOUT_UNDEFINED,
+    DriverCommandState driver_state{};
+    if (g_driver_optimization_enabled) {
+        std::vector<DriverImageBarrier> upload_begin;
+        upload_begin.reserve(images.size() + 1u);
+        for (const auto& native : images) {
+            upload_begin.push_back({
+                native.image, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT});
+        }
+        upload_begin.push_back({
+            target.image, VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             0, VK_ACCESS_TRANSFER_WRITE_BIT,
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VK_PIPELINE_STAGE_TRANSFER_BIT});
+        EmitDriverImageBarriers(command_buffer, upload_begin);
+    }
+    for (std::size_t index = 0; index < images.size(); ++index) {
+        const auto& guest = pixel_program.images[index];
+        auto& native = images[index];
+        if (!g_driver_optimization_enabled) {
+            ImageBarrier(
+                command_buffer, native.image,
+                VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        }
         const VkBufferImageCopy copy{
             native.staging_offset, 0, 0,
             {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
@@ -6360,23 +9281,27 @@ bool ExecuteVulkanGen5Graphics(
         vkCmdCopyBufferToImage(
             command_buffer, staging.buffer, native.image,
             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-        ImageBarrier(
-            command_buffer, native.image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_GENERAL,
-            VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_ACCESS_SHADER_READ_BIT |
-                VK_ACCESS_SHADER_WRITE_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        if (!g_driver_optimization_enabled) {
+            ImageBarrier(
+                command_buffer, native.image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        }
     }
-    ImageBarrier(
-        command_buffer, target.image,
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        0, VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (!g_driver_optimization_enabled) {
+        ImageBarrier(
+            command_buffer, target.image,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            0, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
     const VkBufferImageCopy target_copy{
         target.staging_offset, 0, 0,
         {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -6385,15 +9310,41 @@ bool ExecuteVulkanGen5Graphics(
     vkCmdCopyBufferToImage(
         command_buffer, staging.buffer, target.image,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &target_copy);
-    ImageBarrier(
-        command_buffer, target.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_ACCESS_TRANSFER_WRITE_BIT,
-        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    if (g_driver_optimization_enabled) {
+        std::vector<DriverImageBarrier> upload_finish;
+        upload_finish.reserve(images.size() + 1u);
+        for (const auto& native : images) {
+            upload_finish.push_back({
+                native.image,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT});
+        }
+        upload_finish.push_back({
+            target.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT});
+        EmitDriverImageBarriers(command_buffer, upload_finish);
+    } else {
+        ImageBarrier(
+            command_buffer, target.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    }
     const VkRenderPassBeginInfo render_begin{
         VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr,
         render_pass, framebuffer,
@@ -6402,37 +9353,38 @@ bool ExecuteVulkanGen5Graphics(
     vkCmdBeginRenderPass(
         command_buffer, &render_begin,
         VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(
-        command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    DriverBindPipeline(
+        driver_state, command_buffer, pipeline);
     if (vertex_set != VK_NULL_HANDLE) {
-        vkCmdBindDescriptorSets(
-            command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline_layout, 0, 1, &vertex_set, 0, nullptr);
+        DriverBindDescriptor(
+            driver_state, command_buffer, pipeline_layout,
+            vertex_set, VK_PIPELINE_BIND_POINT_GRAPHICS, 0u);
     }
     if (pixel_set != VK_NULL_HANDLE) {
-        vkCmdBindDescriptorSets(
-            command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline_layout, 1, 1, &pixel_set, 0, nullptr);
+        DriverBindDescriptor(
+            driver_state, command_buffer, pipeline_layout,
+            pixel_set, VK_PIPELINE_BIND_POINT_GRAPHICS, 1u);
     }
     if (vertex_program.push_constant_size != 0u) {
-        vkCmdPushConstants(
-            command_buffer, pipeline_layout,
+        DriverPushConstants(
+            driver_state, command_buffer, pipeline_layout,
             VK_SHADER_STAGE_VERTEX_BIT,
             vertex_program.push_constant_offset,
             vertex_program.push_constant_size,
             vertex_program.packed_user_data.data());
     }
     if (pixel_program.push_constant_size != 0u) {
-        vkCmdPushConstants(
-            command_buffer, pipeline_layout,
+        DriverPushConstants(
+            driver_state, command_buffer, pipeline_layout,
             VK_SHADER_STAGE_FRAGMENT_BIT,
             pixel_program.push_constant_offset,
             pixel_program.push_constant_size,
             pixel_program.packed_user_data.data());
     }
     if (draw.indexed) {
-        vkCmdBindIndexBuffer(
-            command_buffer, index_buffer.buffer, 0,
+        DriverBindIndexBuffer(
+            driver_state, command_buffer,
+            index_buffer.buffer, 0,
             draw.index_size == 4u
                 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
         vkCmdDrawIndexed(
@@ -6444,20 +9396,51 @@ bool ExecuteVulkanGen5Graphics(
             std::max(draw.instance_count, 1u), 0, 0);
     }
     vkCmdEndRenderPass(command_buffer);
+    if (g_driver_optimization_enabled) {
+        std::vector<DriverImageBarrier> output_barriers;
+        output_barriers.reserve(images.size() + 1u);
+        for (std::size_t index = 0;
+             index < images.size(); ++index) {
+            const auto& guest = pixel_program.images[index];
+            if (!guest.written && !guest.atomic) {
+                continue;
+            }
+            output_barriers.push_back({
+                images[index].image,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT});
+        }
+        output_barriers.push_back({
+            target.image,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT});
+        EmitDriverImageBarriers(
+            command_buffer, output_barriers);
+    }
     for (std::size_t index = 0; index < images.size(); ++index) {
         const auto& guest = pixel_program.images[index];
         auto& native = images[index];
         if (!guest.written && !guest.atomic) {
             continue;
         }
-        ImageBarrier(
-            command_buffer, native.image,
-            VK_IMAGE_LAYOUT_GENERAL,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            VK_ACCESS_SHADER_WRITE_BIT,
-            VK_ACCESS_TRANSFER_READ_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            VK_PIPELINE_STAGE_TRANSFER_BIT);
+        if (!g_driver_optimization_enabled) {
+            ImageBarrier(
+                command_buffer, native.image,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        }
         const VkBufferImageCopy copy{
             native.staging_offset, 0, 0,
             {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0,
@@ -6471,14 +9454,16 @@ bool ExecuteVulkanGen5Graphics(
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             staging.buffer, 1, &copy);
     }
-    ImageBarrier(
-        command_buffer, target.image,
-        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_ACCESS_TRANSFER_READ_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT);
+    if (!g_driver_optimization_enabled) {
+        ImageBarrier(
+            command_buffer, target.image,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT);
+    }
     vkCmdCopyImageToBuffer(
         command_buffer, target.image,
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -6498,19 +9483,30 @@ bool ExecuteVulkanGen5Graphics(
     if (result != VK_SUCCESS) {
         return fail("gen5 graphics end", result);
     }
-    const VkSubmitInfo submit{
-        VK_STRUCTURE_TYPE_SUBMIT_INFO, nullptr,
-        0, nullptr, nullptr, 1, &command_buffer,
-        0, nullptr};
-    result = vkQueueSubmit(presenter.queue, 1, &submit, fence);
+    const std::array submitted_commands{command_buffer};
+    result = SubmitCommandBuffersAndRetire(
+        presenter, submitted_commands, fence,
+        true, 1u, UINT64_C(10000000000));
     if (result != VK_SUCCESS) {
-        return fail("gen5 graphics submit", result);
+        return fail("gen5 graphics submit/retire", result);
     }
-    result = vkWaitForFences(
-        presenter.device, 1, &fence, VK_TRUE,
-        UINT64_C(10000000000));
-    if (result != VK_SUCCESS) {
-        return fail("gen5 graphics wait", result);
+    if (g_readback_batch_enabled) {
+        const auto image_output_count =
+            std::ranges::count_if(
+                pixel_program.images,
+                [](const auto& image) {
+                    return image.written || image.atomic;
+                });
+        g_readback_batch_stats.snapshots.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_readback_batch_stats.ranges.fetch_add(
+            1u + image_output_count,
+            std::memory_order_relaxed);
+        g_readback_batch_stats.copy_commands.fetch_add(
+            1u, std::memory_order_relaxed);
+        g_readback_batch_stats.copy_regions.fetch_add(
+            1u + image_output_count,
+            std::memory_order_relaxed);
     }
     std::vector<std::uint8_t> tiled(target.guest_size);
     auto copied = true;
@@ -6651,6 +9647,434 @@ bool ExecuteVulkanGen5Graphics(
 
 std::uint64_t GetVulkanPresentCount() {
     return g_present_count.load(std::memory_order_relaxed);
+}
+
+void ConfigureVulkanPipelineCacheIdentity(
+    const std::string_view root_directory,
+    const std::string_view title_id) {
+    const std::lock_guard lock{g_mutex};
+    const std::string new_root{root_directory};
+    const std::string new_title =
+        SanitizeCacheComponent(std::string{title_id});
+    std::error_code error;
+    const bool disk_enabled =
+        !new_root.empty() &&
+        std::filesystem::is_regular_file(
+            std::filesystem::path{new_root} /
+                "run-jit-persistent-jit-cache",
+            error) &&
+        !error;
+    if (g_pipeline_cache_root == new_root &&
+        g_pipeline_cache_title == new_title &&
+        g_pipeline_cache_disk_enabled == disk_enabled) {
+        return;
+    }
+    StopAsyncPipelineState(g_presenter);
+    g_pipeline_cache_root = new_root;
+    g_pipeline_cache_title = new_title;
+    g_pipeline_cache_disk_enabled = disk_enabled;
+    if (g_async_pipeline_enabled &&
+        g_presenter.device != VK_NULL_HANDLE) {
+        g_presenter.async_pipeline =
+            CreateAsyncPipelineState(g_presenter);
+    }
+}
+
+void SetVulkanDriverOptimizationEnabled(const bool enabled) {
+    const std::lock_guard lock{g_mutex};
+    g_driver_optimization_enabled = enabled;
+}
+
+void SetVulkanAsyncPipelineEnabled(const bool enabled) {
+    const std::lock_guard lock{g_mutex};
+    if (g_async_pipeline_enabled == enabled) {
+        return;
+    }
+    g_async_pipeline_enabled = enabled;
+    if (!enabled) {
+        StopAsyncPipelineState(g_presenter);
+    } else if (g_presenter.device != VK_NULL_HANDLE) {
+        g_presenter.async_pipeline =
+            CreateAsyncPipelineState(g_presenter);
+    }
+}
+
+void SetVulkanReadbackBatchingEnabled(const bool enabled) {
+    const std::lock_guard lock{g_mutex};
+    g_readback_batch_enabled = enabled;
+}
+
+void SetVulkanMobileGpuEnabled(const bool enabled) {
+    const std::lock_guard lock{g_mutex};
+    if (g_mobile_gpu_enabled == enabled) {
+        return;
+    }
+    if (g_presenter.device != VK_NULL_HANDLE) {
+        (void)vkDeviceWaitIdle(g_presenter.device);
+    }
+    g_mobile_gpu_enabled = enabled;
+    g_presenter.mobile_scale_percent =
+        enabled ? 75u : 100u;
+    g_presenter.mobile_pending_scale_percent =
+        g_presenter.mobile_scale_percent;
+    g_presenter.mobile_pressure_frames = 0u;
+    g_presenter.mobile_relaxed_frames = 0u;
+    g_mobile_gpu_stats.effective_scale_percent.store(
+        g_presenter.mobile_scale_percent,
+        std::memory_order_relaxed);
+    g_mobile_gpu_stats.physical_drs_available.store(
+        1u, std::memory_order_relaxed);
+    if (g_presenter.device != VK_NULL_HANDLE) {
+        DestroyGuestSwapchainResources(g_presenter);
+    }
+}
+
+void SetVulkanMaxAnisotropy(
+    const std::uint32_t max_anisotropy) {
+    const std::lock_guard lock{g_mutex};
+    const auto requested = std::clamp(
+        max_anisotropy, 1u, 2u);
+    if (requested == g_requested_max_anisotropy) {
+        return;
+    }
+    if (g_presenter.device != VK_NULL_HANDLE) {
+        (void)vkDeviceWaitIdle(g_presenter.device);
+        DestroyGuestResources(g_presenter);
+    }
+    g_requested_max_anisotropy = requested;
+    g_presenter.effective_anisotropy =
+        g_presenter.sampler_anisotropy_supported
+        ? std::min(
+              static_cast<float>(requested),
+              g_presenter.physical_properties.limits
+                  .maxSamplerAnisotropy)
+        : 1.0f;
+}
+
+bool IsVulkanDriverOptimizationEnabled() {
+    const std::lock_guard lock{g_mutex};
+    return g_driver_optimization_enabled;
+}
+
+bool IsVulkanAsyncPipelineEnabled() {
+    const std::lock_guard lock{g_mutex};
+    return g_async_pipeline_enabled;
+}
+
+bool IsVulkanReadbackBatchingEnabled() {
+    const std::lock_guard lock{g_mutex};
+    return g_readback_batch_enabled;
+}
+
+bool IsVulkanMobileGpuEnabled() {
+    const std::lock_guard lock{g_mutex};
+    return g_mobile_gpu_enabled;
+}
+
+std::uint32_t GetVulkanEffectiveAnisotropy() {
+    const std::lock_guard lock{g_mutex};
+    return static_cast<std::uint32_t>(
+        std::max(g_presenter.effective_anisotropy, 1.0f));
+}
+
+VulkanDriverOptimizationStats GetVulkanDriverOptimizationStats() {
+    const std::lock_guard lock{g_mutex};
+    return {
+        .enabled = g_driver_optimization_enabled ? 1u : 0u,
+        .pipeline_bind_attempts =
+            g_driver_optimization_stats.pipeline_bind_attempts.load(
+                std::memory_order_relaxed),
+        .pipeline_binds_elided =
+            g_driver_optimization_stats.pipeline_binds_elided.load(
+                std::memory_order_relaxed),
+        .descriptor_bind_attempts =
+            g_driver_optimization_stats.descriptor_bind_attempts.load(
+                std::memory_order_relaxed),
+        .descriptor_binds_elided =
+            g_driver_optimization_stats.descriptor_binds_elided.load(
+                std::memory_order_relaxed),
+        .push_constant_attempts =
+            g_driver_optimization_stats.push_constant_attempts.load(
+                std::memory_order_relaxed),
+        .push_constants_elided =
+            g_driver_optimization_stats.push_constants_elided.load(
+                std::memory_order_relaxed),
+        .dynamic_state_commits =
+            g_driver_optimization_stats.dynamic_state_commits.load(
+                std::memory_order_relaxed),
+        .dynamic_state_full_replays =
+            g_driver_optimization_stats.dynamic_state_full_replays.load(
+                std::memory_order_relaxed),
+        .barriers_elided =
+            g_driver_optimization_stats.barriers_elided.load(
+                std::memory_order_relaxed),
+        .render_scope_reuses =
+            g_driver_optimization_stats.render_scope_reuses.load(
+                std::memory_order_relaxed),
+        .barrier_requests =
+            g_driver_optimization_stats.barrier_requests.load(
+                std::memory_order_relaxed),
+        .barrier_batches =
+            g_driver_optimization_stats.barrier_batches.load(
+                std::memory_order_relaxed),
+        .barrier_regions =
+            g_driver_optimization_stats.barrier_regions.load(
+                std::memory_order_relaxed),
+        .barrier_regions_merged =
+            g_driver_optimization_stats.barrier_regions_merged.load(
+                std::memory_order_relaxed),
+        .transfer_requests =
+            g_driver_optimization_stats.transfer_requests.load(
+                std::memory_order_relaxed),
+        .transfer_flushes =
+            g_driver_optimization_stats.transfer_flushes.load(
+                std::memory_order_relaxed),
+        .transfer_regions =
+            g_driver_optimization_stats.transfer_regions.load(
+                std::memory_order_relaxed),
+        .transfer_copy_calls =
+            g_driver_optimization_stats.transfer_copy_calls.load(
+                std::memory_order_relaxed),
+        .queue_submits =
+            g_driver_optimization_stats.queue_submits.load(
+                std::memory_order_relaxed),
+        .queue_submit_logical_packets =
+            g_driver_optimization_stats.queue_submit_logical_packets.load(
+                std::memory_order_relaxed),
+        .queue_submit_command_buffers =
+            g_driver_optimization_stats.queue_submit_command_buffers.load(
+                std::memory_order_relaxed),
+        .queue_submit_calls_saved =
+            g_driver_optimization_stats.queue_submit_calls_saved.load(
+                std::memory_order_relaxed),
+        .queue_submit_forced_boundaries =
+            g_driver_optimization_stats.queue_submit_forced_boundaries.load(
+                std::memory_order_relaxed),
+        .vertex_bind_attempts =
+            g_driver_optimization_stats.vertex_bind_attempts.load(
+                std::memory_order_relaxed),
+        .vertex_binds_elided =
+            g_driver_optimization_stats.vertex_binds_elided.load(
+                std::memory_order_relaxed),
+        .index_bind_attempts =
+            g_driver_optimization_stats.index_bind_attempts.load(
+                std::memory_order_relaxed),
+        .index_binds_elided =
+            g_driver_optimization_stats.index_binds_elided.load(
+                std::memory_order_relaxed)};
+}
+
+VulkanAsyncPipelineStats GetVulkanAsyncPipelineStats() {
+    return {
+        g_async_pipeline_stats.compute_misses.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.cache_hits.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.fast_completed.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.optimized_queued.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.optimized_completed.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.published.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.optimized_replacements.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.build_failures.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.queue_drops.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.disk_cache_loads.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.disk_cache_writes.load(
+            std::memory_order_relaxed),
+        g_async_pipeline_stats.negative_cache_hits.load(
+            std::memory_order_relaxed)};
+}
+
+VulkanMobileGpuStats GetVulkanMobileGpuStats() {
+    return {
+        g_mobile_gpu_stats.effective_scale_percent.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.max_gpu_backlog.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.coarse_rate_draws.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.fsr_frames.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.exact_surface_reuses.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.exact_surface_reuse_bytes.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.residency_gc_evictions.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.physical_drs_available.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.physical_scaled_draws.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.physical_scale_fallbacks.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.physical_resolve_blits.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.physical_pixels_saved.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.source_smaller_than_output_frames.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.scale_down_events.load(
+            std::memory_order_relaxed),
+        g_mobile_gpu_stats.scale_up_events.load(
+            std::memory_order_relaxed)};
+}
+
+VulkanReadbackBatchStats GetVulkanReadbackBatchStats() {
+    return {
+        g_readback_batch_stats.snapshots.load(
+            std::memory_order_relaxed),
+        g_readback_batch_stats.ranges.load(
+            std::memory_order_relaxed),
+        g_readback_batch_stats.copy_commands.load(
+            std::memory_order_relaxed),
+        g_readback_batch_stats.copy_regions.load(
+            std::memory_order_relaxed),
+        g_readback_batch_stats.retirement_waits.load(
+            std::memory_order_relaxed),
+        g_readback_batch_stats.fallbacks.load(
+            std::memory_order_relaxed)};
+}
+
+void ResetVulkanDriverOptimizationStats() {
+    g_driver_optimization_stats.pipeline_bind_attempts.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.pipeline_binds_elided.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.descriptor_bind_attempts.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.descriptor_binds_elided.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.push_constant_attempts.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.push_constants_elided.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.dynamic_state_commits.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.dynamic_state_full_replays.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.barriers_elided.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.render_scope_reuses.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.barrier_requests.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.barrier_batches.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.barrier_regions.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.barrier_regions_merged.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.transfer_requests.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.transfer_flushes.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.transfer_regions.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.transfer_copy_calls.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.queue_submits.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.queue_submit_logical_packets.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.queue_submit_command_buffers.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.queue_submit_calls_saved.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.queue_submit_forced_boundaries.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.vertex_bind_attempts.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.vertex_binds_elided.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.index_bind_attempts.store(
+        0u, std::memory_order_relaxed);
+    g_driver_optimization_stats.index_binds_elided.store(
+        0u, std::memory_order_relaxed);
+}
+
+void ResetVulkanAsyncPipelineStats() {
+    g_async_pipeline_stats.compute_misses.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.cache_hits.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.fast_completed.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.optimized_queued.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.optimized_completed.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.published.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.optimized_replacements.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.build_failures.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.queue_drops.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.disk_cache_loads.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.disk_cache_writes.store(
+        0u, std::memory_order_relaxed);
+    g_async_pipeline_stats.negative_cache_hits.store(
+        0u, std::memory_order_relaxed);
+}
+
+void ResetVulkanMobileGpuStats() {
+    const auto scale =
+        g_mobile_gpu_stats.effective_scale_percent.load(
+            std::memory_order_relaxed);
+    g_mobile_gpu_stats.max_gpu_backlog.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.coarse_rate_draws.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.fsr_frames.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.exact_surface_reuses.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.exact_surface_reuse_bytes.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.residency_gc_evictions.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.physical_drs_available.store(
+        1u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.physical_scaled_draws.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.physical_scale_fallbacks.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.physical_resolve_blits.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.physical_pixels_saved.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.source_smaller_than_output_frames.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.scale_down_events.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.scale_up_events.store(
+        0u, std::memory_order_relaxed);
+    g_mobile_gpu_stats.effective_scale_percent.store(
+        scale, std::memory_order_relaxed);
+}
+
+void ResetVulkanReadbackBatchStats() {
+    g_readback_batch_stats.snapshots.store(
+        0u, std::memory_order_relaxed);
+    g_readback_batch_stats.ranges.store(
+        0u, std::memory_order_relaxed);
+    g_readback_batch_stats.copy_commands.store(
+        0u, std::memory_order_relaxed);
+    g_readback_batch_stats.copy_regions.store(
+        0u, std::memory_order_relaxed);
+    g_readback_batch_stats.retirement_waits.store(
+        0u, std::memory_order_relaxed);
+    g_readback_batch_stats.fallbacks.store(
+        0u, std::memory_order_relaxed);
 }
 
 void ResetVulkanPresenter() {
