@@ -3352,7 +3352,7 @@ private:
     }
 
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607300011ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607300012ull;
     static constexpr std::uint64_t kSerializedDecodedOpLayoutToken = 344;
     static constexpr std::size_t kWriterBatchRecords = 2048;
     static constexpr std::size_t kMaxShardRecords = 2048;
@@ -17054,40 +17054,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                   return lhs.saved_accesses >
                                          rhs.saved_accesses;
                               });
-                    const std::size_t cached_count =
-                        std::min<std::size_t>(
-                            generic_cached_gpr_offsets.size(),
-                            candidate_count);
-                    for (std::size_t cache_index = 0;
-                         cache_index < cached_count; ++cache_index) {
-                        generic_cached_gpr_offsets[cache_index] =
-                            candidates[cache_index].state_offset;
-                        generic_cached_gpr_dirty[cache_index] =
-                            candidates[cache_index].dirty;
-                    }
-                    if (cached_count != 0) {
-                        std::uint64_t saved_accesses = 0;
-                        for (std::size_t cache_index = 0;
-                             cache_index < cached_count; ++cache_index) {
-                            saved_accesses +=
-                                candidates[cache_index].saved_accesses;
-                        }
-                        g_jit_native_scalar_gpr_cached_blocks.fetch_add(
-                            1, std::memory_order_relaxed);
-                        g_jit_native_scalar_gpr_cached_registers.fetch_add(
-                            cached_count, std::memory_order_relaxed);
-                        g_jit_native_scalar_gpr_saved_accesses.fetch_add(
-                            saved_accesses, std::memory_order_relaxed);
-                    }
-                    // FEX and Box64 keep a stable architectural GPR mapping
-                    // across linked blocks.  Use the same invariant for the
-                    // four legacy x86-64 registers handled by this emitter:
-                    // x23,x24,x25,x26 always carry RAX,RCX,RDX,RBX.  The
-                    // caller-saved x4,x6,x7,x8 remain available to existing
-                    // lowering paths until they are allocator-managed. A fixed
-                    // layout lets a compatible successor consume the values
-                    // directly instead of round-tripping through
-                    // LsxMachineImage at every edge.
                     generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                     generic_cached_gpr_dirty.fill(false);
                     for (std::size_t cache_index = 0;
@@ -17096,12 +17062,32 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         generic_cached_gpr_offsets[cache_index] =
                             static_cast<std::uint32_t>(
                                 cache_index * sizeof(std::uint64_t));
-                        // A block entered from another static-GPR block may
-                        // inherit a dirty value even when it does not write
-                        // that guest register itself.  Conservatively publish
-                        // all eight at observable exits and fault recovery.
                         generic_cached_gpr_dirty[cache_index] = true;
                     }
+                    std::size_t local_cache_index = 4;
+                    std::uint64_t saved_accesses = 0;
+                    for (std::size_t candidate_index = 0;
+                         candidate_index < candidate_count &&
+                         local_cache_index < generic_cached_gpr_offsets.size();
+                         ++candidate_index) {
+                        const auto& candidate = candidates[candidate_index];
+                        if (candidate.state_offset <
+                            4u * sizeof(std::uint64_t)) {
+                            continue;
+                        }
+                        generic_cached_gpr_offsets[local_cache_index] =
+                            candidate.state_offset;
+                        generic_cached_gpr_dirty[local_cache_index] =
+                            candidate.dirty;
+                        saved_accesses += candidate.saved_accesses;
+                        ++local_cache_index;
+                    }
+                    g_jit_native_scalar_gpr_cached_blocks.fetch_add(
+                        1, std::memory_order_relaxed);
+                    g_jit_native_scalar_gpr_cached_registers.fetch_add(
+                        local_cache_index, std::memory_order_relaxed);
+                    g_jit_native_scalar_gpr_saved_accesses.fetch_add(
+                        saved_accesses, std::memory_order_relaxed);
                 } else if (generic_gpr_cache_shape_rejected) {
                     g_jit_native_scalar_gpr_shape_rejections.fetch_add(
                         1, std::memory_order_relaxed);
@@ -17860,21 +17846,24 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             Xbyak_aarch64::ptr(code->x19, state_offset));
                     }
                 };
-                const auto emit_flush_gpr_cache = [&]() {
+                const auto emit_flush_gpr_cache =
+                    [&](const bool caller_saved_only = false) {
                     for (std::size_t cache_index = 0;
                          cache_index < generic_cached_gpr_offsets.size();
                          ++cache_index) {
                         const std::uint32_t state_offset =
                             generic_cached_gpr_offsets[cache_index];
+                        const std::uint32_t host_register =
+                            kGenericCachedGprHostRegisters[cache_index];
                         if (state_offset == kNoCachedGprOffset ||
+                            (caller_saved_only && host_register >= 19u) ||
                             !generic_cached_gpr_dirty[cache_index] ||
                             (generic_gpr_cache_written_mask &
                              (std::uint32_t{1} << cache_index)) == 0) {
                             continue;
                         }
                         code->str(
-                            XReg(static_cast<std::uint32_t>(
-                                kGenericCachedGprHostRegisters[cache_index])),
+                            XReg(host_register),
                             Xbyak_aarch64::ptr(code->x19, state_offset));
                     }
                 };
@@ -17906,7 +17895,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emit_flush_gpr_cache();
                         return;
                     }
-                    Xbyak_aarch64::Label keep_static_gpr;
+                    Xbyak_aarch64::Label flush_all_gpr;
+                    Xbyak_aarch64::Label flushed_gpr;
                     code->ldrb(
                         code->w11,
                         Xbyak_aarch64::ptr(
@@ -17914,9 +17904,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             static_cast<std::uint32_t>(offsetof(
                                 OutboundEdgeState,
                                 target_accepts_static_gpr_cache))));
-                    code->cbnz(code->w11, keep_static_gpr);
+                    code->cbz(code->w11, flush_all_gpr);
+                    emit_flush_gpr_cache(true);
+                    code->b(flushed_gpr);
+                    code->L(flush_all_gpr);
                     emit_flush_gpr_cache();
-                    code->L(keep_static_gpr);
+                    code->L(flushed_gpr);
                 };
                 const auto emit_reload_register_caches =
                     [&](const bool after_abi_call = false) {
@@ -19419,6 +19412,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->b(after_static_gpr_entry);
                     generic_static_gpr_entry_offset = code->getSize();
                     emit_resident_block_initialization();
+                    emit_reload_gpr_cache(true);
                     code->L(after_static_gpr_entry);
                 }
                 emit_reload_vector_cache();
