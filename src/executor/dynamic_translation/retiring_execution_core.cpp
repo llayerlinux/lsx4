@@ -3352,7 +3352,7 @@ private:
     }
 
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607210010ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607300011ull;
     static constexpr std::uint64_t kSerializedDecodedOpLayoutToken = 344;
     static constexpr std::size_t kWriterBatchRecords = 2048;
     static constexpr std::size_t kMaxShardRecords = 2048;
@@ -3834,8 +3834,10 @@ struct CachedTranslationRecord {
     TranslationRecord tier0_block{};
     Arm64BlockEntry tier0_published_external = nullptr;
     Arm64BlockEntry tier0_published_resident = nullptr;
+    Arm64BlockEntry tier0_published_static_gpr = nullptr;
     Arm64BlockEntry tier1_published_external = nullptr;
     Arm64BlockEntry tier1_published_resident = nullptr;
+    Arm64BlockEntry tier1_published_static_gpr = nullptr;
     LocalJitTier tier = LocalJitTier::Tier0;
     Tier1PromotionState tier1_state = Tier1PromotionState::Cold;
 };
@@ -4046,6 +4048,8 @@ struct alignas(16) OutboundEdgeState {
     const std::uint64_t source_rip = 0;
     bool enters_resident_frame = false;
     std::atomic<std::uint8_t> inspection_pending{1};
+    bool carries_static_gpr_cache = false;
+    std::atomic<std::uint8_t> target_accepts_static_gpr_cache{0};
     // Keep this in the old tail padding: persisted native blocks embed the
     // offsets of owner/source_rip/enters_resident_frame. Source validation
     // identifies an edge emitted by a trace so its already-selected hot exit
@@ -4058,6 +4062,9 @@ static_assert(offsetof(OutboundEdgeState, guest_rip) == 0x08);
 static_assert(offsetof(OutboundEdgeState, owner) == 0x20);
 static_assert(offsetof(OutboundEdgeState, source_rip) == 0x28);
 static_assert(offsetof(OutboundEdgeState, enters_resident_frame) == 0x30);
+static_assert(offsetof(OutboundEdgeState, carries_static_gpr_cache) == 0x32);
+static_assert(
+    offsetof(OutboundEdgeState, target_accepts_static_gpr_cache) == 0x33);
 static_assert(sizeof(OutboundEdgeState) == 0x40);
 static_assert(std::atomic<Arm64BlockEntry>::is_always_lock_free);
 static_assert(sizeof(std::atomic<Arm64BlockEntry>) == sizeof(Arm64BlockEntry));
@@ -4125,6 +4132,7 @@ struct PublishedDestination {
     Arm64BlockEntry resident_entry = nullptr;
     const PublishedCodeWitness* code_witness = nullptr;
     const TraceValidationRecord* trace_validation = nullptr;
+    Arm64BlockEntry static_gpr_entry = nullptr;
 };
 
 struct TraceValidationMember {
@@ -4136,6 +4144,7 @@ struct TraceValidationRecord {
     std::uint64_t seed_rip = 0;
     Arm64BlockEntry baseline_external_entry = nullptr;
     Arm64BlockEntry baseline_resident_entry = nullptr;
+    Arm64BlockEntry baseline_static_gpr_entry = nullptr;
     const PublishedCodeWitness* baseline_witness = nullptr;
     std::vector<TraceValidationMember> members{};
     // Successful trace entries are sampled at the outbound safepoint. Keep
@@ -4163,9 +4172,21 @@ struct TraceValidationRecord {
 Arm64BlockEntry SelectDestinationEntry(const PublishedDestination& destination,
                                        const OutboundEdgeState& edge) noexcept {
     if (edge.enters_resident_frame) {
+        if (edge.carries_static_gpr_cache &&
+            destination.static_gpr_entry != nullptr) {
+            return destination.static_gpr_entry;
+        }
         return destination.resident_entry;
     }
     return destination.external_entry;
+}
+
+bool DestinationAcceptsStaticGprCache(
+    const PublishedDestination& destination,
+    const OutboundEdgeState& edge) noexcept {
+    return edge.enters_resident_frame &&
+           edge.carries_static_gpr_cache &&
+           destination.static_gpr_entry != nullptr;
 }
 
 class EdgeDestinationDirectory {
@@ -4194,6 +4215,9 @@ public:
             edge->trace_validation.store(
                 destination.trace_validation, std::memory_order_relaxed);
             edge->inspection_pending.store(1, std::memory_order_relaxed);
+            edge->target_accepts_static_gpr_cache.store(
+                DestinationAcceptsStaticGprCache(destination, *edge),
+                std::memory_order_relaxed);
             edge->target.store(
                 SelectDestinationEntry(destination, *edge),
                 std::memory_order_release);
@@ -4211,6 +4235,8 @@ public:
             edge->code_witness.store(nullptr, std::memory_order_relaxed);
             edge->trace_validation.store(nullptr, std::memory_order_relaxed);
             edge->inspection_pending.store(1, std::memory_order_relaxed);
+            edge->target_accepts_static_gpr_cache.store(
+                0, std::memory_order_relaxed);
             edge->target.store(nullptr, std::memory_order_release);
         }
     }
@@ -5448,7 +5474,9 @@ public:
                                                tiered_guards = nullptr,
                                            bool force_local_loop_dispatch_safepoint = false,
                                            LocalJitTier compilation_tier =
-                                               LocalJitTier::Tier0);
+                                               LocalJitTier::Tier0,
+                                           Arm64BlockEntry*
+                                               static_gpr_entry_out = nullptr);
     Arm64BlockEntry EmitCheckedNativeBlock(const LsxDecodedRegion& block, Arm64BlockEntry native);
     Arm64BlockEntry EmitInterpreterBridge(const LsxDecodedRegion& block);
     bool CapturePersistentNativeBlock(Arm64BlockEntry entry, Arm64BlockEntry direct,
@@ -5660,6 +5688,7 @@ struct TieredTraceArtifact {
     std::vector<std::unique_ptr<TieredGuardDeoptContext>> guard_contexts{};
     Arm64BlockEntry external_entry = nullptr;
     Arm64BlockEntry resident_entry = nullptr;
+    Arm64BlockEntry static_gpr_entry = nullptr;
     OutboundEdgeState* primary_outbound_edge = nullptr;
     OutboundEdgeState* secondary_outbound_edge = nullptr;
     std::unique_ptr<IndirectEdgeFanout> indirect_edge_fanout{};
@@ -6284,6 +6313,8 @@ public:
             std::lock_guard direct_lock{edge_graph_mutex_};
             edge_directory_.Reset([](OutboundEdgeState* const edge) {
                 if (edge != nullptr) {
+                    edge->target_accepts_static_gpr_cache.store(
+                        0, std::memory_order_relaxed);
                     edge->target.store(nullptr, std::memory_order_release);
                     edge->code_witness.store(nullptr, std::memory_order_relaxed);
                     edge->trace_validation.store(
@@ -7411,6 +7442,7 @@ public:
         Arm64BlockEntry compiled_entry = nullptr;
         Arm64BlockEntry direct_target = nullptr;
         Arm64BlockEntry resident_entry = nullptr;
+        Arm64BlockEntry static_gpr_entry = nullptr;
         bool compiled_chain_abi = false;
         bool compiled_native = false;
         const bool force_helper = JitForceHelperEnabled() ||
@@ -7706,11 +7738,13 @@ public:
                         *decoded, primary_outbound_edge, &direct_target,
                         secondary_outbound_edge, indirect_edge_fanout,
                         &indirect_pic_used, &compiled_chain_abi,
-                        &resident_entry);
+                        &resident_entry, nullptr, false,
+                        LocalJitTier::Tier0, &static_gpr_entry);
                 } catch (const std::exception& failure) {
                     compiled_entry = nullptr;
                     direct_target = nullptr;
                     resident_entry = nullptr;
+                    static_gpr_entry = nullptr;
                     indirect_pic_used = false;
                     compiled_chain_abi = false;
                     JitLog("[LSX4_NATIVE_EMIT_FALLBACK] pc=0x%llx reason=%s block=%s",
@@ -7720,6 +7754,7 @@ public:
                     compiled_entry = nullptr;
                     direct_target = nullptr;
                     resident_entry = nullptr;
+                    static_gpr_entry = nullptr;
                     indirect_pic_used = false;
                     compiled_chain_abi = false;
                     JitLog("[LSX4_NATIVE_EMIT_FALLBACK] pc=0x%llx reason=unknown block=%s",
@@ -7728,9 +7763,11 @@ public:
                 }
             }
             ConfigureOutboundEdgeEntryConvention(
-                primary_outbound_edge, compiled_chain_abi);
+                primary_outbound_edge, compiled_chain_abi,
+                static_gpr_entry != nullptr);
             ConfigureOutboundEdgeEntryConvention(
-                secondary_outbound_edge, compiled_chain_abi);
+                secondary_outbound_edge, compiled_chain_abi,
+                static_gpr_entry != nullptr);
             compiled_native = static_cast<bool>(compiled_entry);
         } else if (!std::ranges::empty(decoded->instructions)) {
             const auto first_mnemonic =
@@ -8010,6 +8047,10 @@ public:
             direct_target != nullptr && compiled_chain_abi
                 ? resident_entry
                 : nullptr;
+        installed.tier0_published_static_gpr =
+            direct_target != nullptr && compiled_chain_abi
+                ? static_gpr_entry
+                : nullptr;
         if (compiled_entry != nullptr) {
             g_tiered_counts.tier0_compiled.fetch_add(
                 1, std::memory_order_relaxed);
@@ -8120,7 +8161,8 @@ public:
                 guest_rip,
                 compiled_chain_abi ? compiled_entry : direct_target,
                 compiled_chain_abi ? resident_entry : nullptr,
-                published_witness, result.flags);
+                published_witness, result.flags,
+                compiled_chain_abi ? static_gpr_entry : nullptr);
         }
         if (immediate_tier1_vector_loop) {
             bool queued_now = false;
@@ -8186,19 +8228,25 @@ public:
             edge->trace_validation.store(destination->trace_validation,
                                          std::memory_order_relaxed);
             edge->inspection_pending.store(1, std::memory_order_relaxed);
+            edge->target_accepts_static_gpr_cache.store(
+                DestinationAcceptsStaticGprCache(*destination, *edge),
+                std::memory_order_relaxed);
             edge->target.store(SelectDestinationEntry(*destination, *edge),
                                std::memory_order_release);
         }
         return edge;
     }
 
-    void ConfigureOutboundEdgeEntryConvention(OutboundEdgeState* const edge,
-                                               const bool resident_frame) {
+    void ConfigureOutboundEdgeEntryConvention(
+        OutboundEdgeState* const edge, const bool resident_frame,
+        const bool carries_static_gpr_cache = false) {
         if (edge == nullptr) {
             return;
         }
         std::lock_guard lock{edge_graph_mutex_};
         edge->enters_resident_frame = resident_frame;
+        edge->carries_static_gpr_cache =
+            resident_frame && carries_static_gpr_cache;
         if (const PublishedDestination* const destination =
                 edge_directory_.FindPublished(edge->guest_rip);
             destination != nullptr) {
@@ -8207,12 +8255,17 @@ public:
             edge->trace_validation.store(destination->trace_validation,
                                          std::memory_order_relaxed);
             edge->inspection_pending.store(1, std::memory_order_relaxed);
+            edge->target_accepts_static_gpr_cache.store(
+                DestinationAcceptsStaticGprCache(*destination, *edge),
+                std::memory_order_relaxed);
             edge->target.store(SelectDestinationEntry(*destination, *edge),
                                std::memory_order_release);
         } else {
             edge->target.store(nullptr, std::memory_order_release);
             edge->code_witness.store(nullptr, std::memory_order_relaxed);
             edge->trace_validation.store(nullptr, std::memory_order_relaxed);
+            edge->target_accepts_static_gpr_cache.store(
+                0, std::memory_order_relaxed);
         }
     }
 
@@ -8272,7 +8325,8 @@ public:
                     active->first,
                     {validation.baseline_external_entry,
                      validation.baseline_resident_entry,
-                     validation.baseline_witness, nullptr});
+                     validation.baseline_witness, nullptr,
+                     validation.baseline_static_gpr_entry});
             }
             active = active_tiered_traces_.erase(active);
         }
@@ -8283,7 +8337,8 @@ public:
                                  Arm64BlockEntry external_entry,
                                  Arm64BlockEntry resident_entry,
                                  const PublishedCodeWitness* code_witness,
-                                 const std::uint32_t block_flags) {
+                                 const std::uint32_t block_flags,
+                                 Arm64BlockEntry static_gpr_entry = nullptr) {
         if (external_entry == nullptr ||
             TranslationHasFeature(block_flags, TranslationFeature::DispatcherBoundary)) {
             WithdrawPublishedDestination(guest_rip);
@@ -8291,7 +8346,9 @@ public:
         }
         std::lock_guard lock{edge_graph_mutex_};
         edge_directory_.PublishAndConnect(
-            guest_rip, {external_entry, resident_entry, code_witness});
+            guest_rip,
+            {external_entry, resident_entry, code_witness, nullptr,
+             static_gpr_entry});
     }
 
     void RetireDecodedOwnership(const std::uint64_t guest_rip) {
@@ -8401,7 +8458,8 @@ void RetiringTranslationRuntime::ApplyTieredConfiguration(
                     seed,
                     {validation.baseline_external_entry,
                      validation.baseline_resident_entry,
-                     validation.baseline_witness, nullptr});
+                     validation.baseline_witness, nullptr,
+                     validation.baseline_static_gpr_entry});
             } else {
                 edge_directory_.WithdrawAndDisconnect(seed);
             }
@@ -9460,13 +9518,14 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         const auto compile_started = std::chrono::steady_clock::now();
         Arm64BlockEntry direct = nullptr;
         Arm64BlockEntry resident = nullptr;
+        Arm64BlockEntry static_gpr = nullptr;
         bool chain_abi = false;
         const auto* const tiered_guards =
             plan.guards.empty() ? nullptr : &plan.guards;
         Arm64BlockEntry external = native_depot_.EmitNativeControlFlowBlock(
             plan.combined, primary, &direct, secondary, nullptr, nullptr,
             &chain_abi, &resident, tiered_guards, plan.loop_head_osr,
-            LocalJitTier::Tier2);
+            LocalJitTier::Tier2, &static_gpr);
         const auto compile_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - compile_started)
@@ -9475,12 +9534,14 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             reject();
             return;
         }
-        ConfigureOutboundEdgeEntryConvention(primary, true);
-        ConfigureOutboundEdgeEntryConvention(secondary, true);
+        ConfigureOutboundEdgeEntryConvention(
+            primary, true, static_gpr != nullptr);
+        ConfigureOutboundEdgeEntryConvention(
+            secondary, true, static_gpr != nullptr);
 
         std::uint64_t generated_bytes = 0;
         std::unordered_set<std::uint64_t> code_ranges;
-        for (const auto entry : {external, direct, resident}) {
+        for (const auto entry : {external, direct, resident, static_gpr}) {
             const auto range = native_depot_.FindCodeRange(
                 reinterpret_cast<std::uint64_t>(entry));
             if (range && code_ranges.insert(range->base).second) {
@@ -9508,6 +9569,7 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         }
         artifact->external_entry = external;
         artifact->resident_entry = resident;
+        artifact->static_gpr_entry = static_gpr;
         artifact->primary_outbound_edge = primary;
         artifact->secondary_outbound_edge = secondary;
         artifact->generated_bytes = generated_bytes;
@@ -9551,6 +9613,8 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             published->external_entry;
         artifact->validation->baseline_resident_entry =
             published->resident_entry;
+        artifact->validation->baseline_static_gpr_entry =
+            published->static_gpr_entry;
         artifact->validation->baseline_witness =
             published->code_witness;
         if (primary != nullptr) {
@@ -9569,7 +9633,7 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             plan.seed_rip,
             {active->external_entry, active->resident_entry,
              active->validation->baseline_witness,
-             active->validation.get()});
+             active->validation.get(), active->static_gpr_entry});
         tiered_active_code_bytes_.fetch_add(
             generated_bytes, std::memory_order_release);
         g_tiered_counts.compiled.fetch_add(1, std::memory_order_relaxed);
@@ -9643,7 +9707,8 @@ bool RetiringTranslationRuntime::DemoteTier1Locked(
                 guest_rip,
                 {record.tier0_published_external,
                  record.tier0_published_resident,
-                 record.witness, nullptr});
+                 record.witness, nullptr,
+                 record.tier0_published_static_gpr});
         } else {
             edge_directory_.WithdrawAndDisconnect(guest_rip);
         }
@@ -9849,12 +9914,13 @@ void RetiringTranslationRuntime::CompileTier1Block(
             std::chrono::steady_clock::now();
         Arm64BlockEntry direct = nullptr;
         Arm64BlockEntry resident = nullptr;
+        Arm64BlockEntry static_gpr = nullptr;
         bool chain_abi = false;
         Arm64BlockEntry external =
             native_depot_.EmitNativeControlFlowBlock(
                 *tier1_decoded, primary, &direct, secondary,
                 nullptr, nullptr, &chain_abi, &resident, nullptr,
-                false, LocalJitTier::Tier1);
+                false, LocalJitTier::Tier1, &static_gpr);
         const auto compile_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() -
@@ -9863,8 +9929,10 @@ void RetiringTranslationRuntime::CompileTier1Block(
             reject("native-emission");
             return;
         }
-        ConfigureOutboundEdgeEntryConvention(primary, chain_abi);
-        ConfigureOutboundEdgeEntryConvention(secondary, chain_abi);
+        ConfigureOutboundEdgeEntryConvention(
+            primary, chain_abi, static_gpr != nullptr);
+        ConfigureOutboundEdgeEntryConvention(
+            secondary, chain_abi, static_gpr != nullptr);
 
         // Tier-1 is an optional optimization, not merely a second spelling of
         // T0.  On wide SIMD blocks its current residency allocator can trade
@@ -9893,7 +9961,7 @@ void RetiringTranslationRuntime::CompileTier1Block(
 
         std::uint64_t generated_bytes = 0;
         std::unordered_set<std::uint64_t> code_ranges;
-        for (const auto entry : {external, direct, resident}) {
+        for (const auto entry : {external, direct, resident, static_gpr}) {
             const auto range = native_depot_.FindCodeRange(
                 reinterpret_cast<std::uint64_t>(entry));
             if (range && code_ranges.insert(range->base).second) {
@@ -9978,6 +10046,8 @@ void RetiringTranslationRuntime::CompileTier1Block(
                         chain_abi ? external : direct;
                     current->tier1_published_resident =
                         chain_abi ? resident : nullptr;
+                    current->tier1_published_static_gpr =
+                        chain_abi ? static_gpr : nullptr;
                     current->tier = LocalJitTier::Tier1;
                     current->tier1_state =
                         Tier1PromotionState::Active;
@@ -9987,7 +10057,8 @@ void RetiringTranslationRuntime::CompileTier1Block(
                         guest_rip,
                         {current->tier1_published_external,
                          current->tier1_published_resident,
-                         current->witness, nullptr});
+                         current->witness, nullptr,
+                         current->tier1_published_static_gpr});
                 }
             }
         }
@@ -10188,7 +10259,8 @@ void RetiringTranslationRuntime::RetirePublishedDestination(
             guest_rip,
             {validation.baseline_external_entry,
              validation.baseline_resident_entry,
-             validation.baseline_witness, nullptr});
+             validation.baseline_witness, nullptr,
+             validation.baseline_static_gpr_entry});
     } else {
         edge_directory_.WithdrawAndDisconnect(guest_rip);
     }
@@ -10249,6 +10321,8 @@ std::uint64_t RetiringTranslationRuntime::HandleTieredGuardDeopt(
                 validation.baseline_external_entry;
             const Arm64BlockEntry baseline_resident_entry =
                 validation.baseline_resident_entry;
+            const Arm64BlockEntry baseline_static_gpr_entry =
+                validation.baseline_static_gpr_entry;
             const PublishedCodeWitness* const baseline_witness =
                 validation.baseline_witness;
             validation.active.store(false, std::memory_order_release);
@@ -10269,7 +10343,8 @@ std::uint64_t RetiringTranslationRuntime::HandleTieredGuardDeopt(
                     seed_rip,
                     {baseline_external_entry,
                      baseline_resident_entry,
-                     baseline_witness, nullptr});
+                     baseline_witness, nullptr,
+                     baseline_static_gpr_entry});
             } else {
                 edge_directory_.WithdrawAndDisconnect(seed_rip);
             }
@@ -11605,6 +11680,8 @@ void RetireRejectedDirectTarget(OutboundEdgeState& cell, const Arm64BlockEntry c
     Arm64BlockEntry expected = candidate;
     if (cell.target.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
                                             std::memory_order_acquire)) {
+        cell.target_accepts_static_gpr_cache.store(
+            0, std::memory_order_relaxed);
         const PublishedCodeWitness* const witness =
             cell.code_witness.load(std::memory_order_acquire);
         if (witness != nullptr) {
@@ -11991,7 +12068,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     bool* chain_abi_out, Arm64BlockEntry* resident_entry_out,
     const std::vector<TieredGuardEmission>* const tiered_guards,
     const bool force_local_loop_dispatch_safepoint,
-    const LocalJitTier compilation_tier) {
+    const LocalJitTier compilation_tier,
+    Arm64BlockEntry* const static_gpr_entry_out) {
     if (direct_target_out != nullptr) {
         *direct_target_out = nullptr;
     }
@@ -12003,6 +12081,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     }
     if (resident_entry_out != nullptr) {
         *resident_entry_out = nullptr;
+    }
+    if (static_gpr_entry_out != nullptr) {
+        *static_gpr_entry_out = nullptr;
     }
     const auto finish_direct_native = [&](Arm64BlockEntry direct_target) {
         return PublishDirectEntry(direct_target_out, direct_target);
@@ -16856,13 +16937,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_VADDSS:
                     case X86_MNEMONIC_VSUBSS:
                     case X86_MNEMONIC_VMULSS:
-                        if (compilation_tier == LocalJitTier::Tier0 &&
-                            (!FastGuestMemoryEnabled() ||
-                             generic_has_faultable_memory_access)) {
-                            generic_gpr_cache_shape_rejected = true;
-                            generic_gpr_cache_eligible = false;
-                            continue;
-                        }
                         break;
                     case X86_MNEMONIC_IMUL:
                         if (candidate.operand_count == 2 ||
@@ -17005,10 +17079,35 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         g_jit_native_scalar_gpr_saved_accesses.fetch_add(
                             saved_accesses, std::memory_order_relaxed);
                     }
+                    // FEX and Box64 keep a stable architectural GPR mapping
+                    // across linked blocks.  Use the same invariant for the
+                    // four legacy x86-64 registers handled by this emitter:
+                    // x23,x24,x25,x26 always carry RAX,RCX,RDX,RBX.  The
+                    // caller-saved x4,x6,x7,x8 remain available to existing
+                    // lowering paths until they are allocator-managed. A fixed
+                    // layout lets a compatible successor consume the values
+                    // directly instead of round-tripping through
+                    // LsxMachineImage at every edge.
+                    generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
+                    generic_cached_gpr_dirty.fill(false);
+                    for (std::size_t cache_index = 0;
+                         cache_index < 4;
+                         ++cache_index) {
+                        generic_cached_gpr_offsets[cache_index] =
+                            static_cast<std::uint32_t>(
+                                cache_index * sizeof(std::uint64_t));
+                        // A block entered from another static-GPR block may
+                        // inherit a dirty value even when it does not write
+                        // that guest register itself.  Conservatively publish
+                        // all eight at observable exits and fault recovery.
+                        generic_cached_gpr_dirty[cache_index] = true;
+                    }
                 } else if (generic_gpr_cache_shape_rejected) {
                     g_jit_native_scalar_gpr_shape_rejections.fetch_add(
                         1, std::memory_order_relaxed);
                 }
+                const bool generic_static_gpr_cache =
+                    generic_gpr_cache_eligible;
                 constexpr std::uint32_t kNoCachedVectorHalfOffset =
                     std::numeric_limits<std::uint32_t>::max();
                 std::array<std::uint32_t, 14> generic_cached_vector_half_offsets{};
@@ -17490,7 +17589,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                 }
                 const bool generic_fault_cache_recovery_enabled =
-                    compilation_tier != LocalJitTier::Tier0 &&
+                    generic_has_faultable_memory_access &&
                     (std::ranges::any_of(
                          generic_cached_gpr_dirty,
                          [](const bool dirty) { return dirty; }) ||
@@ -17637,9 +17736,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 Xbyak_aarch64::Label skip;
                 Xbyak_aarch64::Label local_loop_body;
                 Xbyak_aarch64::Label scalar_semantic_exit;
-                const bool generic_frame_preserves_x21_x22 =
-                    generic_has_faultable_memory_access || generic_chain_abi ||
-                    generic_has_local_backedge;
+                // The generated body always clears x21 before its first guest
+                // operation. Preserve the ABI pair on every external entry;
+                // otherwise an unchecked leaf can corrupt a caller value even
+                // when the block itself has no faultable access.
+                constexpr bool generic_frame_preserves_x21_x22 = true;
                 const bool generic_frame_preserves_extended_gpr_cache =
                     generic_chain_abi ||
                     (generic_relative_fault_publication_enabled &&
@@ -17714,7 +17815,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         static_cast<std::size_t>(host_index - 16)];
                 };
                 std::uint32_t generic_vector_cache_written_mask = 0;
-                std::uint32_t generic_gpr_cache_written_mask = 0;
+                std::uint32_t generic_gpr_cache_written_mask =
+                    generic_static_gpr_cache ? 0x0fu : 0u;
                 const auto mark_cached_vector_half_written =
                     [&](const int host_index) {
                     if (cached_vector_half_is_writeback(host_index)) {
@@ -17796,6 +17898,25 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 const auto emit_flush_register_caches = [&]() {
                     emit_flush_vector_cache();
                     emit_flush_gpr_cache();
+                };
+                const auto emit_flush_register_caches_for_edge =
+                    [&](const XReg& edge_address) {
+                    emit_flush_vector_cache();
+                    if (!generic_static_gpr_cache) {
+                        emit_flush_gpr_cache();
+                        return;
+                    }
+                    Xbyak_aarch64::Label keep_static_gpr;
+                    code->ldrb(
+                        code->w11,
+                        Xbyak_aarch64::ptr(
+                            edge_address,
+                            static_cast<std::uint32_t>(offsetof(
+                                OutboundEdgeState,
+                                target_accepts_static_gpr_cache))));
+                    code->cbnz(code->w11, keep_static_gpr);
+                    emit_flush_gpr_cache();
+                    code->L(keep_static_gpr);
                 };
                 const auto emit_reload_register_caches =
                     [&](const bool after_abi_call = false) {
@@ -17988,7 +18109,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (generic_strong_memory_sequence_has_write) {
                             code->dmb(Xbyak_aarch64::ISHST);
                         }
-                        emit_flush_register_caches();
+                        EmitJitRelocatablePointer(
+                            *code, code->x17,
+                            reinterpret_cast<std::uint64_t>(edge_slot));
+                        emit_flush_register_caches_for_edge(code->x17);
                         if (generic_has_faultable_memory_access) {
                             code->mov(code->x9, 0);
                             code->str(
@@ -18149,7 +18273,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (generic_strong_memory_sequence_has_write) {
                             code->dmb(Xbyak_aarch64::ISHST);
                         }
-                        emit_flush_register_caches();
+                        emit_flush_register_caches_for_edge(code->x13);
                         if (generic_has_faultable_memory_access) {
                             code->mov(code->x9, 0);
                             code->str(code->x9,
@@ -19273,18 +19397,32 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 if (!generic_chain_abi) {
                     EmitNativeFrameEntry(*code, generic_frame_layout);
                 }
-                // x21 is the async-signal-safe current fault descriptor.
-                // Every direct faultable access replaces it immediately before
-                // touching guest memory.
-                code->mov(code->x21, 0);
-                if (generic_relative_fault_publication_enabled) {
-                    EmitJitRelocatablePointer(
-                        *code,
-                        generic_has_local_backedge ? code->x27 : code->x22,
-                        reinterpret_cast<std::uint64_t>(
-                            generic_fault_publication_base));
+                const auto emit_resident_block_initialization = [&]() {
+                    // x21 is the async-signal-safe current fault descriptor.
+                    // Every direct faultable access replaces it immediately
+                    // before touching guest memory.
+                    code->mov(code->x21, 0);
+                    if (generic_relative_fault_publication_enabled) {
+                        EmitJitRelocatablePointer(
+                            *code,
+                            generic_has_local_backedge ? code->x27
+                                                       : code->x22,
+                            reinterpret_cast<std::uint64_t>(
+                                generic_fault_publication_base));
+                    }
+                };
+                std::size_t generic_static_gpr_entry_offset = 0;
+                emit_resident_block_initialization();
+                emit_reload_gpr_cache();
+                if (generic_chain_abi && generic_static_gpr_cache) {
+                    Xbyak_aarch64::Label after_static_gpr_entry;
+                    code->b(after_static_gpr_entry);
+                    generic_static_gpr_entry_offset = code->getSize();
+                    emit_resident_block_initialization();
+                    code->L(after_static_gpr_entry);
                 }
-                emit_reload_register_caches();
+                emit_reload_vector_cache();
+                generic_vector_half_known_zero.fill(false);
                 for (std::size_t descriptor_index = 0;
                      descriptor_index < generic_poll_fault_descriptor_count;
                      ++descriptor_index) {
@@ -26106,6 +26244,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         !generic_has_faultable_memory_access &&
                         JitLiveCheckedNativeEnabled();
                     if (generic_chain_abi && entry != nullptr) {
+                        if (static_gpr_entry_out != nullptr &&
+                            generic_static_gpr_entry_offset != 0) {
+                            *static_gpr_entry_out =
+                                reinterpret_cast<Arm64BlockEntry>(
+                                    reinterpret_cast<std::uintptr_t>(entry) +
+                                    generic_static_gpr_entry_offset);
+                        }
                         auto normal_entry_code = open_code_draft();
                         normal_entry_code->stp(
                             normal_entry_code->x29, normal_entry_code->x30,
