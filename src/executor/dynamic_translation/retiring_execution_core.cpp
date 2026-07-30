@@ -1896,7 +1896,7 @@ struct NativeFaultCachedRegister {
 
 struct NativeFaultRecoveryDescriptor {
     NativeFaultDescriptor instruction{};
-    std::array<NativeFaultCachedRegister, 8> gpr{};
+    std::array<NativeFaultCachedRegister, 16> gpr{};
     std::array<NativeFaultCachedRegister, 14> vector{};
     std::uint8_t gpr_count = 0;
     std::uint8_t vector_count = 0;
@@ -3352,7 +3352,7 @@ private:
     }
 
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607300013ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607300014ull;
     static constexpr std::uint64_t kSerializedDecodedOpLayoutToken = 344;
     static constexpr std::size_t kWriterBatchRecords = 2048;
     static constexpr std::size_t kMaxShardRecords = 2048;
@@ -16845,12 +16845,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                                  generic_leaf_hle_target);
                 constexpr std::uint32_t kNoCachedGprOffset =
                     std::numeric_limits<std::uint32_t>::max();
-                constexpr std::array<std::uint32_t, 8>
-                    kGenericCachedGprHostRegisters{23, 24, 25, 26, 4, 6, 7, 8};
+                constexpr std::size_t kStaticResidentGprCount = 8;
+                constexpr std::array<std::uint32_t, 12>
+                    kGenericCachedGprHostRegisters{
+                        23, 24, 25, 26, 4, 6, 7, 8, 1, 2, 3, 5};
                 constexpr bool generic_fault_write_through = false;
-                std::array<std::uint32_t, 8> generic_cached_gpr_offsets{};
+                std::array<std::uint32_t, 12> generic_cached_gpr_offsets{};
                 generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
-                std::array<bool, 8> generic_cached_gpr_dirty{};
+                std::array<bool, 12> generic_cached_gpr_dirty{};
                 bool generic_gpr_cache_eligible =
                     !generic_has_dynamic_control_terminator &&
                     !generic_has_call_terminator && !generic_has_ret_terminator &&
@@ -17057,14 +17059,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                     generic_cached_gpr_dirty.fill(false);
                     for (std::size_t cache_index = 0;
-                         cache_index < 4;
+                         cache_index < kStaticResidentGprCount;
                          ++cache_index) {
                         generic_cached_gpr_offsets[cache_index] =
                             static_cast<std::uint32_t>(
                                 cache_index * sizeof(std::uint64_t));
                         generic_cached_gpr_dirty[cache_index] = true;
                     }
-                    std::size_t local_cache_index = 4;
+                    std::size_t local_cache_index = kStaticResidentGprCount;
                     std::uint64_t saved_accesses = 0;
                     for (std::size_t candidate_index = 0;
                          candidate_index < candidate_count &&
@@ -17072,7 +17074,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                          ++candidate_index) {
                         const auto& candidate = candidates[candidate_index];
                         if (candidate.state_offset <
-                            4u * sizeof(std::uint64_t)) {
+                            kStaticResidentGprCount *
+                                sizeof(std::uint64_t)) {
                             continue;
                         }
                         generic_cached_gpr_offsets[local_cache_index] =
@@ -17460,14 +17463,16 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     for (std::size_t slot = 0;
                          slot < generic_vector_half_reads.size(); ++slot) {
                         const std::uint32_t write_through_cost =
-                            1u + generic_vector_half_writes[slot];
+                            static_cast<std::uint32_t>(
+                                !generic_has_local_backedge) +
+                            generic_vector_half_writes[slot];
                         const std::uint32_t write_through_savings =
                             generic_vector_half_reads[slot] > write_through_cost
                                 ? generic_vector_half_reads[slot] -
                                       write_through_cost
                                 : 0u;
                         const std::uint32_t writeback_cost =
-                            2u +
+                            (generic_has_local_backedge ? 0u : 2u) +
                             (compilation_tier == LocalJitTier::Tier0
                                  ? generic_vector_half_fault_publications[slot]
                                  : 0u);
@@ -17532,10 +17537,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 const bool generic_chain_abi = !JitLiveCheckedNativeEnabled();
                 const bool generic_strong_memory_sequence =
                     FastGuestMemoryEnabled();
-                const bool generic_strong_memory_sequence_has_write =
-                    generic_strong_memory_sequence &&
-                    (block_has_guest_memory_write() ||
-                     block_has_implicit_stack_memory_write());
                 std::array<const NativeFaultDescriptor*, 2>
                     generic_poll_fault_descriptors{};
                 std::size_t generic_poll_fault_descriptor_count = 0;
@@ -17802,7 +17803,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 };
                 std::uint32_t generic_vector_cache_written_mask = 0;
                 std::uint32_t generic_gpr_cache_written_mask =
-                    generic_static_gpr_cache ? 0x0fu : 0u;
+                    generic_static_gpr_cache
+                        ? (std::uint32_t{1} << kStaticResidentGprCount) - 1u
+                        : 0u;
                 const auto mark_cached_vector_half_written =
                     [&](const int host_index) {
                     if (cached_vector_half_is_writeback(host_index)) {
@@ -17847,7 +17850,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                 };
                 const auto emit_flush_gpr_cache =
-                    [&](const bool caller_saved_only = false) {
+                    [&](const bool local_only = false) {
                     for (std::size_t cache_index = 0;
                          cache_index < generic_cached_gpr_offsets.size();
                          ++cache_index) {
@@ -17856,7 +17859,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         const std::uint32_t host_register =
                             kGenericCachedGprHostRegisters[cache_index];
                         if (state_offset == kNoCachedGprOffset ||
-                            (caller_saved_only && host_register >= 19u) ||
+                            (local_only &&
+                             cache_index < kStaticResidentGprCount) ||
                             !generic_cached_gpr_dirty[cache_index] ||
                             (generic_gpr_cache_written_mask &
                              (std::uint32_t{1} << cache_index)) == 0) {
@@ -17867,7 +17871,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             Xbyak_aarch64::ptr(code->x19, state_offset));
                     }
                 };
-                const auto emit_reload_gpr_cache = [&](const bool caller_saved_only = false) {
+                const auto emit_reload_gpr_cache =
+                    [&](const bool caller_saved_only = false,
+                        const bool local_only = false) {
                     for (std::size_t cache_index = 0;
                          cache_index < generic_cached_gpr_offsets.size();
                          ++cache_index) {
@@ -17876,6 +17882,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         const std::uint32_t host_register =
                             kGenericCachedGprHostRegisters[cache_index];
                         if (state_offset == kNoCachedGprOffset ||
+                            (local_only &&
+                             cache_index < kStaticResidentGprCount) ||
                             (caller_saved_only && host_register >= 19u)) {
                             continue;
                         }
@@ -17992,9 +18000,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     emit_reload_register_caches();
                 };
                 const auto emit_epilogue_restore = [&]() {
-                    if (generic_strong_memory_sequence_has_write) {
-                        code->dmb(Xbyak_aarch64::ISHST);
-                    }
                     emit_flush_register_caches();
                     emit_sync_native_edge_phase();
                     if (generic_has_faultable_memory_access) {
@@ -18037,9 +18042,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     Xbyak_aarch64::Label chain;
                     Xbyak_aarch64::Label fallback;
                     EmitJitRelocatablePointer(
-                        *code, code->x9,
-                        reinterpret_cast<std::uint64_t>(&edge_slot->target));
-                    code->ldar(code->x16, Xbyak_aarch64::ptr(code->x9));
+                        *code, code->x17,
+                        reinterpret_cast<std::uint64_t>(edge_slot));
+                    code->ldar(code->x16, Xbyak_aarch64::ptr(code->x17));
                     code->cbz(code->x16, fallback);
 
                     if (force_validation) {
@@ -18099,9 +18104,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->str(code->x9,
                               Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
                     if (generic_chain_abi) {
-                        EmitJitRelocatablePointer(
-                            *code, code->x17,
-                            reinterpret_cast<std::uint64_t>(edge_slot));
                         emit_flush_register_caches_for_edge(code->x17);
                         if (generic_has_faultable_memory_access) {
                             code->mov(code->x9, 0);
@@ -18187,6 +18189,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->blr(code->x16);
                     emit_reload_native_edge_phase();
                     emit_reload_register_caches(true);
+                    EmitJitRelocatablePointer(
+                        *code, code->x9,
+                        reinterpret_cast<std::uint64_t>(indirect_edge_fanout));
                     code->mov(code->x13, code->x0);
                     code->cbz(code->x13, fallback);
 
@@ -18236,9 +18241,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                       kStateNativeEdgePhaseOffset));
                     }
                     code->L(chain);
-                    EmitJitRelocatablePointer(
-                        *code, code->x9,
-                        reinterpret_cast<std::uint64_t>(indirect_edge_fanout));
                     code->add(code->x12, code->x9,
                               static_cast<std::uint32_t>(
                                   offsetof(IndirectEdgeFanout, active)));
@@ -18548,7 +18550,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                   Xbyak_aarch64::ptr(code->sp, 48));
                         code->stp(code->x17, code->xzr,
                                   Xbyak_aarch64::ptr(code->sp, 64));
-                        emit_flush_vector_cache();
+                        emit_flush_register_caches();
                         code->mov(code->x0, ir.guest_rip);
                         code->mov(code->x1, code->x14);
                         code->mov(code->x2, size_bytes);
@@ -18559,6 +18561,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emit_sync_native_edge_phase();
                         code->blr(code->x16);
                         emit_reload_native_edge_phase();
+                        emit_reload_register_caches(true);
                         code->ldp(code->x9, code->x10,
                                   Xbyak_aarch64::ptr(code->sp, 0));
                         code->ldp(code->x11, code->x12,
@@ -19406,7 +19409,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->b(after_static_gpr_entry);
                     generic_static_gpr_entry_offset = code->getSize();
                     emit_resident_block_initialization();
-                    emit_reload_gpr_cache(true);
+                    emit_reload_gpr_cache(false, true);
                     code->L(after_static_gpr_entry);
                 }
                 emit_reload_vector_cache();
@@ -19433,9 +19436,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                    ? kTier0PromotionLoopSamplePeriod
                                    : kTieredLoopSafepointPeriod);
                     code->mov(code->x22, loop_safepoint_period);
-                }
-                if (generic_strong_memory_sequence_has_write) {
-                    code->dmb(Xbyak_aarch64::ISHST);
                 }
                 bool emitted = true;
                 std::uint64_t emitted_simd_fast = 0;
@@ -26129,9 +26129,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->L(take);
                         if (generic_has_local_backedge) {
                             code->subs(code->x22, code->x22, 1);
-                            if (generic_strong_memory_sequence_has_write) {
-                                code->dmb(Xbyak_aarch64::ISHST);
-                            }
                             code->cbnz(code->x22, local_loop_body);
                         }
                         if (!deferred_compare_exit) {
