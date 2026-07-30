@@ -2339,7 +2339,14 @@ bool ExecuteHostBlockWithSynchronousFaultResume(Arm64BlockEntry entry, LsxMachin
 
 bool ExecuteHostBlockWithSignalContextFaultReturn(
     Arm64BlockEntry entry, LsxMachineImage* state, std::uint64_t& result,
-    JitDeferredGuestFault* deferred_fault) {
+    JitDeferredGuestFault* deferred_fault
+#if defined(__ANDROID__) && defined(__aarch64__)
+    ,
+    JitDeferredGuestFault* deferred_guest_fault_slot,
+    volatile sig_atomic_t* signal_context_armed_slot,
+    volatile std::uintptr_t* signal_context_return_sp_slot
+#endif
+) {
     if (entry == nullptr || state == nullptr) {
         return false;
     }
@@ -2347,28 +2354,28 @@ bool ExecuteHostBlockWithSignalContextFaultReturn(
         *deferred_fault = {};
     }
 #if defined(__ANDROID__) && defined(__aarch64__)
-    g_jit_deferred_guest_fault = {};
-    g_jit_signal_context_return_sp = 0;
-    g_jit_signal_context_fault_return_armed = 1;
+    *deferred_guest_fault_slot = {};
+    *signal_context_return_sp_slot = 0;
+    *signal_context_armed_slot = 1;
     std::atomic_signal_fence(std::memory_order_seq_cst);
     try {
         result = InvokeHostBlockWithSignalLanding(
-            entry, state, &g_jit_signal_context_return_sp);
+            entry, state, signal_context_return_sp_slot);
     } catch (...) {
-        g_jit_signal_context_fault_return_armed = 0;
-        g_jit_signal_context_return_sp = 0;
+        *signal_context_armed_slot = 0;
+        *signal_context_return_sp_slot = 0;
         throw;
     }
-    g_jit_signal_context_fault_return_armed = 0;
-    g_jit_signal_context_return_sp = 0;
+    *signal_context_armed_slot = 0;
+    *signal_context_return_sp_slot = 0;
     std::atomic_signal_fence(std::memory_order_seq_cst);
-    if (g_jit_deferred_guest_fault.valid == 0) {
+    if (deferred_guest_fault_slot->valid == 0) {
         return false;
     }
     if (deferred_fault != nullptr) {
-        *deferred_fault = g_jit_deferred_guest_fault;
+        *deferred_fault = *deferred_guest_fault_slot;
     }
-    g_jit_deferred_guest_fault = {};
+    *deferred_guest_fault_slot = {};
     if (g_current_fault_state == state) {
         state->native_fault_ir = 0;
         g_current_fault_ir = nullptr;
@@ -5900,6 +5907,10 @@ public:
             &g_jit_fault_resume_frame;
         auto* const deferred_guest_fault_slot =
             &g_jit_deferred_guest_fault;
+        auto* const signal_context_fault_return_armed_slot =
+            &g_jit_signal_context_fault_return_armed;
+        auto* const signal_context_return_sp_slot =
+            &g_jit_signal_context_return_sp;
 #endif
         auto* previous_state = ExchangeDiagnosticMachineImage(&state);
         const LsxDecodedRegion* previous_active_block = *active_block_slot;
@@ -6076,7 +6087,14 @@ public:
                 if (signal_context_fault_return) {
                     synchronous_fault_resumed =
                         ExecuteHostBlockWithSignalContextFaultReturn(
-                            block.entry, &state, result, &deferred_fault);
+                            block.entry, &state, result, &deferred_fault
+#if defined(__ANDROID__) && defined(__aarch64__)
+                            ,
+                            deferred_guest_fault_slot,
+                            signal_context_fault_return_armed_slot,
+                            signal_context_return_sp_slot
+#endif
+                        );
                 } else if (needs_synchronous_fault_resume) {
                     synchronous_fault_resumed =
                         ExecuteHostBlockWithSynchronousFaultResume(
@@ -11615,18 +11633,24 @@ executor_jit_defer_synchronous_guest_fault(
             static_cast<const ucontext_t*>(raw_context);
         const std::uint64_t descriptor =
             context->uc_mcontext.regs[21];
-        if (descriptor == 0) {
+        if (descriptor == 0 && generated_fault) {
             return 0;
         }
-        const std::uint64_t legacy_slot =
-            reinterpret_cast<std::uint64_t>(
-                std::addressof(fault_state->native_fault_ir));
-        if (descriptor != legacy_slot) {
-            fault_state->native_fault_ir = descriptor;
+        if (descriptor != 0) {
+            const std::uint64_t legacy_slot =
+                reinterpret_cast<std::uint64_t>(
+                    std::addressof(fault_state->native_fault_ir));
+            if (descriptor != legacy_slot) {
+                fault_state->native_fault_ir = descriptor;
+            }
+        } else if (!CurrentPublishedFaultInstruction()) {
+            return 0;
         }
-        fault_state->native_edge_phase =
-            static_cast<std::uint32_t>(
-                context->uc_mcontext.regs[28]);
+        if (generated_fault) {
+            fault_state->native_edge_phase =
+                static_cast<std::uint32_t>(
+                    context->uc_mcontext.regs[28]);
+        }
     }
     if (generated_fault &&
         !RestoreTieredFaultRegisterCaches(
@@ -17055,12 +17079,15 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 constexpr std::array<std::uint32_t, 12>
                     kGenericCachedGprHostRegisters{
                         23, 24, 25, 26, 4, 6, 7, 8, 1, 2, 3, 5};
-                const bool generic_fault_write_through =
-                    generic_has_faultable_memory_access &&
-                    compilation_tier == LocalJitTier::Tier2 &&
-                    (generic_has_local_backedge ||
-                     (tiered_guards != nullptr &&
-                      !tiered_guards->empty()));
+                // Faultable T2 regions retain the same write-back register
+                // residency as non-faultable regions. Each direct fault site
+                // publishes a NativeFaultRecoveryDescriptor that maps live
+                // guest GPR/SIMD values to their host registers; the signal
+                // route snapshots those registers before guest delivery.
+                // Guard/helper exits already flush caches at their explicit
+                // ABI boundaries, so forcing every T2 write through memory
+                // only discarded the principal benefit of region formation.
+                constexpr bool generic_fault_write_through = false;
                 std::array<std::uint32_t, 12> generic_cached_gpr_offsets{};
                 generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                 std::array<bool, 12> generic_cached_gpr_dirty{};
