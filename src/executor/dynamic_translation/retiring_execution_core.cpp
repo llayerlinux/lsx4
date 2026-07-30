@@ -3352,7 +3352,7 @@ private:
     }
 
     static constexpr std::uint64_t kPersistentIrAbiVersion = 0x202607190001ull;
-    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607300012ull;
+    static constexpr std::uint64_t kPersistentNativeSemanticAbiVersion = 0x202607300013ull;
     static constexpr std::uint64_t kSerializedDecodedOpLayoutToken = 344;
     static constexpr std::size_t kWriterBatchRecords = 2048;
     static constexpr std::size_t kMaxShardRecords = 2048;
@@ -18099,9 +18099,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->str(code->x9,
                               Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
                     if (generic_chain_abi) {
-                        if (generic_strong_memory_sequence_has_write) {
-                            code->dmb(Xbyak_aarch64::ISHST);
-                        }
                         EmitJitRelocatablePointer(
                             *code, code->x17,
                             reinterpret_cast<std::uint64_t>(edge_slot));
@@ -18263,9 +18260,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emit_epilogue_restore();
                         code->br(code->x16);
                         code->L(resident_target);
-                        if (generic_strong_memory_sequence_has_write) {
-                            code->dmb(Xbyak_aarch64::ISHST);
-                        }
                         emit_flush_register_caches_for_edge(code->x13);
                         if (generic_has_faultable_memory_access) {
                             code->mov(code->x9, 0);
