@@ -4265,6 +4265,7 @@ struct TraceValidationRecord {
     Arm64BlockEntry baseline_static_gpr_entry = nullptr;
     const PublishedCodeWitness* baseline_witness = nullptr;
     std::vector<TraceValidationMember> members{};
+    bool loop_head_osr = false;
     // Successful trace entries are sampled at the outbound safepoint. Keep
     // the estimate on the trace itself so a rare guard exit is judged by its
     // rate, rather than eventually retiring every long-lived hot trace.
@@ -5862,7 +5863,9 @@ public:
     }
 
     void RecordTieredEdge(std::uint64_t source_rip,
-                          std::uint64_t target_rip) noexcept;
+                          std::uint64_t target_rip,
+                          std::uint64_t trace_growth_seed = 0,
+                          bool trace_growth_loop_osr = false) noexcept;
     std::uint64_t HandleTieredGuardDeopt(
         TieredGuardDeoptContext& context) noexcept;
     void RetirePublishedDestination(
@@ -6104,9 +6107,10 @@ public:
                     needs_synchronous_fault_resume &&
                     TranslationHasFeature(
                         block.flags, TranslationFeature::NativeCode) &&
-                    decoded_block != nullptr &&
                     !JitLiveCheckedNativeEnabled() &&
-                    BlockSupportsSignalContextFaultReturn(*decoded_block);
+                    TranslationHasFeature(
+                        block.flags,
+                        TranslationFeature::SignalContextFaultReturn);
                 if (signal_context_fault_return) {
                     synchronous_fault_resumed =
                         ExecuteHostBlockWithSignalContextFaultReturn(
@@ -6611,6 +6615,7 @@ public:
             bool references_runtime_region = false;
             bool references_runtime_instruction = false;
             bool synchronous_fault_resume = false;
+            bool signal_context_fault_return = false;
             bool dispatcher_boundary = false;
             bool return_terminator = false;
             bool backward_vector_loop = false;
@@ -6807,6 +6812,9 @@ public:
             }
             plan.synchronous_fault_resume =
                 BlockNeedsSynchronousFaultResume(decoded);
+            plan.signal_context_fault_return =
+                plan.synchronous_fault_resume &&
+                BlockSupportsSignalContextFaultReturn(decoded);
             plan.dispatcher_boundary =
                 BlockRequiresDispatcherBoundary(decoded) ||
                 IsDirectHleBoundary(decoded.start_rip);
@@ -6945,6 +6953,11 @@ public:
                 if (plan.synchronous_fault_resume) {
                     TranslationEnableFeature(
                         result.flags, TranslationFeature::SynchronousFaultResume);
+                }
+                if (plan.signal_context_fault_return) {
+                    TranslationEnableFeature(
+                        result.flags,
+                        TranslationFeature::SignalContextFaultReturn);
                 }
                 if (plan.dispatcher_boundary) {
                     TranslationEnableFeature(
@@ -8025,6 +8038,11 @@ public:
         if (BlockNeedsSynchronousFaultResume(*decoded)) {
             TranslationEnableFeature(result.flags,
                                      TranslationFeature::SynchronousFaultResume);
+            if (BlockSupportsSignalContextFaultReturn(*decoded)) {
+                TranslationEnableFeature(
+                    result.flags,
+                    TranslationFeature::SignalContextFaultReturn);
+            }
         }
         if (BlockRequiresDispatcherBoundary(*decoded) ||
             IsDirectHleBoundary(guest_rip)) {
@@ -8895,7 +8913,9 @@ void RetiringTranslationRuntime::FlushTieredEdgeProfile() noexcept {
 
 void RetiringTranslationRuntime::RecordTieredEdge(
     const std::uint64_t source_rip,
-    const std::uint64_t target_rip) noexcept {
+    const std::uint64_t target_rip,
+    const std::uint64_t trace_growth_seed,
+    const bool trace_growth_loop_osr) noexcept {
     if (!TieredJitEnabled() || TieredJitDiagnosticModeActive() ||
         source_rip == 0 || target_rip == 0) {
         return;
@@ -9060,8 +9080,14 @@ void RetiringTranslationRuntime::RecordTieredEdge(
         if (JitTraceCompilationEnabled() && stable_target &&
             profile.total_samples >= profile.retry_after_samples) {
             queued_target = *stable_target;
-            queued_loop_osr = queued_target <= source_rip;
-            queued_seed = queued_loop_osr ? queued_target : source_rip;
+            queued_loop_osr =
+                trace_growth_seed != 0
+                    ? trace_growth_loop_osr
+                    : queued_target <= source_rip;
+            queued_seed =
+                trace_growth_seed != 0
+                    ? trace_growth_seed
+                    : (queued_loop_osr ? queued_target : source_rip);
             const auto seed_profile = tiered_edge_profiles_.find(queued_seed);
             const bool seed_is_queued =
                 seed_profile != tiered_edge_profiles_.end() &&
@@ -9076,6 +9102,8 @@ void RetiringTranslationRuntime::RecordTieredEdge(
                     profile.queued = true;
                 } else {
                     tiered_edge_profiles_[queued_seed].queued = true;
+                }
+                if (queued_loop_osr) {
                     tiered_loop_seed_requests_.insert(queued_seed);
                 }
                 tiered_compile_queue_.push_back(queued_seed);
@@ -9515,6 +9543,26 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             return;
         }
 
+        std::uint64_t replaceable_active_bytes = 0;
+        bool active_trace_is_not_narrower = false;
+        {
+            std::lock_guard edge_lock{edge_graph_mutex_};
+            const auto current = active_tiered_traces_.find(plan.seed_rip);
+            if (current != active_tiered_traces_.end() &&
+                current->second != nullptr) {
+                const TieredTraceArtifact& active = *current->second;
+                if (plan.members.size() <= active.member_blocks) {
+                    active_trace_is_not_narrower = true;
+                } else {
+                    replaceable_active_bytes = active.generated_bytes;
+                }
+            }
+        }
+        if (active_trace_is_not_narrower) {
+            reject();
+            return;
+        }
+
         std::vector<std::unique_ptr<TieredGuardDeoptContext>>
             guard_contexts;
         guard_contexts.reserve(plan.guards.size());
@@ -9686,9 +9734,15 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         }
         constexpr std::uint64_t kTieredCodeBudget =
             128u * 1024u * 1024u;
+        const std::uint64_t active_code_bytes =
+            tiered_active_code_bytes_.load(std::memory_order_acquire);
+        const std::uint64_t retained_active_code_bytes =
+            active_code_bytes >= replaceable_active_bytes
+                ? active_code_bytes - replaceable_active_bytes
+                : 0;
         if (generated_bytes == 0 ||
             generated_bytes > kTieredCodeBudget ||
-            tiered_active_code_bytes_.load(std::memory_order_acquire) >
+            retained_active_code_bytes >
                 kTieredCodeBudget - generated_bytes) {
             reject();
             return;
@@ -9711,6 +9765,7 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         artifact->guest_instructions =
             static_cast<std::uint32_t>(plan.combined.instructions.size());
         artifact->validation->seed_rip = plan.seed_rip;
+        artifact->validation->loop_head_osr = plan.loop_head_osr;
         for (const auto& member : plan.members) {
             artifact->validation->members.push_back(
                 {member.witness, member.revision});
@@ -9732,24 +9787,49 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             }
         }
 
-        std::lock_guard edge_lock{edge_graph_mutex_};
+        std::unique_lock edge_lock{edge_graph_mutex_};
         const PublishedDestination* const published =
             edge_directory_.FindPublished(plan.seed_rip);
         if (published == nullptr || published->external_entry == nullptr ||
-            published->code_witness != plan.members.front().witness ||
-            published->trace_validation != nullptr) {
+            published->code_witness != plan.members.front().witness) {
+            edge_lock.unlock();
             block_lock.unlock();
             reject();
             return;
         }
-        artifact->validation->baseline_external_entry =
-            published->external_entry;
-        artifact->validation->baseline_resident_entry =
-            published->resident_entry;
-        artifact->validation->baseline_static_gpr_entry =
-            published->static_gpr_entry;
-        artifact->validation->baseline_witness =
-            published->code_witness;
+        TieredTraceArtifact* replaced_trace = nullptr;
+        if (published->trace_validation != nullptr) {
+            const auto current =
+                active_tiered_traces_.find(plan.seed_rip);
+            if (current == active_tiered_traces_.end() ||
+                current->second == nullptr ||
+                current->second->validation.get() !=
+                    published->trace_validation ||
+                plan.members.size() <= current->second->member_blocks) {
+                edge_lock.unlock();
+                block_lock.unlock();
+                reject();
+                return;
+            }
+            replaced_trace = current->second;
+            artifact->validation->baseline_external_entry =
+                replaced_trace->validation->baseline_external_entry;
+            artifact->validation->baseline_resident_entry =
+                replaced_trace->validation->baseline_resident_entry;
+            artifact->validation->baseline_static_gpr_entry =
+                replaced_trace->validation->baseline_static_gpr_entry;
+            artifact->validation->baseline_witness =
+                replaced_trace->validation->baseline_witness;
+        } else {
+            artifact->validation->baseline_external_entry =
+                published->external_entry;
+            artifact->validation->baseline_resident_entry =
+                published->resident_entry;
+            artifact->validation->baseline_static_gpr_entry =
+                published->static_gpr_entry;
+            artifact->validation->baseline_witness =
+                published->code_witness;
+        }
         if (primary != nullptr) {
             primary->source_trace_validation.store(
                 artifact->validation.get(), std::memory_order_release);
@@ -9761,6 +9841,16 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         artifact->validation->active.store(true, std::memory_order_release);
         TieredTraceArtifact* const active = artifact.get();
         tiered_trace_artifacts_.push_back(std::move(artifact));
+        if (replaced_trace != nullptr) {
+            replaced_trace->validation->active.store(
+                false, std::memory_order_release);
+            tiered_active_code_bytes_.fetch_sub(
+                replaced_trace->generated_bytes,
+                std::memory_order_release);
+            SaturatingDecrement(g_tiered_counts.active);
+            g_tiered_counts.retired.fetch_add(
+                1, std::memory_order_relaxed);
+        }
         active_tiered_traces_[plan.seed_rip] = active;
         edge_directory_.PublishAndConnect(
             plan.seed_rip,
@@ -9769,6 +9859,12 @@ void RetiringTranslationRuntime::CompileTieredTrace(
              active->validation.get(), active->static_gpr_entry});
         tiered_active_code_bytes_.fetch_add(
             generated_bytes, std::memory_order_release);
+        edge_lock.unlock();
+        block_lock.unlock();
+        {
+            std::lock_guard profile_lock{tiered_profile_mutex_};
+            tiered_edge_profiles_[plan.seed_rip].queued = false;
+        }
         g_tiered_counts.compiled.fetch_add(1, std::memory_order_relaxed);
         if (faultable_trace) {
             g_tiered_counts.faultable_compiled.fetch_add(
@@ -11924,14 +12020,17 @@ Arm64BlockEntry ValidateObservedDirectTargetAtSafepointPeriod(
         const TraceValidationRecord* const trace =
             slot->source_trace_validation.load(std::memory_order_acquire);
         if (trace == nullptr) {
-            // Baseline/T1 paths still need samples for promotion and path
-            // changes. An active trace's hot exit is already the selected
-            // path, however; continually feeding it back into PGO only
-            // saturates the shared profile and disk flush threshold. Its cold
-            // guard exits are recorded separately by HandleTieredGuardDeopt.
             slot->owner->RecordTieredEdge(
                 slot->source_rip, slot->guest_rip);
         } else {
+            // Keep profiling the final edge at the existing sparse witness
+            // safepoint. This lets a short trace grow after its successor has
+            // become native or a conditional path has accumulated enough live
+            // evidence. RecordTieredEdge's thread-local sketch removes the
+            // shared-map cost after the short dense validation window.
+            slot->owner->RecordTieredEdge(
+                slot->source_rip, slot->guest_rip, trace->seed_rip,
+                trace->loop_head_osr);
             trace->estimated_entries.fetch_add(
                 sample_period, std::memory_order_relaxed);
             g_tiered_counts.entries.fetch_add(
