@@ -170,6 +170,7 @@ enum class TranslationFeature : std::uint32_t {
     SynchronousFaultResume = 1u << 4u,
     DispatcherBoundary = 1u << 5u,
     ReturnTerminator = 1u << 6u,
+    SignalContextFaultReturn = 1u << 7u,
 };
 
 constexpr std::uint32_t TranslationFeatureMask(const TranslationFeature feature) noexcept {
