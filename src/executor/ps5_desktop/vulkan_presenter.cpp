@@ -328,6 +328,7 @@ struct Presenter {
     std::uint64_t mobile_frame_count{};
     std::uint64_t mobile_pressure_frames{};
     std::uint64_t mobile_relaxed_frames{};
+    bool mobile_new_frame_backlog_observed{};
 };
 
 std::mutex g_mutex;
@@ -1783,8 +1784,7 @@ bool CreateDeviceAndSurface(Presenter& presenter,
             128u * 1024u * 1024u,
             512u * 1024u * 1024u);
     }
-    presenter.mobile_scale_percent =
-        g_mobile_gpu_enabled ? 75u : 100u;
+    presenter.mobile_scale_percent = 100u;
     presenter.mobile_pending_scale_percent =
         presenter.mobile_scale_percent;
     g_mobile_gpu_stats.effective_scale_percent.store(
@@ -2670,19 +2670,21 @@ void UpdateMobileScalePolicy(
     const VulkanGuestFrame& frame) {
     if (!g_mobile_gpu_enabled) {
         presenter.mobile_pending_scale_percent = 100u;
+        presenter.mobile_new_frame_backlog_observed = false;
         return;
     }
     ++presenter.mobile_frame_count;
     const auto draw_count = GuestFrameDrawCount(frame);
-    if (draw_count >= 180u) {
+    const bool gpu_pressure =
+        std::exchange(
+            presenter.mobile_new_frame_backlog_observed, false) &&
+        draw_count >= 180u;
+    if (gpu_pressure) {
         ++presenter.mobile_pressure_frames;
         presenter.mobile_relaxed_frames = 0u;
-    } else if (draw_count <= 48u) {
+    } else {
         ++presenter.mobile_relaxed_frames;
         presenter.mobile_pressure_frames = 0u;
-    } else {
-        presenter.mobile_pressure_frames = 0u;
-        presenter.mobile_relaxed_frames = 0u;
     }
     if (presenter.mobile_pressure_frames >= 45u &&
         presenter.mobile_pending_scale_percent > 50u) {
@@ -2699,6 +2701,16 @@ void UpdateMobileScalePolicy(
                 presenter.mobile_pending_scale_percent + 5u);
         presenter.mobile_relaxed_frames = 0u;
     }
+}
+
+void RecordMobileNewFrameBacklog(
+    Presenter& presenter,
+    const VulkanGuestFrame& frame) {
+    if (!g_mobile_gpu_enabled || frame.batch_id == 0u ||
+        frame.batch_id == presenter.last_guest_batch_id) {
+        return;
+    }
+    presenter.mobile_new_frame_backlog_observed = true;
 }
 
 void ApplyPendingMobileScale(
@@ -4525,6 +4537,7 @@ bool SubmitGuestPasses(Presenter& presenter,
         const auto fence_status = vkGetFenceStatus(
             presenter.device, presenter.fence);
         if (fence_status == VK_NOT_READY) {
+            RecordMobileNewFrameBacklog(presenter, frame);
             const auto backlog =
                 g_mobile_gpu_stats.max_gpu_backlog.load(
                     std::memory_order_relaxed);
@@ -4998,6 +5011,7 @@ bool SubmitGuestFrame(Presenter& presenter,
         const auto fence_status = vkGetFenceStatus(
             presenter.device, presenter.fence);
         if (fence_status == VK_NOT_READY) {
+            RecordMobileNewFrameBacklog(presenter, frame);
             const auto backlog =
                 g_mobile_gpu_stats.max_gpu_backlog.load(
                     std::memory_order_relaxed);
@@ -9713,12 +9727,12 @@ void SetVulkanMobileGpuEnabled(const bool enabled) {
         (void)vkDeviceWaitIdle(g_presenter.device);
     }
     g_mobile_gpu_enabled = enabled;
-    g_presenter.mobile_scale_percent =
-        enabled ? 75u : 100u;
+    g_presenter.mobile_scale_percent = 100u;
     g_presenter.mobile_pending_scale_percent =
         g_presenter.mobile_scale_percent;
     g_presenter.mobile_pressure_frames = 0u;
     g_presenter.mobile_relaxed_frames = 0u;
+    g_presenter.mobile_new_frame_backlog_observed = false;
     g_mobile_gpu_stats.effective_scale_percent.store(
         g_presenter.mobile_scale_percent,
         std::memory_order_relaxed);
