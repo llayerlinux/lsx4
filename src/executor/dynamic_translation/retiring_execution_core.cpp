@@ -5374,9 +5374,10 @@ std::uint64_t JitNativeCacheAbiId() noexcept {
     // used an NZCV-clobbering alignment test, and tag 7 was the narrower
     // private-stack experiment. Tag 11 keeps the Box64-style strong-memory
     // sequences introduced by tag 9 and adds the non-faultable fast execution
-    // contract: direct dispatch plus conservative T0 scalar residency.
+    // contract: direct dispatch plus conservative T0 scalar residency. Tag 15
+    // makes every faultable T2 register write memory-authoritative.
     constexpr std::uint64_t kStrongMemorySequenceAbiTag =
-        0x000000000000000bull;
+        0x000000000000000full;
     return kStrictMemoryAbi ^
            (FastGuestMemoryEnabled()
                 ? kStrongMemorySequenceAbiTag
@@ -7305,84 +7306,11 @@ public:
             StartTieredWorker();
             tiered_worker_cv_.notify_one();
         }
-        // Title-bound PGO previously warmed T1 only. T2 then waited for a
-        // fresh sparse edge sample even when the persistent profile already
-        // contained a strongly dominant forward chain, leaving TRACE nearly
-        // idle throughout mobile gameplay. Queue a bounded set of the hottest
-        // forward seeds now. BuildTieredTracePlan still revalidates every
-        // member and refuses imported conditional guards until live samples
-        // confirm them, so stale phase-specific paths remain exact fallbacks.
-        struct WarmTraceCandidate {
-            std::uint64_t seed = 0;
-            std::uint64_t samples = 0;
-        };
-        std::vector<WarmTraceCandidate> warm_trace_candidates;
-        if (JitTraceCompilationEnabled()) {
-            std::lock_guard profile_lock{tiered_profile_mutex_};
-            warm_trace_candidates.reserve(
-                std::min<std::size_t>(
-                    tiered_edge_profiles_.size(), 512u));
-            for (const auto& [source, profile] :
-                 tiered_edge_profiles_) {
-                if (source == 0 || profile.queued ||
-                    profile.total_samples < 64u ||
-                    profile.targets.empty()) {
-                    continue;
-                }
-                const auto dominant = std::ranges::max_element(
-                    profile.targets, {}, [](const auto& item) {
-                        return item.second;
-                    });
-                if (dominant == profile.targets.end() ||
-                    dominant->first <= source ||
-                    dominant->second * 100u <
-                        profile.total_samples * 95u) {
-                    continue;
-                }
-                warm_trace_candidates.push_back(
-                    {source, profile.total_samples});
-            }
-        }
-        std::sort(
-            warm_trace_candidates.begin(),
-            warm_trace_candidates.end(),
-            [](const WarmTraceCandidate& lhs,
-               const WarmTraceCandidate& rhs) {
-                return lhs.samples > rhs.samples;
-            });
-        constexpr std::size_t kWarmTraceQueueLimit = 2048;
-        if (warm_trace_candidates.size() >
-            kWarmTraceQueueLimit) {
-            warm_trace_candidates.resize(
-                kWarmTraceQueueLimit);
-        }
-        std::size_t warm_traces_queued = 0;
-        if (!warm_trace_candidates.empty()) {
-            std::lock_guard profile_lock{tiered_profile_mutex_};
-            for (const WarmTraceCandidate& candidate :
-                 warm_trace_candidates) {
-                TieredEdgeProfile& profile =
-                    tiered_edge_profiles_[candidate.seed];
-                if (profile.queued) {
-                    continue;
-                }
-                profile.queued = true;
-                tiered_compile_queue_.push_back(candidate.seed);
-                ++warm_traces_queued;
-            }
-        }
-        if (warm_traces_queued != 0) {
-            g_tiered_counts.queued.fetch_add(
-                warm_traces_queued,
-                std::memory_order_relaxed);
-            JitLog(
-                "[EXECUTOR_TIERED_WARM_QUEUE] queued=%zu "
-                "candidates=%zu",
-                warm_traces_queued,
-                warm_trace_candidates.size());
-            StartTieredWorker();
-            tiered_worker_cv_.notify_one();
-        }
+        // Imported T2 profiles are hints, not startup work. Enqueuing the
+        // complete title profile here made the compiler contend with the
+        // dispatcher while the game was still discovering its boot path.
+        // RecordTieredEdge queues an imported seed after it is observed live,
+        // preserving title PGO without turning TRACE into a loading penalty.
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
         JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=1 "
@@ -17079,15 +17007,15 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 constexpr std::array<std::uint32_t, 12>
                     kGenericCachedGprHostRegisters{
                         23, 24, 25, 26, 4, 6, 7, 8, 1, 2, 3, 5};
-                // Faultable T2 regions retain the same write-back register
-                // residency as non-faultable regions. Each direct fault site
-                // publishes a NativeFaultRecoveryDescriptor that maps live
-                // guest GPR/SIMD values to their host registers; the signal
-                // route snapshots those registers before guest delivery.
-                // Guard/helper exits already flush caches at their explicit
-                // ABI boundaries, so forcing every T2 write through memory
-                // only discarded the principal benefit of region formation.
-                constexpr bool generic_fault_write_through = false;
+                // Until every direct fault site can reconstruct all dirty
+                // guest registers from host-register metadata, memory must
+                // remain authoritative throughout faultable T2 code. A stale
+                // address/size reaching memcpy eventually corrupts Vulkan
+                // transfer descriptors. Non-faultable T2 retains write-back
+                // residency and zero-materialization region edges.
+                const bool generic_fault_write_through =
+                    compilation_tier == LocalJitTier::Tier2 &&
+                    generic_has_faultable_memory_access;
                 std::array<std::uint32_t, 12> generic_cached_gpr_offsets{};
                 generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                 std::array<bool, 12> generic_cached_gpr_dirty{};
