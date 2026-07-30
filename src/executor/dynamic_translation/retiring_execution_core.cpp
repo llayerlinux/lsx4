@@ -2217,6 +2217,7 @@ void RestoreJitFaultResume(JitSynchronousFaultResumeFrame*) {
 
 thread_local JitSynchronousFaultResumeFrame* g_jit_fault_resume_frame = nullptr;
 thread_local JitDeferredGuestFault g_jit_deferred_guest_fault{};
+thread_local volatile sig_atomic_t g_jit_signal_context_fault_return_armed = 0;
 
 void PrepareFaultResumeFrame(
     JitSynchronousFaultResumeFrame& frame, LsxMachineImage* const state,
@@ -2237,6 +2238,20 @@ void RemoveFaultResumeFrame(
     JitSynchronousFaultResumeFrame** const slot) noexcept {
     frame.armed = 0;
     *slot = frame.previous;
+}
+
+extern "C" __attribute__((naked, noinline, used))
+std::uint64_t ReturnFromJitSignalContextFault() {
+    asm volatile(
+        "bti c\n"
+        "ldp x27, x28, [sp, #80]\n"
+        "ldp x25, x26, [sp, #64]\n"
+        "ldp x23, x24, [sp, #48]\n"
+        "ldp x21, x22, [sp, #32]\n"
+        "ldp x19, x20, [sp, #16]\n"
+        "ldp x29, x30, [sp], #96\n"
+        "mov x0, xzr\n"
+        "ret\n");
 }
 #endif
 
@@ -2299,6 +2314,45 @@ bool ExecuteHostBlockWithSynchronousFaultResume(Arm64BlockEntry entry, LsxMachin
 #endif
 }
 
+bool ExecuteHostBlockWithSignalContextFaultReturn(
+    Arm64BlockEntry entry, LsxMachineImage* state, std::uint64_t& result,
+    JitDeferredGuestFault* deferred_fault) {
+    if (entry == nullptr || state == nullptr) {
+        return false;
+    }
+    if (deferred_fault != nullptr) {
+        *deferred_fault = {};
+    }
+#if defined(__ANDROID__) && defined(__aarch64__)
+    g_jit_deferred_guest_fault = {};
+    g_jit_signal_context_fault_return_armed = 1;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    try {
+        result = InvokeHostBlockUnchecked(entry, state);
+    } catch (...) {
+        g_jit_signal_context_fault_return_armed = 0;
+        throw;
+    }
+    g_jit_signal_context_fault_return_armed = 0;
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    if (g_jit_deferred_guest_fault.valid == 0) {
+        return false;
+    }
+    if (deferred_fault != nullptr) {
+        *deferred_fault = g_jit_deferred_guest_fault;
+    }
+    g_jit_deferred_guest_fault = {};
+    if (g_current_fault_state == state) {
+        state->native_fault_ir = 0;
+        g_current_fault_ir = nullptr;
+    }
+    return CompleteDeferredFaultCapture(result);
+#else
+    result = InvokeHostBlockUnchecked(entry, state);
+    return false;
+#endif
+}
+
 bool BlockNeedsSynchronousFaultResume(const LsxDecodedRegion& block) {
     for (const LsxDecodedOp& ir : block.instructions) {
         const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
@@ -2350,6 +2404,70 @@ bool BlockNeedsSynchronousFaultResume(const LsxDecodedRegion& block) {
         }
     }
     return false;
+}
+
+bool BlockSupportsSignalContextFaultReturn(const LsxDecodedRegion& block) {
+    if (block.instructions.empty()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < block.instructions.size(); ++index) {
+        const LsxDecodedOp& ir = block.instructions[index];
+        const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
+        if (mnemonic == X86_MNEMONIC_JMP ||
+            IsConditionalBranchMnemonic(mnemonic)) {
+            continue;
+        }
+        switch (mnemonic) {
+        case X86_MNEMONIC_NOP:
+        case X86_MNEMONIC_MOV:
+        case X86_MNEMONIC_MOVBE:
+        case X86_MNEMONIC_MOVZX:
+        case X86_MNEMONIC_MOVSX:
+        case X86_MNEMONIC_MOVSXD:
+        case X86_MNEMONIC_LEA:
+        case X86_MNEMONIC_ADD:
+        case X86_MNEMONIC_SUB:
+        case X86_MNEMONIC_AND:
+        case X86_MNEMONIC_OR:
+        case X86_MNEMONIC_XOR:
+        case X86_MNEMONIC_CMP:
+        case X86_MNEMONIC_TEST:
+        case X86_MNEMONIC_ANDN:
+        case X86_MNEMONIC_INC:
+        case X86_MNEMONIC_DEC:
+        case X86_MNEMONIC_NEG:
+        case X86_MNEMONIC_NOT:
+        case X86_MNEMONIC_BEXTR:
+        case X86_MNEMONIC_BLSI:
+        case X86_MNEMONIC_BLSR:
+        case X86_MNEMONIC_SHLX:
+        case X86_MNEMONIC_SHRX:
+        case X86_MNEMONIC_SARX:
+        case X86_MNEMONIC_RORX:
+        case X86_MNEMONIC_SHL:
+        case X86_MNEMONIC_SHR:
+        case X86_MNEMONIC_SAR:
+        case X86_MNEMONIC_MOVSS:
+        case X86_MNEMONIC_MOVSD:
+        case X86_MNEMONIC_VMOVSS:
+        case X86_MNEMONIC_VMOVSD:
+        case X86_MNEMONIC_ADDSS:
+        case X86_MNEMONIC_SUBSS:
+        case X86_MNEMONIC_MULSS:
+        case X86_MNEMONIC_VADDSS:
+        case X86_MNEMONIC_VSUBSS:
+        case X86_MNEMONIC_VMULSS:
+            break;
+        case X86_MNEMONIC_IMUL:
+            if (ir.operand_count == 2 || ir.operand_count == 3) {
+                break;
+            }
+            return false;
+        default:
+            return false;
+        }
+    }
+    return true;
 }
 
 bool BlockRequiresDispatcherBoundary(const LsxDecodedRegion& block) {
@@ -5978,11 +6096,22 @@ public:
             try {
                 JitDeferredGuestFault deferred_fault{};
                 bool synchronous_fault_resumed = false;
-                if (TranslationHasFeature(block.flags,
-                                          TranslationFeature::NativeCode) ||
+                const bool needs_synchronous_fault_resume =
                     TranslationHasFeature(
                         block.flags,
-                        TranslationFeature::SynchronousFaultResume)) {
+                        TranslationFeature::SynchronousFaultResume);
+                const bool signal_context_fault_return =
+                    needs_synchronous_fault_resume &&
+                    TranslationHasFeature(
+                        block.flags, TranslationFeature::NativeCode) &&
+                    decoded_block != nullptr &&
+                    !JitLiveCheckedNativeEnabled() &&
+                    BlockSupportsSignalContextFaultReturn(*decoded_block);
+                if (signal_context_fault_return) {
+                    synchronous_fault_resumed =
+                        ExecuteHostBlockWithSignalContextFaultReturn(
+                            block.entry, &state, result, &deferred_fault);
+                } else if (needs_synchronous_fault_resume) {
                     synchronous_fault_resumed =
                         ExecuteHostBlockWithSynchronousFaultResume(
                             block.entry, &state, result, &deferred_fault
@@ -9441,6 +9570,9 @@ void RetiringTranslationRuntime::CompileTieredTrace(
 
         const bool faultable_trace =
             BlockNeedsSynchronousFaultResume(plan.combined);
+        const bool signal_context_faultable_trace =
+            faultable_trace &&
+            BlockSupportsSignalContextFaultReturn(plan.combined);
         const bool read_only_poll_trace =
             faultable_trace && plan.loop_head_osr &&
             plan.members.size() >= 2 &&
@@ -9482,7 +9614,8 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         // traces, but keep faultable loops and internal guarded exits on the
         // conservative baseline: their combined recovery/rollback path can
         // otherwise observe a fault between cached-state handoffs.
-        if (faultable_trace && !read_only_poll_trace &&
+        if (faultable_trace && !signal_context_faultable_trace &&
+            !read_only_poll_trace &&
             (plan.loop_head_osr || !plan.guards.empty())) {
             reject();
             return;
@@ -11399,6 +11532,27 @@ JitSynchronousFaultResumeFrame* ActiveSynchronousFaultFrame() {
     return usable ? frame : nullptr;
 }
 
+LsxMachineImage* ActiveSignalContextFaultState(
+    const void* const raw_context) noexcept {
+#if defined(__ANDROID__) && defined(__aarch64__)
+    if (g_jit_signal_context_fault_return_armed == 0 ||
+        !SignalContextPcIsGeneratedCode(raw_context) ||
+        raw_context == nullptr) {
+        return nullptr;
+    }
+    const auto* const context =
+        static_cast<const ucontext_t*>(raw_context);
+    auto* const state = reinterpret_cast<LsxMachineImage*>(
+        static_cast<std::uintptr_t>(context->uc_mcontext.regs[19]));
+    return state != nullptr && state == FindActiveMachineImage()
+               ? state
+               : nullptr;
+#else
+    (void)raw_context;
+    return nullptr;
+#endif
+}
+
 [[noreturn]] void JumpToSynchronousFaultResume(
     JitSynchronousFaultResumeFrame& frame) {
     frame.armed = 0;
@@ -11415,7 +11569,11 @@ executor_jit_defer_synchronous_guest_fault(
     const std::int32_t is_write, const void* const raw_context) {
 #if defined(__ANDROID__) && defined(__aarch64__)
     auto* frame = ActiveSynchronousFaultFrame();
-    if (frame == nullptr) {
+    auto* const context_state =
+        frame == nullptr ? ActiveSignalContextFaultState(raw_context) : nullptr;
+    LsxMachineImage* const fault_state =
+        frame != nullptr ? frame->state : context_state;
+    if (fault_state == nullptr) {
         return 0;
     }
     if (SignalContextPcIsGeneratedCode(raw_context)) {
@@ -11431,16 +11589,16 @@ executor_jit_defer_synchronous_guest_fault(
         }
         const std::uint64_t legacy_slot =
             reinterpret_cast<std::uint64_t>(
-                std::addressof(frame->state->native_fault_ir));
+                std::addressof(fault_state->native_fault_ir));
         if (descriptor != legacy_slot) {
-            frame->state->native_fault_ir = descriptor;
+            fault_state->native_fault_ir = descriptor;
         }
-        frame->state->native_edge_phase =
+        fault_state->native_edge_phase =
             static_cast<std::uint32_t>(
                 context->uc_mcontext.regs[28]);
     }
     if (!RestoreTieredFaultRegisterCaches(
-            *frame->state, raw_context)) {
+            *fault_state, raw_context)) {
         return 0;
     }
 
@@ -11451,15 +11609,25 @@ executor_jit_defer_synchronous_guest_fault(
     g_jit_deferred_guest_fault.source_pid = source_pid;
     g_jit_deferred_guest_fault.source_uid = source_uid;
     g_jit_deferred_guest_fault.fault_addr = fault_addr;
-    MaterializeDeferredFlags(*frame->state);
+    MaterializeDeferredFlags(*fault_state);
     const auto fault_ir = CurrentPublishedFaultInstruction();
     g_jit_deferred_guest_fault.guest_rip =
-        fault_ir ? fault_ir.guest_rip : frame->state->rip_or_exit;
+        fault_ir ? fault_ir.guest_rip : fault_state->rip_or_exit;
     g_jit_deferred_guest_fault.is_write = is_write != 0 ? 1 : 0;
 
     std::atomic_signal_fence(std::memory_order_seq_cst);
     g_jit_deferred_guest_fault.valid = 1;
     std::atomic_signal_fence(std::memory_order_seq_cst);
+    if (context_state != nullptr) {
+        auto* const context =
+            const_cast<ucontext_t*>(
+                static_cast<const ucontext_t*>(raw_context));
+        context->uc_mcontext.sp = context->uc_mcontext.regs[29];
+        context->uc_mcontext.pc =
+            reinterpret_cast<std::uintptr_t>(
+                &ReturnFromJitSignalContextFault);
+        return 1;
+    }
     JumpToSynchronousFaultResume(*frame);
 #endif
     return 0;
@@ -11481,9 +11649,6 @@ executor_jit_has_synchronous_guest_fault_frame(
     const void* const raw_context) {
 #if defined(__ANDROID__) && defined(__aarch64__)
     auto* const frame = ActiveSynchronousFaultFrame();
-    if (frame == nullptr) {
-        return 0;
-    }
     // The Android SIGSEGV/SIGBUS route calls this before deferring a hardware
     // fault. Helpers still publish through the machine image. Direct generated
     // memory accesses keep the exact descriptor in x21 so the hot path avoids
@@ -11493,10 +11658,13 @@ executor_jit_has_synchronous_guest_fault_frame(
         const auto* const context =
             static_cast<const ucontext_t*>(raw_context);
         if (context->uc_mcontext.regs[21] != 0) {
-            return 1;
+            if (frame != nullptr ||
+                ActiveSignalContextFaultState(raw_context) != nullptr) {
+                return 1;
+            }
         }
     }
-    return CurrentPublishedFaultInstruction() ? 1 : 0;
+    return frame != nullptr && CurrentPublishedFaultInstruction() ? 1 : 0;
 #else
     (void)raw_context;
     return 0;
@@ -16849,7 +17017,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 constexpr std::array<std::uint32_t, 12>
                     kGenericCachedGprHostRegisters{
                         23, 24, 25, 26, 4, 6, 7, 8, 1, 2, 3, 5};
-                constexpr bool generic_fault_write_through = false;
+                const bool generic_fault_write_through =
+                    generic_has_faultable_memory_access &&
+                    compilation_tier == LocalJitTier::Tier2 &&
+                    (generic_has_local_backedge ||
+                     (tiered_guards != nullptr &&
+                      !tiered_guards->empty()));
                 std::array<std::uint32_t, 12> generic_cached_gpr_offsets{};
                 generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                 std::array<bool, 12> generic_cached_gpr_dirty{};
