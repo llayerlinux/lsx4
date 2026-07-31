@@ -13,6 +13,7 @@
 #include "executor/dynamic_translation/hle_thunk_identity.h"
 #include "executor/dynamic_translation/live_state_port.h"
 #include "executor/dynamic_translation/retiring_execution_core.h"
+#include "executor/android_performance_hint.h"
 #include "executor/dynamic_translation/stack_windows.h"
 #include "executor/ps5_desktop/backend_contract.h"
 #include "executor/ps5_desktop/bc7decomp.h"
@@ -48,6 +49,9 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_acle.h>
+#endif
 
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -736,7 +740,7 @@ const auto g_ps5_process_start =
 std::atomic<std::uint64_t> g_ps5_pad_timestamp{};
 std::atomic<std::uint64_t> g_hle_binding_generation{1};
 std::atomic<std::uint64_t> g_event_flag_generation{1};
-std::array<std::atomic_bool, 14> g_ps5_managed_optimizations{};
+std::array<std::atomic_bool, 19> g_ps5_managed_optimizations{};
 std::atomic<std::uint64_t> g_ps5_managed_optimization_epoch{1};
 std::atomic<std::uint64_t> g_ps5_readback_cache_hits{};
 std::atomic<std::uint64_t> g_ps5_readback_cache_misses{};
@@ -16793,9 +16797,9 @@ bool TryHandleGuestEventFlag(
     if (timeout_output == 0 || timeout_microseconds >= 50u) {
         for (std::uint32_t spin = 0; spin < 192u; ++spin) {
 #if defined(__aarch64__) || defined(__arm__)
-            __asm__ __volatile__("yield");
+            __yield();
 #elif defined(__x86_64__) || defined(__i386__)
-            __asm__ __volatile__("pause");
+            __builtin_ia32_pause();
 #else
             std::atomic_signal_fence(std::memory_order_seq_cst);
 #endif
@@ -19433,9 +19437,7 @@ bool TryInvokeBuiltinHle(
     }
     if (symbol == "1j3S3n-tTW4") {
 #if defined(__aarch64__)
-        std::uint64_t frequency{};
-        asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
-        result = frequency;
+        result = __arm_rsr64("cntfrq_el0");
 #else
         result = UINT64_C(1000000000);
 #endif
@@ -19443,9 +19445,7 @@ bool TryInvokeBuiltinHle(
     }
     if (symbol == "-2IRUCO--PM") {
 #if defined(__aarch64__)
-        std::uint64_t counter{};
-        asm volatile("mrs %0, cntvct_el0" : "=r"(counter));
-        result = counter;
+        result = __arm_rsr64("cntvct_el0");
 #else
         result = static_cast<std::uint64_t>(
             std::chrono::steady_clock::now().time_since_epoch().count());
@@ -22336,6 +22336,26 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
         Executor::Jit::ConfigureFastGuestMemory(active);
         effective = Executor::Jit::FastGuestMemoryEnabled();
         break;
+    case 14: // optional scalar MUL+ADD contraction; strict rounding by default
+        Executor::Jit::ConfigureRelaxedFpFusion(active);
+        effective = Executor::Jit::RelaxedFpFusionEnabled();
+        break;
+    case 15: // Android Dynamic Performance Framework frame workload session
+        Executor::AndroidPerformanceHint::SetEnabled(active);
+        effective = Executor::AndroidPerformanceHint::IsEnabled();
+        break;
+    case 16: // FEAT_FlagM/FlagM2 JIT lowering, baseline fallback otherwise
+        Executor::Jit::ConfigureHostFlagM(active);
+        effective = Executor::Jit::HostFlagMEnabled();
+        break;
+    case 17: // FEAT_SVE2 JIT lowering, NEON fallback otherwise
+        Executor::Jit::ConfigureHostSve2(active);
+        effective = Executor::Jit::HostSve2Enabled();
+        break;
+    case 18: // FEAT_LRCPC host-acquire lowering, LDAR fallback otherwise
+        Executor::Jit::ConfigureHostRcpc(active);
+        effective = Executor::Jit::HostRcpcEnabled();
+        break;
     case TieredJit:
         if (!active) {
             g_ps5_managed_optimizations[JitTraceCompilation].store(
@@ -22391,7 +22411,8 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
         ANDROID_LOG_INFO, "LSX4-PS5",
         "managed optimization option=%d requested=%d effective=%d status=%d "
         "tiered=%d trace=%d readback=%d driver=%d async=%d mobile=%d "
-        "audio=%d fastMemory=%d epoch=%llu",
+        "audio=%d fastMemory=%d relaxedFpFusion=%d adpf=%d "
+        "flagm=%d sve2=%d rcpc=%d epoch=%llu",
         option, active ? 1 : 0, effective ? 1 : 0, status,
         Executor::Jit::TieredJitEnabled() ? 1 : 0,
         Executor::Jit::JitTraceCompilationEnabled() ? 1 : 0,
@@ -22406,6 +22427,11 @@ extern "C" int executor_lsx4_ps5_runtime_set_managed_optimization(
         g_ps5_managed_optimizations[11].load(
             std::memory_order_acquire) ? 1 : 0,
         Executor::Jit::FastGuestMemoryEnabled() ? 1 : 0,
+        Executor::Jit::RelaxedFpFusionEnabled() ? 1 : 0,
+        Executor::AndroidPerformanceHint::IsEnabled() ? 1 : 0,
+        Executor::Jit::HostFlagMEnabled() ? 1 : 0,
+        Executor::Jit::HostSve2Enabled() ? 1 : 0,
+        Executor::Jit::HostRcpcEnabled() ? 1 : 0,
         static_cast<unsigned long long>(epoch));
 #endif
     return status;

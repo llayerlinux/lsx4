@@ -35,6 +35,7 @@
 #include "executor/dynamic_translation/process_memory.h"
 #include "executor/dynamic_translation/runtime_gateway.h"
 #include "executor/dynamic_translation/retiring_execution_core.h"
+#include "executor/android_performance_hint.h"
 #include "input/controller.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -22129,6 +22130,19 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
                       bisect_draw_limit_file.string().c_str());
         }
     }
+    const auto bisect_skip_pipeline_file =
+        std::filesystem::path(g_root) / "run-bisect-skip-pipeline-hashes";
+    if (std::filesystem::exists(bisect_skip_pipeline_file)) {
+        std::ifstream hashes_stream{bisect_skip_pipeline_file};
+        std::string hashes;
+        std::getline(hashes_stream, hashes);
+        if (!hashes.empty() && hashes.size() <= 1024) {
+            setenv("EXECUTOR_BISECT_SKIP_PIPELINE_HASHES", hashes.c_str(), 1);
+            NativeLog(ANDROID_LOG_INFO,
+                      "[EXECUTOR_BISECT_SKIP_PIPELINE_HASHES] source=file hashes=%s path=%s",
+                      hashes.c_str(), bisect_skip_pipeline_file.string().c_str());
+        }
+    }
     const auto bisect_skip_coro_present_sentinel =
         std::filesystem::path(g_root) / "run-bisect-skip-coro-present";
     if (std::filesystem::exists(bisect_skip_coro_present_sentinel)) {
@@ -22500,10 +22514,14 @@ extern "C" int executor_lsx4_runtime_initialize(const char* root_dir, const char
     }
     const auto vk_journal_sentinel = std::filesystem::path(g_root) / "run-vk-journal";
     if (std::filesystem::exists(vk_journal_sentinel)) {
+        const auto vk_journal_output =
+            std::filesystem::path(g_root) / "vk-journal-last.txt";
         setenv("EXECUTOR_VK_JOURNAL", "1", 1);
+        setenv("EXECUTOR_VK_JOURNAL_FILE", vk_journal_output.string().c_str(), 1);
         NativeLog(ANDROID_LOG_INFO,
-                  "[EXECUTOR_VK_JOURNAL] source=sentinel path=%s enabled=1",
-                  vk_journal_sentinel.string().c_str());
+                  "[EXECUTOR_VK_JOURNAL] source=sentinel path=%s enabled=1 output=%s",
+                  vk_journal_sentinel.string().c_str(),
+                  vk_journal_output.string().c_str());
     }
     const auto live_mutex_owner_dump_sentinel =
         std::filesystem::path(g_root) / "run-live-mutex-owner-dump";
@@ -22910,6 +22928,11 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
     constexpr int AudioSimd = 11;
     constexpr int ForceAnisotropy1x = 12;
     constexpr int FastGuestMemory = 13;
+    constexpr int RelaxedFpFusion = 14;
+    constexpr int AndroidPerformanceHint = 15;
+    constexpr int HostFlagM = 16;
+    constexpr int HostSve2 = 17;
+    constexpr int HostRcpc = 18;
     static std::atomic<bool> tiered_jit{false};
     static std::atomic<bool> trace_compilation{false};
     const bool active = enabled != 0;
@@ -22997,6 +23020,26 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
         Executor::Jit::ConfigureFastGuestMemory(active);
         option_name = "fast_guest_memory";
         break;
+    case RelaxedFpFusion:
+        Executor::Jit::ConfigureRelaxedFpFusion(active);
+        option_name = "relaxed_fp_fusion";
+        break;
+    case AndroidPerformanceHint:
+        Executor::AndroidPerformanceHint::SetEnabled(active);
+        option_name = "android_performance_hint";
+        break;
+    case HostFlagM:
+        Executor::Jit::ConfigureHostFlagM(active);
+        option_name = "host_flagm";
+        break;
+    case HostSve2:
+        Executor::Jit::ConfigureHostSve2(active);
+        option_name = "host_sve2";
+        break;
+    case HostRcpc:
+        Executor::Jit::ConfigureHostRcpc(active);
+        option_name = "host_rcpc";
+        break;
     default:
         return -1;
     }
@@ -23004,21 +23047,32 @@ extern "C" int executor_lsx4_runtime_set_managed_optimization(const int option,
               "[EXECUTOR_MANAGED_OPTIMIZATION] option=%s enabled=%d directMemory=%d "
               "vkDiagnostics=%d coarseFragment=%d disableRobustness=%d "
               "readbackBatch=%d driverCalls=%d asyncPipeline=%d mobileGpu=%d "
-              "audioSimd=%d fastGuestMemory=%d",
+              "audioSimd=%d fastGuestMemory=%d relaxedFpFusion=%d adpf=%d "
+              "flagm=%d sve2=%d rcpc=%d",
               option_name, active ? 1 : 0, Config::directMemoryAccess() ? 1 : 0,
               Config::managedGpuFastPath() ? 0 : 1,
               Config::managedCoarseFragmentShading() ? 1 : 0,
               Config::managedDisableVkRobustness() ? 1 : 0,
 #if defined(LSX4_EXTERNAL_FUNNEL_BASELINE_COMPAT)
               0, 0, 0, 0, 0,
-              Executor::Jit::FastGuestMemoryEnabled() ? 1 : 0);
+              Executor::Jit::FastGuestMemoryEnabled() ? 1 : 0,
+              Executor::Jit::RelaxedFpFusionEnabled() ? 1 : 0,
+              Executor::AndroidPerformanceHint::IsEnabled() ? 1 : 0,
+              Executor::Jit::HostFlagMEnabled() ? 1 : 0,
+              Executor::Jit::HostSve2Enabled() ? 1 : 0,
+              Executor::Jit::HostRcpcEnabled() ? 1 : 0);
 #else
               Config::managedReadbackBatching() ? 1 : 0,
               VideoCore::IsManagedVulkanDriverOptimization() ? 1 : 0,
               Config::managedAsyncPipelineCompilation() ? 1 : 0,
               VideoCore::IsManagedMobileGpuOptimization() ? 1 : 0,
               Libraries::AudioOut::IsManagedAudioSimdEnabled() ? 1 : 0,
-              Executor::Jit::FastGuestMemoryEnabled() ? 1 : 0);
+              Executor::Jit::FastGuestMemoryEnabled() ? 1 : 0,
+              Executor::Jit::RelaxedFpFusionEnabled() ? 1 : 0,
+              Executor::AndroidPerformanceHint::IsEnabled() ? 1 : 0,
+              Executor::Jit::HostFlagMEnabled() ? 1 : 0,
+              Executor::Jit::HostSve2Enabled() ? 1 : 0,
+              Executor::Jit::HostRcpcEnabled() ? 1 : 0);
 #endif
     return 0;
 }

@@ -34,7 +34,8 @@ constexpr std::array<std::uint8_t, 8> kCacheMagic = {
     'E', 'X', 'B', 'I', 'R', 'C', '0', '1',
 };
 constexpr std::uint32_t kHeaderSize = 88;
-constexpr std::uint16_t kRecordSchemaVersion = 2;
+constexpr std::uint16_t kRecordSchemaVersion = 3;
+constexpr std::uint16_t kLegacyRecordSchemaVersion = 2;
 constexpr std::uint32_t kKnownNativeFlags =
     kJitNativeFlagValid | kJitNativeFlagLeafHleFused |
     kJitNativeFlagScalarFloatDirectV1 |
@@ -394,7 +395,9 @@ private:
     if (!valid) {
         if (!record.native_segments.empty() ||
             record.entry_segment_index != kJitNativeNoSegment ||
-            record.direct_segment_index != kJitNativeNoSegment) {
+            record.direct_segment_index != kJitNativeNoSegment ||
+            record.static_gpr_segment_index != kJitNativeNoSegment ||
+            record.static_gpr_entry_offset != 0) {
             error = "native segments present without valid marker";
             return false;
         }
@@ -407,7 +410,14 @@ private:
     }
     if (record.entry_segment_index >= record.native_segments.size() ||
         (record.direct_segment_index != kJitNativeNoSegment &&
-         record.direct_segment_index >= record.native_segments.size())) {
+         record.direct_segment_index >= record.native_segments.size()) ||
+        (record.static_gpr_segment_index != kJitNativeNoSegment &&
+         (record.static_gpr_segment_index >= record.native_segments.size() ||
+          record.static_gpr_entry_offset >=
+              record.native_segments[record.static_gpr_segment_index].bytes.size() ||
+          (record.static_gpr_entry_offset & 3u) != 0)) ||
+        (record.static_gpr_segment_index == kJitNativeNoSegment &&
+         record.static_gpr_entry_offset != 0)) {
         error = "cached native entry/direct segment index out of bounds";
         return false;
     }
@@ -820,6 +830,8 @@ void WriteNativeRelocation(ByteWriter& writer,
     body.U32(static_cast<std::uint32_t>(record.native_segments.size()));
     body.U32(record.entry_segment_index);
     body.U32(record.direct_segment_index);
+    body.U32(record.static_gpr_segment_index);
+    body.U32(record.static_gpr_entry_offset);
     body.Bytes(std::span<const std::uint8_t>{
         reinterpret_cast<const std::uint8_t*>(record.block.diagnostic.data()),
         record.block.diagnostic.size()});
@@ -867,8 +879,15 @@ void WriteNativeRelocation(ByteWriter& writer,
         error = "truncated cache record header";
         return false;
     }
-    if (schema != kRecordSchemaVersion) {
+    if (schema != kRecordSchemaVersion &&
+        schema != kLegacyRecordSchemaVersion) {
         error = "unsupported cache record schema";
+        return false;
+    }
+    if (schema >= 3 &&
+        (!body.U32(record.static_gpr_segment_index) ||
+         !body.U32(record.static_gpr_entry_offset))) {
+        error = "truncated cache resident-entry metadata";
         return false;
     }
     if ((flags & ~kKnownBlockFlags) != 0) {

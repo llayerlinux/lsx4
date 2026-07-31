@@ -331,6 +331,7 @@ set(LSX4_JIT_COMMON_SOURCES
     src/executor/dynamic_translation/floating_relation.cpp
     src/executor/dynamic_translation/guest_capability_profile.cpp
     src/executor/dynamic_translation/guest_mapping_policy.cpp
+    src/executor/dynamic_translation/host_isa_profile.cpp
     src/executor/dynamic_translation/hle_invocation_frame.cpp
     src/executor/dynamic_translation/instruction_diagnostics.cpp
     src/executor/dynamic_translation/integer_math.cpp
@@ -351,6 +352,7 @@ set(LSX4_JIT_COMMON_SOURCES
     src/executor/dynamic_translation/x87_semantics.cpp
     src/executor/dynamic_translation/x87_state.cpp
     src/executor/dynamic_translation/retiring_execution_core.cpp
+    src/executor/dynamic_translation/jit_aarch64_stubs.S
     src/executor/dynamic_translation/artifact_repository.cpp
     src/executor/dynamic_translation/decode_bridge.cpp
     src/executor/dynamic_translation/vector_lowering_policy.cpp
@@ -362,6 +364,7 @@ set(LSX4_JIT_COMMON_SOURCES
 add_library(lsx4_executor_android SHARED
     ${LSX4_NATIVE_CORE_SOURCES}
     ${LSX4_JIT_COMMON_SOURCES}
+    src/executor/android_performance_hint.cpp
     src/executor/native_runtime_api.cpp
     src/executor/ps4_jit_platform.cpp
     src/executor/runtime_death_catcher.cpp
@@ -422,7 +425,8 @@ if(LSX4_ENABLE_PS5_DESKTOP_PATH)
         src/executor/ps5_desktop/gen5_compute_recompiler.cpp
         src/executor/ps5_desktop/ps5_audio_scheduler.cpp
         src/executor/ps5_desktop/vulkan_presenter.cpp
-        src/executor/ps5_desktop/runtime_api.cpp)
+        src/executor/ps5_desktop/runtime_api.cpp
+        src/executor/android_performance_hint.cpp)
     set_property(
         SOURCE "${LSX4_ARM_DESKTOP_SOURCE_DIR}/common/thread.cpp"
         APPEND PROPERTY COMPILE_OPTIONS

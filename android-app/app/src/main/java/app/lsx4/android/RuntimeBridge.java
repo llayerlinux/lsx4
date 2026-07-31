@@ -16,6 +16,11 @@ public final class RuntimeBridge {
     public static final int MANAGED_OPTIMIZATION_AUDIO_SIMD = 11;
     public static final int MANAGED_OPTIMIZATION_FORCE_ANISOTROPY_1X = 12;
     public static final int MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY = 13;
+    public static final int MANAGED_OPTIMIZATION_RELAXED_FP_FUSION = 14;
+    public static final int MANAGED_OPTIMIZATION_ANDROID_PERFORMANCE_HINT = 15;
+    public static final int MANAGED_OPTIMIZATION_HOST_FLAGM = 16;
+    public static final int MANAGED_OPTIMIZATION_HOST_SVE2 = 17;
+    public static final int MANAGED_OPTIMIZATION_HOST_RCPC = 18;
 
     static {
         System.loadLibrary("lsx_runtime_bridge");

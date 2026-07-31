@@ -172,6 +172,16 @@
     <string name="optimization_jit_trace_compilation_hint">Compiles stable hot direct paths as optimized Tier 2 traces. Requires Tiered JIT; unsafe or changed paths remain on the baseline JIT. Restart the game after changing it.</string>
     <string name="optimization_fast_guest_memory">Fast guest memory model</string>
     <string name="optimization_fast_guest_memory_hint">Experimental: uses direct ARM loads and stores only for direct stack-relative accesses while keeping all other guest memory operations strict. Disabled by default until escaped stack addresses can be proven private. Restart the game after changing it.</string>
+    <string name="optimization_relaxed_fp_fusion">Relaxed scalar FMA fusion</string>
+    <string name="optimization_relaxed_fp_fusion_hint">Uses one ARM64 FMADD for proven scalar MUL+ADD chains. This removes an intermediate rounding step, so strict x86 floating-point results remain the default. Restart the game after changing it.</string>
+    <string name="optimization_android_performance_hint">Android performance hints (ADPF)</string>
+    <string name="optimization_android_performance_hint_hint">On Android 12 and newer, groups Game:Main, GpuComm, FMOD and worker threads into a frame workload and reports actual frame time against the 30 FPS target. Unsupported systems fall back safely. Sustained performance mode is not used. Restart the game after changing it.</string>
+    <string name="optimization_host_flagm">ARM FlagM/FlagM2 JIT lowering</string>
+    <string name="optimization_host_flagm_hint">Uses compact ARM flag-conversion instructions when the CPU and kernel expose them. Unsupported devices automatically keep the baseline lowering. Restart the game after changing it.</string>
+    <string name="optimization_host_sve2">ARM SVE2 JIT lowering</string>
+    <string name="optimization_host_sve2_hint">Uses SVE2 only for profitable wide vector operations and retains the NEON implementation everywhere else. Unsupported devices and insufficient vector lengths automatically use NEON. Restart the game after changing it.</string>
+    <string name="optimization_host_rcpc">ARM RCpc host acquires</string>
+    <string name="optimization_host_rcpc_hint">Uses LDAPR only for proven host-side acquire loads. Guest LOCK, fences, sequential consistency, and GPU ordering remain strict. Unsupported devices use LDAR. Restart the game after changing it.</string>
     <string name="optimization_readback_batching">Submit-scoped GPU readback batching</string>
     <string name="optimization_readback_batching_hint">Publishes CPU-side fence labels from one submit snapshot, merges adjacent pages into multi-copy commands, and performs at most one timeline wait for a demand wave. Restart the game after changing it.</string>
     <string name="optimization_vulkan_driver_calls">Reduce Vulkan driver calls</string>

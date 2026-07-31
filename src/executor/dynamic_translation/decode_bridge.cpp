@@ -105,6 +105,8 @@ ByteLensResult LiftOneMachineInstruction(const std::span<const std::uint8_t> byt
     operation.decoded.operand_width = decoded.operand_width;
     operation.decoded.operand_count = decoded.operand_count;
     operation.decoded.operand_count_visible = decoded.operand_count_visible;
+    operation.decoded.implicit_gpr_read_mask = decoded.implicit_gpr_read_mask;
+    operation.decoded.implicit_gpr_write_mask = decoded.implicit_gpr_write_mask;
     operation.operand_count = static_cast<std::uint8_t>(
         std::min<std::uint32_t>(decoded.operand_count_visible,
                                 X86_MAX_OPERAND_COUNT_VISIBLE));

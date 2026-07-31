@@ -280,3 +280,184 @@ stall, missing geometry, white attachment regions, or foliage-color frames.
 Additional JIT invariant: no trace that can native-chain back into its own member set may be
 published as a straight-line trace. Every such cycle requires a validated loop head and periodic
 OSR/deopt safepoint.
+
+## Nidhogg 2 Adreno `DEVICE_LOST` from descriptor snapshots (2026-07-31)
+
+### Symptom and fault signature
+
+Nidhogg 2 could reach live rendering and accept input, then lose the Vulkan device when a
+post-process-heavy gameplay transition was submitted. The terminal error was always reported by
+`queue_submit` as `VK_ERROR_DEVICE_LOST`; it was not a guest crash or a frozen FPS counter.
+
+The useful identity was the 56-byte device-fault fingerprint
+`0x721c15d6dc5462f3`. It recurred at unrelated scheduler ticks:
+
+- `cusa07640-direct-valid-r1-log.txt`, lines 1511-1515: tick 1579;
+- `vivo-main-robust-current.txt`, lines 1859-1863 and 4392 onward: ticks 1347 and
+  6092, with two later occurrences at 13968 and 19102;
+- `vivo-main-alloff-keyroute.txt`: ticks 1347 and 6092 even with the managed
+  Vulkan optimizations disabled;
+- `vivo-barrierfix-logcat.txt`, lines 1708-1710: tick 1815;
+- `vivo-shaderdump-logcat.txt`, lines 1717-1720: tick 1669.
+
+The driver supplied no useful fault address or vendor record (`addresses=0/0`,
+`vendors=0/0`). The draw journal was therefore evidence about the workload, not proof that its
+last recorded draw was the instruction that faulted. For example,
+`cusa07640-vk-journal-r4.txt` repeatedly records the same 640x360 post-process family
+(`key=0xb525d5f028a56f6f`, two buffers and four images) immediately before the delayed submit
+failure.
+
+### Root cause and fix
+
+The Android read-only rename fast path copied small CPU-readable guest ranges into the shared,
+host-visible `StreamBuffer` ring. `Rasterizer::BindResources` then used that ring slice directly
+as the backing of read-only Uniform or Storage descriptors. Under sustained descriptor churn and
+ring wrap, an Adreno submission could consume a descriptor range after the shared slice had been
+recycled for a newer draw. Flushes, barriers, `Commit()`, and `RetainCurrentAllocation()` make
+writes visible and track ordinary ring use, but they did not establish the required lifetime for
+these descriptor-backed snapshots.
+
+The fix is type-specific rather than a global rollback. In
+[`buffer_cache.cpp`](../funnel-arm/src/video_core/buffer_cache/buffer_cache.cpp),
+`ExecutorReadOnlyRenameUsageEnabled` unconditionally rejects `Uniform` and `Storage`. Those
+requests fall back through `ObtainReadOnlyBuffer` to the stable tracked buffer-cache backing.
+Vertex and index snapshots retain the fast path because the reproducer isolated the unsafe
+lifetime to descriptor-bound UBO/SSBO ranges. The binding site is
+[`vk_rasterizer.cpp`](../funnel-arm/src/video_core/renderer_vulkan/vk_rasterizer.cpp),
+`Rasterizer::BindResources`.
+
+The A/B progression is retained in the workspace:
+
+- `current-vivo-cusa07640-renameoff.png` shows active gameplay at 00:55 with the whole rename
+  path disabled;
+- `current-vivo-cusa07640-hardgate-death.png` shows the selective UBO/SSBO gate still running
+  gameplay at 01:47;
+- `current-vivo-cusa07640-final-nobisection2.png` shows the production selective gate, without
+  pipeline bisection, active at 01:10 with draw, submit, and present counters advancing.
+
+The failing instrumented runs lost the device around 15-20 seconds or at the corresponding
+gameplay transition. Surviving the same match/death path for more than a minute while retaining
+vertex/index rename distinguishes the descriptor-lifetime fix from a blanket performance
+disable.
+
+### Hypotheses and attempts that were not fixes
+
+- Robust descriptor access did not change the fingerprint; `vivo-main-robust-current.txt`
+  contains four occurrences.
+- Disabling the managed Vulkan optimization group did not remove it; the all-off run retained
+  the same fingerprint and failing ticks.
+- Extra buffer/image barriers and descriptor-range adjustments did not make a recycled ring
+  slice immutable. The barrier-fix and range-fix runs still produced a failing journal.
+- Shader dumping and pipeline/journal instrumentation localized the recurring post-process
+  workload but did not prevent the loss. Pipeline skipping is not a valid production fix because
+  device loss is reported asynchronously and skipping a consumer only hides the lifetime defect.
+- Treating the final journal draw, one shader hash, or one title address as the cause was rejected.
+  The solution contains no title, pipeline, shader, or guest-address hardcode.
+
+### Required invariants
+
+1. Every Uniform or Storage descriptor backing range remains byte-stable and allocated until the
+   completion timeline of every submission that can consume it.
+2. Host coherence, a flush, or a Vulkan memory barrier is a visibility guarantee, not an
+   allocation-lifetime guarantee.
+3. The common host-visible `StreamBuffer` ring must not back read-only Uniform/Storage descriptors
+   under the current retirement model. A diagnostic marker must not bypass this hard gate.
+4. Reintroducing descriptor snapshots requires a dedicated arena whose slices are retired by the
+   actual consuming submit timeline, including wrapped ranges and deferred command buffers.
+5. Uniform/Storage fallback must preserve descriptor alignment, offset/range, synchronization, and
+   stable tracked backing. Vertex/index eligibility remains independent.
+6. A `DEVICE_LOST` returned by submit may describe earlier GPU work. Correlate the binary
+   fingerprint, journal window, and per-usage A/B gates; never hardcode the last recorded draw.
+7. Compatibility fixes remain engine- and title-independent.
+
+### Regression tests
+
+1. Add a routing contract test: read-only `Uniform` and `Storage` requests must never return the
+   shared stream buffer; eligible `Vertex` and `Index` requests may still do so.
+2. Add an in-flight wrap stress test with a deliberately small ring and multiple uncompleted
+   submissions. Shader-observed UBO/SSBO checksums must remain unchanged, and no descriptor may
+   reference a recycled slice.
+3. In telemetry, require `renamedUsage.ubo == 0` and `renamedUsage.ssbo == 0`; nonzero
+   vertex/index rename counts are expected and guard against an accidental global rollback.
+4. Run Nidhogg 2 through menu, match, death, restart, and a second match for at least five minutes.
+   Acceptance requires no `EXECUTOR_VK_DEVICE_FAULT`, no
+   `EXECUTOR_VK_TERMINAL_ORIGIN ... ErrorDeviceLost`, and specifically no
+   `0x721c15d6dc5462f3`.
+5. Recheck Bloodborne or another high-descriptor-churn title, then a PS4 control title that relies
+   heavily on streamed vertex/index data. This verifies both descriptor safety and retention of
+   the unaffected fast path.
+
+## Dead Cells nondeterministic missing texture layers from deferred uploads (2026-07-31)
+
+### Symptom
+
+Dead Cells (`CUSA10484`) intermittently entered the same live dialogue scene with characters,
+particles, UI, and the spotlight present, but the room masonry, foreground, weapon, and other
+texture layers absent. The surviving image was a flat blue background. Draw, submit, and present
+continued at 56-60 per second, so this was neither a guest freeze nor a lost Vulkan device.
+
+The failure was startup-order dependent. An unchanged binary could render the full room once and
+lose it on the next cold launch, which made single screenshots and title-specific shader theories
+misleading.
+
+### Isolation and root cause
+
+The five-way Vulkan bisection was repeatable:
+
+- disabling state, pipeline-bind, vertex-bind, transfer, and render-scope fast paths produced two
+  consecutive correct cold launches;
+- enabling all bind/state deduplication while leaving transfer coalescing and render-scope reuse
+  disabled remained correct;
+- leaving only transfer coalescing disabled remained correct;
+- enabling transfer coalescing while disabling only render-scope reuse reproduced the missing
+  room immediately;
+- retaining delayed coalescing but replacing range-local barriers with the old conservative
+  global barriers still reproduced the defect.
+
+The last result separates visibility-barrier shape from command timing. Transfer telemetry on the
+failing path reported only uploads (`origin=h:0,u:45140,g:0`) and a maximum of two pending groups.
+The rare second pending upload was sufficient: an `Upload` source belongs to a staging/ring
+allocation whose current lifetime contract ends once its copy is recorded. Carrying that upload
+across a later request allowed the source range to be recycled or republished before the deferred
+`copyBuffer` consumed it. Which texture layers received stale bytes therefore depended on request
+timing.
+
+[`vk_scheduler.cpp`](../funnel-arm/src/video_core/renderer_vulkan/vk_scheduler.cpp) now preserves
+coalescing of adjacent/multiple regions inside one upload request, then immediately materializes
+that request. Cross-request pending batching remains available for HLE and GNM DMA transfers,
+whose sources have separate lifetime/ordering contracts. The fix contains no title, address,
+texture, shader, or pipeline hardcode.
+
+### Rejected hypotheses
+
+- Recording detile work in the primary command buffer instead of its secondary buffer produced
+  one correct launch followed by a broken launch.
+- Disabling detile scratch-pool reuse and allocating fresh scratch buffers remained broken.
+- Disabling all read-only rename paths remained broken; UBO/SSBO rename was already hard-gated.
+- Disabling asynchronous pipelines remained broken.
+- Disabling adaptive mobile GPU/residency/DRS remained broken; coarse 2x2 shading was already off.
+- Restoring direct page-manager `InvalidateMemory`/`ReadMemory` routing remained broken, excluding
+  guest-invalidation batching as the cause.
+- State, pipeline-bind, and vertex-bind deduplication remained enabled in a correct run.
+- Render-scope reuse disabled by itself did not help.
+- Conservative global memory barriers around the delayed batch did not help; the defect was the
+  staging lifetime crossed by deferral, not a narrower access mask.
+
+The detile scratch pool, guest-thread invalidation routing, async pipeline, adaptive mobile GPU,
+bind/state deduplication, render-scope reuse, and local transfer barriers were restored after their
+negative A/B results. No diagnostic bisection marker remains enabled.
+
+### Required invariant and regression checks
+
+1. A staging-backed upload must be recorded before the producer can recycle, overwrite, retire,
+   or republish its source allocation. A memory barrier cannot extend allocation lifetime.
+2. Multi-region merging within one request is safe; cross-request upload deferral requires an
+   explicit submit-timeline pin for every source slice and must not be reintroduced without one.
+3. HLE/GNM DMA pending batching must remain independent from upload eligibility.
+4. `current-vivo-deadcells-upload-lifetime-r1.png` and
+   `current-vivo-deadcells-upload-lifetime-r2.png` are two consecutive correct cold launches with
+   every managed optimization enabled and no bisection marker. The later
+   `current-vivo-deadcells-upload-lifetime-gameplay.png` remains correct after additional dialogue
+   and resource activity at 58 FPS.
+5. Regressions must be checked with at least two cold launches and a resource-transition segment;
+   one correct frame is insufficient for this timing-dependent bug.

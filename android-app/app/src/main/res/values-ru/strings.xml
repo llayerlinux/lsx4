@@ -79,6 +79,16 @@
     <string name="optimization_jit_trace_compilation_hint">Компилирует стабильные горячие прямые пути как оптимизированные трассы Tier 2. Требует многоуровневый JIT; небезопасные и изменившиеся пути остаются на базовом JIT. После изменения перезапустите игру.</string>
     <string name="optimization_fast_guest_memory">Быстрая модель памяти гостя</string>
     <string name="optimization_fast_guest_memory_hint">Экспериментально: прямые ARM-чтения и записи используются только для обращений относительно стека, вся остальная память гостя сохраняет строгую модель. По умолчанию отключено, пока нельзя доказать приватность всех переданных адресов стека. После изменения перезапустите игру.</string>
+    <string name="optimization_relaxed_fp_fusion">Слияние скалярных FMA</string>
+    <string name="optimization_relaxed_fp_fusion_hint">Заменяет доказанные цепочки MUL+ADD одной ARM64 FMADD. Промежуточное округление удаляется, поэтому строгий x86-режим остаётся вариантом по умолчанию. После изменения перезапустите игру.</string>
+    <string name="optimization_android_performance_hint">Подсказки производительности Android (ADPF)</string>
+    <string name="optimization_android_performance_hint_hint">На Android 12 и новее объединяет Game:Main, GpuComm, FMOD и рабочие потоки в кадровую нагрузку и сообщает фактическое время кадра относительно цели 30 FPS. На неподдерживаемых системах безопасно отключается. Режим sustained performance не используется. После изменения перезапустите игру.</string>
+    <string name="optimization_host_flagm">JIT-лоуеринг ARM FlagM/FlagM2</string>
+    <string name="optimization_host_flagm_hint">Использует компактные ARM-инструкции преобразования флагов только при подтверждённой поддержке CPU и ядром. На остальных устройствах автоматически остаётся базовый путь. После изменения перезапустите игру.</string>
+    <string name="optimization_host_sve2">JIT-лоуеринг ARM SVE2</string>
+    <string name="optimization_host_sve2_hint">Использует SVE2 только для выгодных широких векторных операций, сохраняя NEON во всех остальных случаях. При отсутствии поддержки или недостаточной длине вектора автоматически используется NEON. После изменения перезапустите игру.</string>
+    <string name="optimization_host_rcpc">ARM RCpc для host acquire</string>
+    <string name="optimization_host_rcpc_hint">Использует LDAPR только для доказанных host-side acquire-загрузок. Guest LOCK, fence, последовательная согласованность и GPU ordering остаются строгими. На неподдерживаемых устройствах используется LDAR. После изменения перезапустите игру.</string>
     <string name="optimization_readback_batching">Пакетный GPU readback на submit</string>
     <string name="optimization_readback_batching_hint">Публикует CPU-side fence/label из одного снимка submit, объединяет соседние страницы в multi-copy и выполняет не более одного timeline wait на волну запросов. После изменения перезапустите игру.</string>
     <string name="optimization_vulkan_driver_calls">Сократить обращения к драйверу Vulkan</string>
