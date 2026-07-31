@@ -22,6 +22,14 @@ void ConfigureTieredJit(bool enabled, bool trace_compilation_enabled) noexcept;
 [[nodiscard]] bool JitTraceCompilationEnabled() noexcept;
 void ConfigureFastGuestMemory(bool enabled) noexcept;
 [[nodiscard]] bool FastGuestMemoryEnabled() noexcept;
+void ConfigureRelaxedFpFusion(bool enabled) noexcept;
+[[nodiscard]] bool RelaxedFpFusionEnabled() noexcept;
+void ConfigureHostFlagM(bool enabled) noexcept;
+[[nodiscard]] bool HostFlagMEnabled() noexcept;
+void ConfigureHostSve2(bool enabled) noexcept;
+[[nodiscard]] bool HostSve2Enabled() noexcept;
+void ConfigureHostRcpc(bool enabled) noexcept;
+[[nodiscard]] bool HostRcpcEnabled() noexcept;
 
 enum class LsxGpr : std::uint8_t {
     Rax,
@@ -229,6 +237,8 @@ struct DecodeSummary {
     std::uint8_t operand_width = 0;
     std::uint8_t operand_count = 0;
     std::uint8_t operand_count_visible = 0;
+    std::uint16_t implicit_gpr_read_mask = 0;
+    std::uint16_t implicit_gpr_write_mask = 0;
 };
 
 static_assert(std::is_standard_layout_v<DecodeSummary>);

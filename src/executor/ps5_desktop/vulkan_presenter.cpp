@@ -8,6 +8,7 @@
 #include "executor/ps5_desktop/vulkan_presenter.h"
 #include "executor/ps5_desktop/gen5_compute_recompiler.h"
 #include "executor/ps5_desktop/vulkan_guest_shaders.h"
+#include "executor/android_performance_hint.h"
 
 #include <android/log.h>
 #include <android/native_window.h>
@@ -4999,6 +5000,7 @@ bool SubmitGuestPasses(Presenter& presenter,
         return false;
     }
     g_present_count.fetch_add(1u, std::memory_order_relaxed);
+    Executor::AndroidPerformanceHint::ReportFramePresented();
     return true;
 }
 
@@ -5501,6 +5503,7 @@ bool SubmitGuestFrame(Presenter& presenter,
         return false;
     }
     g_present_count.fetch_add(1u, std::memory_order_relaxed);
+    Executor::AndroidPerformanceHint::ReportFramePresented();
     return true;
 }
 
@@ -5686,6 +5689,7 @@ bool SubmitFrame(Presenter& presenter,
         return false;
     }
     g_present_count.fetch_add(1u, std::memory_order_relaxed);
+    Executor::AndroidPerformanceHint::ReportFramePresented();
     return true;
 }
 

@@ -304,6 +304,54 @@ targets. Reusing the single-block native format would weaken rollback and SMC
 invariants. Persistent PGO plus persistent member IR/native code retains the
 startup benefit while T2 is safely rebuilt in the background.
 
+## Register-authority observer invariant (2026-07-31)
+
+An attempted exact-layout GPR chain kept all twelve selected guest GPRs in
+host registers across a native edge. The target entry and the fault sidecar
+agreed on offsets and dirty bits, but Bloodborne stopped deterministically at
+203,297 compiled blocks with a frozen frame and zero FPS. Adding dirty bits to
+the layout signature did not move the failure point. This ruled out a simple
+layout collision: a quantum/HLE/deopt observer outside the ordinary edge and
+signal paths still consumed the four adaptive caller-saved registers from the
+machine image.
+
+The safe resolution was to stop publishing mode-2 full-layout entries and to
+omit their generated entry body while retaining the proven eight-register
+static convention and exact metadata for future work. The gated build passed
+the former failure point (282,380 blocks), reached the warning/title/menu and
+loaded the Hunter's Dream save with valid graphics. Persisted metadata remains
+versioned, but cannot activate the incomplete convention.
+
+A second experiment narrowed the missing contract further. Restricting the
+mode-2 layout to read-only adaptive registers still failed before gameplay
+with `jit_host_access_no_resume` (`SIGSEGV`, fault address `0x100000`). Dirty
+mask publication and a source/target layout collision therefore cannot explain
+the stop. The common failure is the carrier itself: adaptive values used
+caller-saved `x1/x2/x3/x5`, which are not preserved by every ordinary edge,
+fault, helper and scheduler landing. Mode 2 remains hard-gated until it owns a
+dedicated callee-saved carrier set or every such observer has an exact recovery
+map. Do not weaken this gate by admitting read-only layouts.
+
+The first safe write-back rollout is deliberately narrower. Closed,
+guard-free Tier-2 loops may keep resident GPRs dirty because their fault
+descriptors map every resident host register and their helper, quantum and
+final exits already publish state. In Bloodborne this reduced an eight-second
+`task-clock` sample by 8.1% and generated-code cycles by 9.9% while passing the
+previous 203k/282k block failure points and reaching Hunter's Dream. Fault
+sidecars for this category must be bounded by exact host-PC intervals: every
+guest instruction closes its last descriptor with a zero-publication marker.
+The earlier unbounded sidecar retained the preceding memory descriptor across
+later control/metadata code and could strand Game:Main at zero FPS while audio
+continued.
+
+Do not re-enable a wider native-chain convention merely because source and
+destination layouts match. It is valid only after every observer is explicit:
+fault signal, guard rollback, computed edge, HLE/helper, event/interrupt and
+the bounded quantum landing. Any missing observer must force publication of
+its exact dirty mask before control can escape the chain. A deterministic
+zero-FPS stop must be treated as state-authority corruption, not as a slow
+compile or renderer stall.
+
 ## Metrics and acceptance gates
 
 Add counters to the existing JIT JSON/HUD:

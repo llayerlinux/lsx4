@@ -77,6 +77,12 @@ public final class SettingsActivity extends Activity {
     public static final String K_ADAPTIVE_MOBILE_GPU = "managed_adaptive_mobile_gpu";
     public static final String K_AUDIO_SIMD = "managed_audio_simd";
     public static final String K_FAST_GUEST_MEMORY = "managed_fast_guest_memory";
+    public static final String K_RELAXED_FP_FUSION = "managed_relaxed_fp_fusion";
+    public static final String K_ANDROID_PERFORMANCE_HINT =
+            "managed_android_performance_hint";
+    public static final String K_HOST_FLAGM = "managed_host_flagm";
+    public static final String K_HOST_SVE2 = "managed_host_sve2";
+    public static final String K_HOST_RCPC = "managed_host_rcpc";
     private static final String K_LEGACY_PERSISTENT_JIT_CACHE =
             "jit_persistent_jit_cache";
     public static final String K_DISABLE_DYNAMIC_SHADOWS = "disable_dynamic_shadows";
@@ -880,6 +886,38 @@ public final class SettingsActivity extends Activity {
                 getString(R.string.optimization_fast_guest_memory_hint));
         fastGuestMemoryHint.setPadding(dp(8), dp(10), dp(8), 0);
         root.addView(fastGuestMemoryHint);
+
+        root.addView(preferenceCheck(R.string.optimization_relaxed_fp_fusion,
+                K_RELAXED_FP_FUSION, false));
+        TextView relaxedFpFusionHint = hint(
+                getString(R.string.optimization_relaxed_fp_fusion_hint));
+        relaxedFpFusionHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(relaxedFpFusionHint);
+
+        root.addView(preferenceCheck(R.string.optimization_android_performance_hint,
+                K_ANDROID_PERFORMANCE_HINT, true));
+        TextView androidPerformanceHint = hint(
+                getString(R.string.optimization_android_performance_hint_hint));
+        androidPerformanceHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(androidPerformanceHint);
+
+        root.addView(preferenceCheck(R.string.optimization_host_flagm,
+                K_HOST_FLAGM, true));
+        TextView hostFlagMHint = hint(getString(R.string.optimization_host_flagm_hint));
+        hostFlagMHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(hostFlagMHint);
+
+        root.addView(preferenceCheck(R.string.optimization_host_sve2,
+                K_HOST_SVE2, true));
+        TextView hostSve2Hint = hint(getString(R.string.optimization_host_sve2_hint));
+        hostSve2Hint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(hostSve2Hint);
+
+        root.addView(preferenceCheck(R.string.optimization_host_rcpc,
+                K_HOST_RCPC, true));
+        TextView hostRcpcHint = hint(getString(R.string.optimization_host_rcpc_hint));
+        hostRcpcHint.setPadding(dp(8), dp(10), dp(8), 0);
+        root.addView(hostRcpcHint);
 
         root.addView(preferenceCheck(R.string.optimization_readback_batching,
                 K_READBACK_BATCHING, true));

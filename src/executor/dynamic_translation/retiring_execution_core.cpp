@@ -10,6 +10,7 @@
 #include "executor/dynamic_translation/floating_relation.h"
 #include "executor/dynamic_translation/guest_capability_profile.h"
 #include "executor/dynamic_translation/guest_mapping_policy.h"
+#include "executor/dynamic_translation/host_isa_profile.h"
 #include "executor/dynamic_translation/vector_lowering_policy.h"
 #include "executor/dynamic_translation/packed_lane_ops.h"
 #include "executor/dynamic_translation/partial_move_plan.h"
@@ -70,6 +71,9 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#if defined(__aarch64__)
+#include <arm_acle.h>
+#endif
 
 #ifdef __ANDROID__
 #include <android/api-level.h>
@@ -102,6 +106,15 @@ std::atomic<bool> g_jit_trace_compilation_enabled{false};
 // This path is opt-in until its private-stack proof also covers escaped guest
 // stack addresses. Strict x86 ordering remains the safe default on every host.
 std::atomic<bool> g_fast_guest_memory_enabled{false};
+std::atomic<bool> g_relaxed_fp_fusion_enabled{false};
+std::atomic<bool> g_host_flagm_enabled{true};
+std::atomic<bool> g_host_sve2_enabled{true};
+std::atomic<bool> g_host_rcpc_enabled{true};
+std::atomic<std::uint64_t> g_host_flagm_small_nz_emissions{};
+std::atomic<std::uint64_t> g_host_flagm_carry_chain_emissions{};
+std::atomic<std::uint64_t> g_host_flagm2_fp_compare_emissions{};
+std::atomic<std::uint64_t> g_host_sve2_pshufb_emissions{};
+std::atomic<std::uint64_t> g_host_rcpc_metadata_emissions{};
 }
 
 bool TieredJitEnabled() noexcept {
@@ -114,6 +127,63 @@ bool JitTraceCompilationEnabled() noexcept {
 
 bool FastGuestMemoryEnabled() noexcept {
     return g_fast_guest_memory_enabled.load(std::memory_order_acquire);
+}
+
+bool RelaxedFpFusionEnabled() noexcept {
+    return g_relaxed_fp_fusion_enabled.load(std::memory_order_acquire);
+}
+
+namespace {
+
+bool JitHostHasFlagM() noexcept {
+    return g_host_flagm_enabled.load(std::memory_order_acquire) &&
+           GetHostIsaProfile().Has(HostIsaFeature::FlagM);
+}
+
+bool JitHostHasFlagM2() noexcept {
+    return JitHostHasFlagM() &&
+           GetHostIsaProfile().Has(HostIsaFeature::FlagM2);
+}
+
+bool JitHostHasSve2() noexcept {
+    return g_host_sve2_enabled.load(std::memory_order_acquire) &&
+           GetHostIsaProfile().Has(HostIsaFeature::Sve2) &&
+           GetHostIsaProfile().sve_vector_bytes >= 32;
+}
+
+bool JitHostHasRcpc() noexcept {
+    return g_host_rcpc_enabled.load(std::memory_order_acquire) &&
+           GetHostIsaProfile().Has(HostIsaFeature::Lrcpc);
+}
+
+std::uint64_t JitEffectiveHostIsaMask() noexcept {
+    const HostIsaProfile& profile = GetHostIsaProfile();
+    std::uint64_t mask = 0;
+    if (profile.Has(HostIsaFeature::Lse)) {
+        mask |= static_cast<std::uint64_t>(HostIsaFeature::Lse);
+    }
+    if (JitHostHasFlagM()) {
+        mask |= static_cast<std::uint64_t>(HostIsaFeature::FlagM);
+        if (JitHostHasFlagM2()) {
+            mask |= static_cast<std::uint64_t>(HostIsaFeature::FlagM2);
+        }
+    }
+    if (JitHostHasRcpc()) {
+        mask |= static_cast<std::uint64_t>(HostIsaFeature::Lrcpc);
+        if (profile.Has(HostIsaFeature::Ilrcpc)) {
+            mask |= static_cast<std::uint64_t>(HostIsaFeature::Ilrcpc);
+        }
+        if (profile.Has(HostIsaFeature::Lrcpc3)) {
+            mask |= static_cast<std::uint64_t>(HostIsaFeature::Lrcpc3);
+        }
+    }
+    if (JitHostHasSve2()) {
+        mask |= static_cast<std::uint64_t>(HostIsaFeature::Sve) |
+                static_cast<std::uint64_t>(HostIsaFeature::Sve2);
+    }
+    return mask;
+}
+
 }
 
 void CompareExchangeWideAtomic(LsxMachineImage& state, std::uint64_t address);
@@ -377,17 +447,10 @@ thread_local bool g_jit_stable_guest_reads = false;
 
 std::uint64_t ReadGuestTsc(const bool prior_loads_visible) {
 #if defined(__aarch64__)
-    std::uint64_t value = 0;
     if (prior_loads_visible) {
-        asm volatile("dmb ishld\n\t"
-                     "mrs %0, cntvct_el0"
-                     : "=r"(value)
-                     :
-                     : "memory");
-    } else {
-        asm volatile("mrs %0, cntvct_el0" : "=r"(value));
+        __dmb(9); // DMB ISHLD
     }
-    return value;
+    return __arm_rsr64("cntvct_el0");
 #else
     return static_cast<std::uint64_t>(
         std::chrono::steady_clock::now().time_since_epoch().count());
@@ -401,9 +464,7 @@ std::uint32_t ReadGuestTscAux() {
     if (syscall(SYS_getcpu, &cpu, &node, nullptr) == 0) {
         return (node << 12u) | cpu;
     }
-    std::uint64_t tpidrro = 0;
-    asm volatile("mrs %0, tpidrro_el0" : "=r"(tpidrro));
-    return static_cast<std::uint32_t>(tpidrro);
+    return static_cast<std::uint32_t>(__arm_rsr64("tpidrro_el0"));
 #else
     return 0;
 #endif
@@ -769,12 +830,7 @@ bool JitBlockUsesPostLoadDirectV9(const LsxDecodedRegion& block) {
 }
 
 bool JitHostHasLseAtomics() {
-#if defined(__ANDROID__) && defined(__aarch64__) && defined(HWCAP_ATOMICS)
-    static const bool supported = (getauxval(AT_HWCAP) & HWCAP_ATOMICS) != 0;
-    return supported;
-#else
-    return false;
-#endif
+    return GetHostIsaProfile().Has(HostIsaFeature::Lse);
 }
 
 bool JitBlockUsesDirectFaultSlotV10(const LsxDecodedRegion& block) {
@@ -1102,6 +1158,43 @@ bool JitHelperPerfMapEnabled() {
     return toggle.Enabled();
 }
 
+void EmitHostMetadataAcquire(Xbyak_aarch64::CodeGenerator& code,
+                             const WReg& destination,
+                             const Xbyak_aarch64::AdrImm& address) {
+    if (JitHostHasRcpc()) {
+        code.ldapr(destination, address);
+        if (g_host_rcpc_metadata_emissions.fetch_add(
+                1, std::memory_order_relaxed) == 0) {
+            JitLog("[EXECUTOR_HOST_ISA_LOWERING] feature=rcpc "
+                   "operation=runtime_metadata_acquire active=1");
+        }
+    } else {
+        code.ldar(destination, address);
+    }
+}
+
+void EmitHostMetadataAcquire(Xbyak_aarch64::CodeGenerator& code,
+                             const XReg& destination,
+                             const Xbyak_aarch64::AdrImm& address) {
+    if (JitHostHasRcpc()) {
+        code.ldapr(destination, address);
+        if (g_host_rcpc_metadata_emissions.fetch_add(
+                1, std::memory_order_relaxed) == 0) {
+            JitLog("[EXECUTOR_HOST_ISA_LOWERING] feature=rcpc "
+                   "operation=runtime_metadata_acquire active=1");
+        }
+    } else {
+        code.ldar(destination, address);
+    }
+}
+
+bool JitTierEventLoggingEnabled() {
+    static const DiagnosticSwitch toggle{
+        "/data/data/app.lsx4.android/files/lsx4-home/diag-jit-tier-events",
+        "EXECUTOR_JIT_TIER_EVENTS"};
+    return toggle.Enabled();
+}
+
 void JitThreadName(std::span<char> output);
 
 bool JitGuestHotSamplerEnabled() {
@@ -1242,6 +1335,7 @@ bool JitDiagAlwaysCheckEnabled() {
 
 thread_local bool g_jit_selftest_differential_active = false;
 thread_local bool g_jit_selftest_production_direct_active = false;
+constexpr bool kJitResidentSimdDirectEnabled = true;
 thread_local std::uint64_t g_jit_selftest_dynamic_control_semantic_calls = 0;
 thread_local std::uint64_t g_jit_selftest_shift_flag_path_emissions = 0;
 thread_local std::uint64_t g_jit_selftest_scalar_flag_helper_emissions = 0;
@@ -1854,7 +1948,7 @@ std::string DescribeInvalidGuestMemoryAccess(
 
 constexpr std::uint64_t kRunStopMarker = 0xd15c'a7c4'0000'0001ull;
 constexpr std::uint64_t kUnwindTerminatorAddress = 0;
-constexpr std::uint32_t kGenericSharedChainFrameSize = 96;
+constexpr std::uint32_t kGenericSharedChainFrameSize = 160;
 
 thread_local std::uint64_t g_active_block_rip = 0;
 thread_local const LsxDecodedRegion* g_active_block = nullptr;
@@ -1897,12 +1991,136 @@ struct NativeFaultCachedRegister {
 struct NativeFaultRecoveryDescriptor {
     NativeFaultDescriptor instruction{};
     std::array<NativeFaultCachedRegister, 16> gpr{};
-    std::array<NativeFaultCachedRegister, 14> vector{};
+    std::array<NativeFaultCachedRegister, 48> vector{};
     std::uint8_t gpr_count = 0;
     std::uint8_t vector_count = 0;
 };
 
 constexpr std::uintptr_t kNativeFaultRecoveryTag = 1;
+
+struct NativeSignalFaultSite {
+    std::uint32_t host_offset = 0;
+    std::uintptr_t publication = 0;
+};
+
+struct NativeSignalFaultRegion {
+    std::uintptr_t host_begin = 0;
+    std::uintptr_t host_end = 0;
+    std::vector<NativeSignalFaultSite> sites{};
+    std::atomic<bool> active{false};
+};
+
+template <typename Callback>
+class JitEmissionScopeExit {
+public:
+    explicit JitEmissionScopeExit(Callback callback)
+        : callback_(std::move(callback)) {}
+    JitEmissionScopeExit(const JitEmissionScopeExit&) = delete;
+    JitEmissionScopeExit& operator=(const JitEmissionScopeExit&) = delete;
+    ~JitEmissionScopeExit() { callback_(); }
+
+private:
+    Callback callback_;
+};
+
+template <typename Callback>
+JitEmissionScopeExit(Callback) -> JitEmissionScopeExit<Callback>;
+
+#if defined(__ANDROID__) && defined(__aarch64__)
+constexpr std::size_t kMaximumSignalFaultRegions = 64u * 1024u;
+constexpr std::size_t kInvalidSignalFaultRegion =
+    std::numeric_limits<std::size_t>::max();
+std::array<std::atomic<const NativeSignalFaultRegion*>,
+           kMaximumSignalFaultRegions>
+    g_signal_fault_regions{};
+std::atomic<std::size_t> g_signal_fault_region_high_water{0};
+
+std::size_t ReserveSignalFaultRegion() noexcept {
+    std::size_t slot =
+        g_signal_fault_region_high_water.load(std::memory_order_relaxed);
+    while (slot < g_signal_fault_regions.size()) {
+        if (g_signal_fault_region_high_water.compare_exchange_weak(
+                slot, slot + 1u, std::memory_order_acq_rel,
+                std::memory_order_relaxed)) {
+            return slot;
+        }
+    }
+    return kInvalidSignalFaultRegion;
+}
+
+void PublishSignalFaultRegion(
+    const std::size_t slot,
+    const NativeSignalFaultRegion* const region) noexcept {
+    if (slot >= g_signal_fault_regions.size() || region == nullptr) {
+        return;
+    }
+    g_signal_fault_regions[slot].store(region, std::memory_order_release);
+}
+
+std::uintptr_t ResolveSignalFaultPublication(
+    const std::uintptr_t host_pc) noexcept {
+    const std::size_t count = std::min(
+        g_signal_fault_region_high_water.load(std::memory_order_acquire),
+        g_signal_fault_regions.size());
+    for (std::size_t reverse = count; reverse != 0; --reverse) {
+        const NativeSignalFaultRegion* const region =
+            g_signal_fault_regions[reverse - 1u].load(
+                std::memory_order_acquire);
+        if (region == nullptr ||
+            !region->active.load(std::memory_order_acquire) ||
+            host_pc < region->host_begin || host_pc >= region->host_end) {
+            continue;
+        }
+        const std::uint32_t offset = static_cast<std::uint32_t>(
+            host_pc - region->host_begin);
+        for (std::size_t site_index = region->sites.size();
+             site_index != 0; --site_index) {
+            const NativeSignalFaultSite& site =
+                region->sites[site_index - 1u];
+            if (site.host_offset <= offset) {
+                return site.publication;
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+std::uintptr_t ResolveSignalFaultPublication(
+    const void* const raw_context) noexcept {
+    if (raw_context == nullptr) {
+        return 0;
+    }
+    const auto* const context =
+        static_cast<const ucontext_t*>(raw_context);
+    return ResolveSignalFaultPublication(
+        static_cast<std::uintptr_t>(context->uc_mcontext.pc));
+}
+
+constexpr bool SignalFaultRegionSidecarsSupported() noexcept {
+    return true;
+}
+#else
+constexpr std::size_t kInvalidSignalFaultRegion =
+    std::numeric_limits<std::size_t>::max();
+
+std::size_t ReserveSignalFaultRegion() noexcept {
+    return kInvalidSignalFaultRegion;
+}
+
+void PublishSignalFaultRegion(
+    const std::size_t,
+    const NativeSignalFaultRegion*) noexcept {}
+
+std::uintptr_t ResolveSignalFaultPublication(
+    const void*) noexcept {
+    return 0;
+}
+
+constexpr bool SignalFaultRegionSidecarsSupported() noexcept {
+    return false;
+}
+#endif
 
 struct NativeDescriptorBundle {
     std::vector<NativeFaultDescriptor> faults{};
@@ -2059,6 +2277,7 @@ enum class DeferredFlagKind : std::uint8_t {
     Subtraction = 5,
     Logical = 6,
     ImulOverflow = 7,
+    Increment = 8,
 };
 
 constexpr std::uint64_t PackDeferredFlagMeta(
@@ -2071,7 +2290,10 @@ constexpr std::uint64_t PackDeferredFlagMeta(
             << 16u);
 }
 
-void MaterializeDeferredFlags(LsxMachineImage& state) noexcept {
+extern "C" __attribute__((noinline, visibility("hidden")))
+void Lsx4MaterializeDeferredFlagsBody(
+    LsxMachineImage* const state_image) noexcept {
+    LsxMachineImage& state = *state_image;
     const std::uint64_t meta = state.deferred_flags_meta;
     const auto kind =
         static_cast<DeferredFlagKind>(static_cast<std::uint8_t>(meta));
@@ -2080,13 +2302,19 @@ void MaterializeDeferredFlags(LsxMachineImage& state) noexcept {
     }
     const std::uint32_t width =
         static_cast<std::uint32_t>((meta >> 8u) & 0xffu);
-    if (kind == DeferredFlagKind::Decrement &&
+    if ((kind == DeferredFlagKind::Decrement ||
+         kind == DeferredFlagKind::Increment) &&
         (width == 8 || width == 16 || width == 32 || width == 64)) {
         const std::uint64_t preserved_carry =
             state.rflags & Lsx4::Translation::CarryFlag;
-        std::uint64_t flags = Lsx4::Translation::FlagsForSubtraction(
-                                  state.deferred_flags_lhs, 1, width)
-                                  .bits;
+        std::uint64_t flags =
+            kind == DeferredFlagKind::Decrement
+                ? Lsx4::Translation::FlagsForSubtraction(
+                      state.deferred_flags_lhs, 1, width)
+                      .bits
+                : Lsx4::Translation::FlagsForAddition(
+                      state.deferred_flags_lhs, 1, width)
+                      .bits;
         flags = (flags & ~Lsx4::Translation::CarryFlag) | preserved_carry;
         state.rflags =
             Lsx4::Translation::ReplaceArithmeticFlags(state.rflags, flags);
@@ -2138,6 +2366,29 @@ void MaterializeDeferredFlags(LsxMachineImage& state) noexcept {
     state.deferred_flags_meta = 0;
 }
 
+#if defined(__aarch64__)
+extern "C" __attribute__((noinline, used, visibility("hidden")))
+void Lsx4MaterializeDeferredFlagsStaticGprJitAbi(
+    LsxMachineImage*) noexcept;
+
+extern "C" __attribute__((noinline, used, visibility("hidden")))
+void Lsx4MaterializeDeferredFlagsJitAbi(LsxMachineImage*) noexcept;
+#else
+void Lsx4MaterializeDeferredFlagsStaticGprJitAbi(
+    LsxMachineImage* const state) noexcept {
+    Lsx4MaterializeDeferredFlagsBody(state);
+}
+
+void Lsx4MaterializeDeferredFlagsJitAbi(
+    LsxMachineImage* const state) noexcept {
+    Lsx4MaterializeDeferredFlagsBody(state);
+}
+#endif
+
+void MaterializeDeferredFlags(LsxMachineImage& state) noexcept {
+    Lsx4MaterializeDeferredFlagsBody(&state);
+}
+
 struct JitDeferredGuestFault {
     std::uint32_t valid = 0;
     std::int32_t native_sig = 0;
@@ -2166,54 +2417,11 @@ struct JitSynchronousFaultResumeFrame {
     volatile sig_atomic_t armed = 0;
 };
 
-__attribute__((returns_twice, naked, noinline))
-int CaptureJitFaultResume(JitSynchronousFaultResumeFrame*) {
-    asm volatile(
-        "bti c\n"
-        "stp x19, x20, [x0, #0]\n"
-        "stp x21, x22, [x0, #16]\n"
-        "stp x23, x24, [x0, #32]\n"
-        "stp x25, x26, [x0, #48]\n"
-        "stp x27, x28, [x0, #64]\n"
-        "stp x29, x30, [x0, #80]\n"
-        "mov x1, sp\n"
-        "str x1, [x0, #96]\n"
-        "stp d8, d9, [x0, #104]\n"
-        "stp d10, d11, [x0, #120]\n"
-        "stp d12, d13, [x0, #136]\n"
-        "stp d14, d15, [x0, #152]\n"
-        "mrs x1, fpcr\n"
-        "str w1, [x0, #168]\n"
-        "mrs x1, fpsr\n"
-        "str w1, [x0, #172]\n"
-        "mov w0, wzr\n"
-        "ret\n");
-}
+extern "C" __attribute__((returns_twice, noinline, visibility("hidden")))
+int CaptureJitFaultResume(JitSynchronousFaultResumeFrame*);
 
-[[noreturn]] __attribute__((naked, noinline))
-void RestoreJitFaultResume(JitSynchronousFaultResumeFrame*) {
-    asm volatile(
-        "bti c\n"
-        "mov x16, x0\n"
-        "ldp d8, d9, [x16, #104]\n"
-        "ldp d10, d11, [x16, #120]\n"
-        "ldp d12, d13, [x16, #136]\n"
-        "ldp d14, d15, [x16, #152]\n"
-        "ldr w17, [x16, #168]\n"
-        "msr fpcr, x17\n"
-        "ldr w17, [x16, #172]\n"
-        "msr fpsr, x17\n"
-        "ldr x17, [x16, #96]\n"
-        "mov sp, x17\n"
-        "ldp x19, x20, [x16, #0]\n"
-        "ldp x21, x22, [x16, #16]\n"
-        "ldp x23, x24, [x16, #32]\n"
-        "ldp x25, x26, [x16, #48]\n"
-        "ldp x27, x28, [x16, #64]\n"
-        "ldp x29, x30, [x16, #80]\n"
-        "mov w0, #1\n"
-        "ret\n");
-}
+extern "C" [[noreturn]] __attribute__((noinline, visibility("hidden")))
+void RestoreJitFaultResume(JitSynchronousFaultResumeFrame*);
 
 thread_local JitSynchronousFaultResumeFrame* g_jit_fault_resume_frame = nullptr;
 thread_local JitDeferredGuestFault g_jit_deferred_guest_fault{};
@@ -2241,26 +2449,16 @@ void RemoveFaultResumeFrame(
     *slot = frame.previous;
 }
 
-extern "C" __attribute__((naked, noinline, used))
-std::uint64_t ReturnFromJitSignalContextFault() {
-    asm volatile(
-        "bti c\n"
-        "ldp x27, x28, [sp, #80]\n"
-        "ldp x25, x26, [sp, #64]\n"
-        "ldp x23, x24, [sp, #48]\n"
-        "ldp x21, x22, [sp, #32]\n"
-        "ldp x19, x20, [sp, #16]\n"
-        "ldp x29, x30, [sp], #96\n"
-        "mov x0, xzr\n"
-        "ret\n");
-}
+extern "C" __attribute__((noinline, used, visibility("hidden")))
+std::uint64_t ReturnFromJitSignalContextFault();
 
 __attribute__((noinline))
 std::uint64_t InvokeHostBlockWithSignalLanding(
     const Arm64BlockEntry entry, LsxMachineImage* const state,
     volatile std::uintptr_t* const return_sp) {
-    std::uintptr_t caller_sp = 0;
-    asm volatile("mov %0, sp" : "=r"(caller_sp) : : "memory");
+    register const void* current_stack_pointer __asm__("sp");
+    const auto caller_sp =
+        reinterpret_cast<std::uintptr_t>(current_stack_pointer);
     // Shared-chain external entries allocate this fixed frame before entering
     // the resident body. A helper can have an arbitrary host call stack when
     // guest memory faults, so retain the generated frame base explicitly
@@ -2624,10 +2822,16 @@ std::atomic<std::uint64_t> g_jit_native_scalar_gpr_cached_blocks{0};
 std::atomic<std::uint64_t> g_jit_native_scalar_gpr_cached_registers{0};
 std::atomic<std::uint64_t> g_jit_native_scalar_gpr_saved_accesses{0};
 std::atomic<std::uint64_t> g_jit_native_scalar_gpr_shape_rejections{0};
+std::atomic<std::uint64_t> g_jit_native_scalar_gpr_faultable_loop_writeback_blocks{0};
 std::atomic<std::uint64_t> g_jit_native_simd_cached_blocks{0};
 std::atomic<std::uint64_t> g_jit_native_simd_cached_halves{0};
 std::atomic<std::uint64_t> g_jit_native_simd_saved_accesses{0};
+std::atomic<std::uint64_t> g_jit_native_relaxed_fma_fusions{0};
+std::atomic<std::uint64_t> g_jit_native_relaxed_neon_reductions{0};
 std::atomic<std::uint64_t> g_jit_native_deferred_loop_flag_blocks{0};
+std::atomic<std::uint64_t> g_jit_deferred_flag_direct_body_sites{0};
+std::atomic<std::uint64_t> g_jit_deferred_flag_static_gpr_sites{0};
+std::atomic<std::uint64_t> g_jit_deferred_flag_full_gpr_sites{0};
 constexpr std::size_t kJitSemanticMnemonicCount =
     static_cast<std::size_t>(X86_MNEMONIC_MAX_VALUE) + 1;
 struct RuntimeInstrumentation {
@@ -2725,6 +2929,8 @@ struct StableDecodedBlock {
     std::vector<JitNativeSegment> native_segments{};
     std::uint32_t entry_segment_index = kJitNativeNoSegment;
     std::uint32_t direct_segment_index = kJitNativeNoSegment;
+    std::uint32_t static_gpr_segment_index = kJitNativeNoSegment;
+    std::uint32_t static_gpr_entry_offset = 0;
     std::uint32_t native_flags = 0;
     bool loaded_ir_validated = false;
     bool needs_identity_migration = false;
@@ -2733,7 +2939,12 @@ struct StableDecodedBlock {
         return (native_flags & kJitNativeFlagValid) != 0 &&
                !native_segments.empty() && entry_segment_index < native_segments.size() &&
                (direct_segment_index == kJitNativeNoSegment ||
-                direct_segment_index < native_segments.size());
+                direct_segment_index < native_segments.size()) &&
+               (static_gpr_segment_index == kJitNativeNoSegment ||
+                (static_gpr_segment_index < native_segments.size() &&
+                 static_gpr_entry_offset <
+                     native_segments[static_gpr_segment_index].bytes.size() &&
+                 (static_gpr_entry_offset & 3u) == 0));
     }
 };
 
@@ -2955,6 +3166,10 @@ public:
                 std::move(candidate.native_segments);
             const std::uint32_t entry_segment_index = candidate.entry_segment_index;
             const std::uint32_t direct_segment_index = candidate.direct_segment_index;
+            const std::uint32_t static_gpr_segment_index =
+                candidate.static_gpr_segment_index;
+            const std::uint32_t static_gpr_entry_offset =
+                candidate.static_gpr_entry_offset;
             const std::uint32_t native_flags = candidate.native_flags;
             const bool needs_identity_migration = candidate.needs_identity_migration;
             candidates.erase(candidates.begin() + static_cast<std::ptrdiff_t>(index - 1));
@@ -2971,8 +3186,9 @@ public:
                             static_cast<unsigned>(decoded->end_rip - decoded->start_rip));
             }
             return {std::move(decoded), stored_hash, std::move(native_segments),
-                    entry_segment_index, direct_segment_index, native_flags, true,
-                    needs_identity_migration};
+                    entry_segment_index, direct_segment_index,
+                    static_gpr_segment_index, static_gpr_entry_offset,
+                    native_flags, true, needs_identity_migration};
         }
 
         g_jit_persistent_ir_misses.fetch_add(1, std::memory_order_relaxed);
@@ -3062,6 +3278,8 @@ public:
             warm_set.push_back({std::make_unique<LsxDecodedRegion>(std::move(selected.block)),
                                 selected.guest_hash, std::move(selected.native_segments),
                                 selected.entry_segment_index, selected.direct_segment_index,
+                                selected.static_gpr_segment_index,
+                                selected.static_gpr_entry_offset,
                                 selected.native_flags, true,
                                 selected.needs_identity_migration});
         }
@@ -3079,6 +3297,8 @@ public:
         record.native_segments = std::move(stable.native_segments);
         record.entry_segment_index = stable.entry_segment_index;
         record.direct_segment_index = stable.direct_segment_index;
+        record.static_gpr_segment_index = stable.static_gpr_segment_index;
+        record.static_gpr_entry_offset = stable.static_gpr_entry_offset;
         record.native_flags = stable.native_flags;
         record.loaded_ir_validated = stable.loaded_ir_validated;
         record.needs_identity_migration = stable.needs_identity_migration;
@@ -3091,7 +3311,10 @@ public:
                   std::vector<JitNativeSegment> native_segments = {},
                   const std::uint32_t entry_segment_index = kJitNativeNoSegment,
                   const std::uint32_t direct_segment_index = kJitNativeNoSegment,
-                  const std::uint32_t native_flags = 0) {
+                  const std::uint32_t native_flags = 0,
+                  const std::uint32_t static_gpr_segment_index =
+                      kJitNativeNoSegment,
+                  const std::uint32_t static_gpr_entry_offset = 0) {
         if (!enabled_ || !writer_available_.load(std::memory_order_acquire) ||
             block.instructions.empty()) {
             return;
@@ -3117,6 +3340,8 @@ public:
         record.native_segments = std::move(native_segments);
         record.entry_segment_index = entry_segment_index;
         record.direct_segment_index = direct_segment_index;
+        record.static_gpr_segment_index = static_gpr_segment_index;
+        record.static_gpr_entry_offset = static_gpr_entry_offset;
         record.native_flags = native_flags;
         {
             std::lock_guard lock{writer_mutex_};
@@ -3692,6 +3917,8 @@ private:
                     record.native_segments.clear();
                     record.entry_segment_index = kJitNativeNoSegment;
                     record.direct_segment_index = kJitNativeNoSegment;
+                    record.static_gpr_segment_index = kJitNativeNoSegment;
+                    record.static_gpr_entry_offset = 0;
                     record.native_flags = 0;
                 }
                 std::uint64_t record_native_bytes = 0;
@@ -3923,9 +4150,13 @@ struct CachedTranslationRecord {
     Arm64BlockEntry tier0_published_external = nullptr;
     Arm64BlockEntry tier0_published_resident = nullptr;
     Arm64BlockEntry tier0_published_static_gpr = nullptr;
+    Arm64BlockEntry tier0_published_full_gpr = nullptr;
+    std::uint32_t tier0_gpr_layout_signature = 0;
     Arm64BlockEntry tier1_published_external = nullptr;
     Arm64BlockEntry tier1_published_resident = nullptr;
     Arm64BlockEntry tier1_published_static_gpr = nullptr;
+    Arm64BlockEntry tier1_published_full_gpr = nullptr;
+    std::uint32_t tier1_gpr_layout_signature = 0;
     LocalJitTier tier = LocalJitTier::Tier0;
     Tier1PromotionState tier1_state = Tier1PromotionState::Cold;
 };
@@ -4063,9 +4294,7 @@ struct JitExecutionCacheWay {
         witness = execution.witness;
         guest_size = static_cast<std::uint16_t>(execution.block.guest_size);
         flags = static_cast<std::uint8_t>(execution.block.flags);
-        observed_revision = witness != nullptr
-            ? witness->revision.load(std::memory_order_acquire)
-            : 0;
+        observed_revision = 0;
         state = ValidBit |
             (inspect_on_first_reuse ? InspectionBit : std::uint8_t{0});
     }
@@ -4095,10 +4324,12 @@ struct TraceValidationRecord;
 struct alignas(64) JitThreadExecutionCache {
     const RetiringTranslationRuntime* backend = nullptr;
     std::uint32_t sampling_state = 1;
+    std::uint64_t observed_epoch = 0;
     std::unique_ptr<std::uint8_t[]> placement_cursors{};
     std::unique_ptr<JitExecutionCacheSet[]> sets{};
 
-    void Reset(const RetiringTranslationRuntime* const owner) {
+    void Reset(const RetiringTranslationRuntime* const owner,
+               const std::uint64_t epoch = 0) {
         if (!placement_cursors) {
             placement_cursors =
                 std::make_unique<std::uint8_t[]>(kJitExecutionSetCount);
@@ -4108,6 +4339,7 @@ struct alignas(64) JitThreadExecutionCache {
                 std::make_unique<JitExecutionCacheSet[]>(kJitExecutionSetCount);
         }
         backend = owner;
+        observed_epoch = epoch;
         sampling_state = static_cast<std::uint32_t>(
             reinterpret_cast<std::uintptr_t>(owner)) | 1u;
         std::memset(placement_cursors.get(), 0, kJitExecutionSetCount);
@@ -4138,6 +4370,7 @@ struct alignas(16) OutboundEdgeState {
     std::atomic<std::uint8_t> inspection_pending{1};
     bool carries_static_gpr_cache = false;
     std::atomic<std::uint8_t> target_accepts_static_gpr_cache{0};
+    std::uint32_t source_gpr_layout_signature = 0;
     // Keep this in the old tail padding: persisted native blocks embed the
     // offsets of owner/source_rip/enters_resident_frame. Source validation
     // identifies an edge emitted by a trace so its already-selected hot exit
@@ -4153,6 +4386,7 @@ static_assert(offsetof(OutboundEdgeState, enters_resident_frame) == 0x30);
 static_assert(offsetof(OutboundEdgeState, carries_static_gpr_cache) == 0x32);
 static_assert(
     offsetof(OutboundEdgeState, target_accepts_static_gpr_cache) == 0x33);
+static_assert(offsetof(OutboundEdgeState, source_gpr_layout_signature) == 0x34);
 static_assert(sizeof(OutboundEdgeState) == 0x40);
 static_assert(std::atomic<Arm64BlockEntry>::is_always_lock_free);
 static_assert(sizeof(std::atomic<Arm64BlockEntry>) == sizeof(Arm64BlockEntry));
@@ -4221,6 +4455,8 @@ struct PublishedDestination {
     const PublishedCodeWitness* code_witness = nullptr;
     const TraceValidationRecord* trace_validation = nullptr;
     Arm64BlockEntry static_gpr_entry = nullptr;
+    Arm64BlockEntry full_gpr_entry = nullptr;
+    std::uint32_t gpr_layout_signature = 0;
 };
 
 struct TraceValidationMember {
@@ -4233,6 +4469,8 @@ struct TraceValidationRecord {
     Arm64BlockEntry baseline_external_entry = nullptr;
     Arm64BlockEntry baseline_resident_entry = nullptr;
     Arm64BlockEntry baseline_static_gpr_entry = nullptr;
+    Arm64BlockEntry baseline_full_gpr_entry = nullptr;
+    std::uint32_t baseline_gpr_layout_signature = 0;
     const PublishedCodeWitness* baseline_witness = nullptr;
     std::vector<TraceValidationMember> members{};
     bool loop_head_osr = false;
@@ -4258,11 +4496,38 @@ struct TraceValidationRecord {
     }
 };
 
+constexpr bool kFullAdaptiveGprChainIsObserverComplete = false;
+constexpr std::uint32_t kAdaptiveGprDirtyLayoutMask = 0x000f0000u;
+
+std::uint8_t DestinationGprCacheMode(
+    const PublishedDestination& destination,
+    const OutboundEdgeState& edge) noexcept {
+    if (!edge.enters_resident_frame ||
+        !edge.carries_static_gpr_cache ||
+        destination.static_gpr_entry == nullptr) {
+        return 0;
+    }
+    if (kFullAdaptiveGprChainIsObserverComplete &&
+        edge.source_gpr_layout_signature != 0 &&
+        (edge.source_gpr_layout_signature &
+         kAdaptiveGprDirtyLayoutMask) == 0 &&
+        edge.source_gpr_layout_signature ==
+            destination.gpr_layout_signature &&
+        destination.full_gpr_entry != nullptr) {
+        return 2;
+    }
+    return 1;
+}
+
 Arm64BlockEntry SelectDestinationEntry(const PublishedDestination& destination,
                                        const OutboundEdgeState& edge) noexcept {
     if (edge.enters_resident_frame) {
-        if (edge.carries_static_gpr_cache &&
-            destination.static_gpr_entry != nullptr) {
+        const std::uint8_t cache_mode =
+            DestinationGprCacheMode(destination, edge);
+        if (cache_mode == 2) {
+            return destination.full_gpr_entry;
+        }
+        if (cache_mode == 1) {
             return destination.static_gpr_entry;
         }
         return destination.resident_entry;
@@ -4270,12 +4535,31 @@ Arm64BlockEntry SelectDestinationEntry(const PublishedDestination& destination,
     return destination.external_entry;
 }
 
-bool DestinationAcceptsStaticGprCache(
+std::uint8_t DestinationAcceptsStaticGprCache(
     const PublishedDestination& destination,
     const OutboundEdgeState& edge) noexcept {
-    return edge.enters_resident_frame &&
-           edge.carries_static_gpr_cache &&
-           destination.static_gpr_entry != nullptr;
+    return DestinationGprCacheMode(destination, edge);
+}
+
+std::atomic<std::uint64_t> g_jit_full_gpr_layout_edges_published{0};
+
+void PublishEdgeDestinationSnapshot(
+    OutboundEdgeState& edge, const Arm64BlockEntry target,
+    const std::uint8_t accepts_static_gpr_cache) noexcept {
+    edge.target_accepts_static_gpr_cache.store(
+        0, std::memory_order_release);
+    edge.target.store(target, std::memory_order_release);
+    edge.target_accepts_static_gpr_cache.store(
+        accepts_static_gpr_cache, std::memory_order_release);
+    if (accepts_static_gpr_cache == 2) {
+        const std::uint64_t published =
+            g_jit_full_gpr_layout_edges_published.fetch_add(
+                1, std::memory_order_relaxed) + 1u;
+        if ((published & (published - 1u)) == 0) {
+            JitLog("[EXECUTOR_JIT_CROSS_BLOCK_GPR] fullLayoutEdges=%llu",
+                   static_cast<unsigned long long>(published));
+        }
+    }
 }
 
 class EdgeDestinationDirectory {
@@ -4304,12 +4588,9 @@ public:
             edge->trace_validation.store(
                 destination.trace_validation, std::memory_order_relaxed);
             edge->inspection_pending.store(1, std::memory_order_relaxed);
-            edge->target_accepts_static_gpr_cache.store(
-                DestinationAcceptsStaticGprCache(destination, *edge),
-                std::memory_order_relaxed);
-            edge->target.store(
-                SelectDestinationEntry(destination, *edge),
-                std::memory_order_release);
+            PublishEdgeDestinationSnapshot(
+                *edge, SelectDestinationEntry(destination, *edge),
+                DestinationAcceptsStaticGprCache(destination, *edge));
         }
     }
 
@@ -4324,9 +4605,7 @@ public:
             edge->code_witness.store(nullptr, std::memory_order_relaxed);
             edge->trace_validation.store(nullptr, std::memory_order_relaxed);
             edge->inspection_pending.store(1, std::memory_order_relaxed);
-            edge->target_accepts_static_gpr_cache.store(
-                0, std::memory_order_relaxed);
-            edge->target.store(nullptr, std::memory_order_release);
+            PublishEdgeDestinationSnapshot(*edge, nullptr, false);
         }
     }
 
@@ -4975,6 +5254,7 @@ struct NativeFrameLayout {
     std::uint32_t byte_size;
     bool preserves_fault_pair;
     bool preserves_extended_cache;
+    bool preserves_vector_cache;
 };
 
 void EmitNativeFrameEntry(Xbyak_aarch64::CodeGenerator& code,
@@ -5002,12 +5282,24 @@ void EmitNativeFrameEntry(Xbyak_aarch64::CodeGenerator& code,
                          code.sp, static_cast<std::int32_t>(pair.offset)));
         }
     }
+    if (layout.preserves_vector_cache) {
+        code.stp(code.d9, code.d10, Xbyak_aarch64::ptr(code.sp, 96));
+        code.stp(code.d11, code.d12, Xbyak_aarch64::ptr(code.sp, 112));
+        code.stp(code.d13, code.d14, Xbyak_aarch64::ptr(code.sp, 128));
+        code.str(code.d15, Xbyak_aarch64::ptr(code.sp, 144));
+    }
     code.add(code.x29, code.sp, 0);
     code.mov(code.x19, code.x0);
 }
 
 void EmitNativeFrameExit(Xbyak_aarch64::CodeGenerator& code,
                          const NativeFrameLayout layout) {
+    if (layout.preserves_vector_cache) {
+        code.ldp(code.d9, code.d10, Xbyak_aarch64::ptr(code.sp, 96));
+        code.ldp(code.d11, code.d12, Xbyak_aarch64::ptr(code.sp, 112));
+        code.ldp(code.d13, code.d14, Xbyak_aarch64::ptr(code.sp, 128));
+        code.ldr(code.d15, Xbyak_aarch64::ptr(code.sp, 144));
+    }
     struct SavedPair {
         std::uint32_t first;
         std::uint32_t second;
@@ -5374,14 +5666,38 @@ std::uint64_t JitNativeCacheAbiId() noexcept {
     // used an NZCV-clobbering alignment test, and tag 7 was the narrower
     // private-stack experiment. Tag 11 keeps the Box64-style strong-memory
     // sequences introduced by tag 9 and adds the non-faultable fast execution
-    // contract: direct dispatch plus conservative T0 scalar residency. Tag 15
-    // makes every faultable T2 register write memory-authoritative.
     constexpr std::uint64_t kStrongMemorySequenceAbiTag =
-        0x000000000000000full;
-    return kStrictMemoryAbi ^
-           (FastGuestMemoryEnabled()
-                ? kStrongMemorySequenceAbiTag
-                : 0ull);
+        0x000000000000007cull;
+    constexpr std::uint64_t kRelaxedFpFusionAbiTag =
+        0x524650464d410002ull;
+    constexpr std::uint64_t kScalarFloatArithmeticAbiTag =
+        0x534641524d363416ull;
+    constexpr std::uint64_t kHostIsaLoweringAbiTag =
+        0x484953414249000bull;
+    constexpr std::uint64_t kStaticCallChainAbiTag =
+        0x5343414c4c000001ull;
+    constexpr std::uint64_t kNonLoopT2GprWritebackAbiTag =
+        0x4750525742000005ull;
+    constexpr std::uint64_t kNativeAbiCompositionVersion =
+        0x4c5358344e414249ull;
+    const std::uint64_t host_isa_mask = JitEffectiveHostIsaMask();
+    const std::uint64_t sve_vector_bytes =
+        JitHostHasSve2() ? GetHostIsaProfile().sve_vector_bytes : 0;
+    const std::array<std::uint64_t, 10> abi_components{
+        kNativeAbiCompositionVersion,
+        kStrictMemoryAbi,
+        kScalarFloatArithmeticAbiTag,
+        kHostIsaLoweringAbiTag,
+        kStaticCallChainAbiTag,
+        kNonLoopT2GprWritebackAbiTag,
+        FastGuestMemoryEnabled() ? kStrongMemorySequenceAbiTag : 0ull,
+        RelaxedFpFusionEnabled() ? kRelaxedFpFusionAbiTag : 0ull,
+        host_isa_mask,
+        sve_vector_bytes,
+    };
+    return XXH3_64bits_withSeed(
+        abi_components.data(), sizeof(abi_components),
+        UINT64_C(0x4a49545f41424932));
 }
 
 bool ClassifyJitModuleRelative(
@@ -5566,7 +5882,11 @@ public:
                                            LocalJitTier compilation_tier =
                                                LocalJitTier::Tier0,
                                            Arm64BlockEntry*
-                                               static_gpr_entry_out = nullptr);
+                                               static_gpr_entry_out = nullptr,
+                                           Arm64BlockEntry*
+                                               full_gpr_entry_out = nullptr,
+                                           std::uint32_t*
+                                               gpr_layout_signature_out = nullptr);
     Arm64BlockEntry EmitCheckedNativeBlock(const LsxDecodedRegion& block, Arm64BlockEntry native);
     Arm64BlockEntry EmitInterpreterBridge(const LsxDecodedRegion& block);
     bool CapturePersistentNativeBlock(Arm64BlockEntry entry, Arm64BlockEntry direct,
@@ -5576,7 +5896,10 @@ public:
                                        IndirectEdgeFanout* indirect_edge_fanout,
                                        std::vector<JitNativeSegment>& segments,
                                        std::uint32_t& entry_segment_index,
-                                       std::uint32_t& direct_segment_index) const;
+                                       std::uint32_t& direct_segment_index,
+                                       Arm64BlockEntry static_gpr_entry = nullptr,
+                                       std::uint32_t* static_gpr_segment_index = nullptr,
+                                       std::uint32_t* static_gpr_entry_offset = nullptr) const;
     bool RestorePersistentNativeBlock(const std::vector<JitNativeSegment>& segments,
                                       std::uint32_t entry_segment_index,
                                        std::uint32_t direct_segment_index,
@@ -5584,7 +5907,11 @@ public:
                                        OutboundEdgeState* primary_outbound_edge,
                                        OutboundEdgeState* secondary_outbound_edge,
                                        IndirectEdgeFanout* indirect_edge_fanout,
-                                       Arm64BlockEntry& entry, Arm64BlockEntry& direct);
+                                       Arm64BlockEntry& entry, Arm64BlockEntry& direct,
+                                       std::uint32_t static_gpr_segment_index =
+                                           kJitNativeNoSegment,
+                                       std::uint32_t static_gpr_entry_offset = 0,
+                                       Arm64BlockEntry* static_gpr_entry = nullptr);
     std::optional<HostCodeRange> FindCodeRange(std::uint64_t host_pc) const;
 
     std::size_t BlockCount() const;
@@ -5622,6 +5949,9 @@ private:
     bool ClassifyPersistentDescriptorRelocation(
         std::uint64_t value, const LsxDecodedRegion& owner,
         JitNativeRelocation& relocation) const;
+    void PublishSignalFaultSidecar(
+        Arm64BlockEntry entry, std::size_t reserved_slot,
+        std::vector<NativeSignalFaultSite> sites);
 #ifdef __ANDROID__
     std::uint8_t* AllocateCommittedCode(std::size_t size);
     std::vector<std::unique_ptr<ExecutableSlab>> executable_slabs_;
@@ -5637,6 +5967,8 @@ private:
     std::deque<LsxDecodedOp> auxiliary_fault_descriptors_;
     std::vector<std::unique_ptr<NativeDescriptorBundle>>
         native_descriptor_bundles_;
+    std::vector<std::unique_ptr<NativeSignalFaultRegion>>
+        native_signal_fault_regions_;
     std::mutex auxiliary_fault_descriptors_mutex_;
     struct PersistentDescriptorRelocationTarget {
         const LsxDecodedRegion* owner = nullptr;
@@ -5779,6 +6111,8 @@ struct TieredTraceArtifact {
     Arm64BlockEntry external_entry = nullptr;
     Arm64BlockEntry resident_entry = nullptr;
     Arm64BlockEntry static_gpr_entry = nullptr;
+    Arm64BlockEntry full_gpr_entry = nullptr;
+    std::uint32_t gpr_layout_signature = 0;
     OutboundEdgeState* primary_outbound_edge = nullptr;
     OutboundEdgeState* secondary_outbound_edge = nullptr;
     std::unique_ptr<IndirectEdgeFanout> indirect_edge_fanout{};
@@ -5900,7 +6234,8 @@ public:
         auto* const recent_execution_trace_slot = &g_recent_execution_trace;
         auto* const execution_cache = &g_jit_thread_execution_cache;
         if (execution_cache->backend != this) {
-            execution_cache->Reset(this);
+            execution_cache->Reset(
+                this, execution_cache_epoch_.load(std::memory_order_acquire));
         }
         const bool rip_probe_enabled = !JitDiagnosticRipProbes().empty();
 #if defined(__ANDROID__) && defined(__aarch64__)
@@ -5990,7 +6325,9 @@ public:
             const TranslationRecord& block = execution.block;
             const LsxDecodedRegion* decoded_block = execution.decoded;
             if (TranslationHasFeature(
-                    block.flags, TranslationFeature::DispatcherBoundary)) {
+                    block.flags, TranslationFeature::DispatcherBoundary) &&
+                !TranslationHasFeature(
+                    block.flags, TranslationFeature::ReturnTerminator)) {
                 if (TryExecuteJitDirectHleTail({state, rip})) {
                     if (advance_after_direct_hle_tail()) {
                         return result;
@@ -5998,7 +6335,8 @@ public:
                     continue;
                 }
                 JitLeafHlePltTarget plt_target{};
-                if (TryResolveJitLeafHlePlt(rip, plt_target) &&
+                TryResolveJitLeafHlePlt(rip, plt_target);
+                if (plt_target.native_function != 0 &&
                     TryExecuteJitResolvedLeafHleTail(state, plt_target)) {
                     if (advance_after_direct_hle_tail()) {
                         return result;
@@ -6416,6 +6754,7 @@ public:
                 record.witness->revision.fetch_add(1, std::memory_order_release);
             }
         });
+        AdvanceExecutionCacheEpoch();
         for (auto& [rip, site] : indirect_edge_fanouts_) {
             (void)rip;
             if (site != nullptr) {
@@ -6427,9 +6766,7 @@ public:
             std::lock_guard direct_lock{edge_graph_mutex_};
             edge_directory_.Reset([](OutboundEdgeState* const edge) {
                 if (edge != nullptr) {
-                    edge->target_accepts_static_gpr_cache.store(
-                        0, std::memory_order_relaxed);
-                    edge->target.store(nullptr, std::memory_order_release);
+                    PublishEdgeDestinationSnapshot(*edge, nullptr, false);
                     edge->code_witness.store(nullptr, std::memory_order_relaxed);
                     edge->trace_validation.store(
                         nullptr, std::memory_order_relaxed);
@@ -6609,6 +6946,7 @@ public:
             std::unique_ptr<IndirectEdgeFanout> indirect_edge_fanout{};
             Arm64BlockEntry entry = nullptr;
             Arm64BlockEntry direct = nullptr;
+            Arm64BlockEntry static_gpr = nullptr;
             PublishedCodeWitness* witness = nullptr;
             bool chain_abi = false;
             std::uint32_t restored_segment_count = 0;
@@ -6911,11 +7249,14 @@ public:
                     plan.retained_instruction_count);
                 Arm64BlockEntry entry = nullptr;
                 Arm64BlockEntry direct = nullptr;
+                Arm64BlockEntry static_gpr = nullptr;
                 if (!native_depot_.RestorePersistentNativeBlock(
                         stable.native_segments, stable.entry_segment_index,
                         stable.direct_segment_index, *stable.block,
                         plan.outgoing_slot, plan.alternate_slot,
-                        plan.indirect_edge_fanout.get(), entry, direct) ||
+                        plan.indirect_edge_fanout.get(), entry, direct,
+                        stable.static_gpr_segment_index,
+                        stable.static_gpr_entry_offset, &static_gpr) ||
                     entry == nullptr) {
                     continue;
                 }
@@ -6953,6 +7294,7 @@ public:
                 }
                 plan.entry = entry;
                 plan.direct = direct;
+                plan.static_gpr = plan.chain_abi ? static_gpr : nullptr;
                 plan.result = result;
                 plan.restored_segment_count =
                     static_cast<std::uint32_t>(stable.native_segments.size());
@@ -6977,8 +7319,12 @@ public:
             if (!plan.restored) {
                 continue;
             }
-            ConfigureOutboundEdgeEntryConvention(plan.outgoing_slot, plan.chain_abi);
-            ConfigureOutboundEdgeEntryConvention(plan.alternate_slot, plan.chain_abi);
+            ConfigureOutboundEdgeEntryConvention(
+                plan.outgoing_slot, plan.chain_abi,
+                plan.static_gpr != nullptr);
+            ConfigureOutboundEdgeEntryConvention(
+                plan.alternate_slot, plan.chain_abi,
+                plan.static_gpr != nullptr);
         }
 
         if (stop_token.stop_requested()) {
@@ -6990,6 +7336,7 @@ public:
 
         std::uint64_t restored = 0;
         std::uint64_t restored_segments = 0;
+        std::uint64_t restored_static_gpr_entries = 0;
         std::uint64_t duplicate_blocks = 0;
         std::uint64_t stale_blocks = 0;
         std::uint64_t compacted_blocks = 0;
@@ -7032,6 +7379,9 @@ public:
                         continue;
                     }
                     restored_segments += plan.restored_segment_count;
+                    restored_static_gpr_entries +=
+                        static_cast<std::uint64_t>(
+                            plan.static_gpr != nullptr);
                     if (plan.runtime_compacted) {
                         ++compacted_blocks;
                         original_instructions += plan.original_instruction_count;
@@ -7053,6 +7403,10 @@ public:
                         migrated.native_segments = std::move(stable.native_segments);
                         migrated.entry_segment_index = stable.entry_segment_index;
                         migrated.direct_segment_index = stable.direct_segment_index;
+                        migrated.static_gpr_segment_index =
+                            stable.static_gpr_segment_index;
+                        migrated.static_gpr_entry_offset =
+                            stable.static_gpr_entry_offset;
                         migrated.native_flags = stable.native_flags;
                         migrated.loaded_ir_validated = true;
                         migrated_records.push_back(std::move(migrated));
@@ -7080,6 +7434,10 @@ public:
                         plan.direct != nullptr && plan.chain_abi
                             ? plan.direct
                             : nullptr;
+                    installed.tier0_published_static_gpr =
+                        plan.direct != nullptr && plan.chain_abi
+                            ? plan.static_gpr
+                            : nullptr;
                     plan.published = true;
                     ++restored;
                 }
@@ -7094,7 +7452,8 @@ public:
                     edge_directory_.PublishAndConnect(guest_rip, {
                         plan.chain_abi ? plan.entry : plan.direct,
                         plan.chain_abi ? plan.direct : nullptr,
-                        plan.witness});
+                        plan.witness, nullptr,
+                        plan.chain_abi ? plan.static_gpr : nullptr});
                 }
             }
             if (background && batch_end < warm_set.size()) {
@@ -7315,7 +7674,8 @@ public:
             std::chrono::steady_clock::now() - started).count();
         JitLog("[EXECUTOR_JIT_PERSISTENT_NATIVE_PREWARM] enabled=1 "
                     "requested=%zu restored=%llu duplicate=%llu stale=%llu workers=%u "
-                    "segments=%llu compacted=%llu originalOps=%llu retainedOps=%llu "
+                    "segments=%llu staticGprEntries=%llu compacted=%llu "
+                    "originalOps=%llu retainedOps=%llu "
                     "regionRefs=%llu instructionRefs=%llu uncompactedOps=%llu "
                     "elapsedMs=%lld background=%u",
                     warm_set.size(), static_cast<unsigned long long>(restored),
@@ -7323,6 +7683,8 @@ public:
                     static_cast<unsigned long long>(stale_blocks),
                     worker_count,
                     static_cast<unsigned long long>(restored_segments),
+                    static_cast<unsigned long long>(
+                        restored_static_gpr_entries),
                     static_cast<unsigned long long>(compacted_blocks),
                     static_cast<unsigned long long>(original_instructions),
                     static_cast<unsigned long long>(retained_instructions),
@@ -7352,6 +7714,15 @@ public:
 
     JitExecutionLookup ResolveExecutableRegionCached(
         const std::uint64_t guest_rip, JitThreadExecutionCache& cache) {
+        const std::uint64_t execution_epoch =
+            execution_cache_epoch_.load(std::memory_order_acquire);
+        if (cache.observed_epoch != execution_epoch) {
+            std::memset(cache.placement_cursors.get(), 0,
+                        kJitExecutionSetCount);
+            std::memset(cache.sets.get(), 0,
+                        kJitExecutionSetCount * sizeof(JitExecutionCacheSet));
+            cache.observed_epoch = execution_epoch;
+        }
         const std::size_t set_index = JitExecutionSetIndex(guest_rip);
         JitExecutionCacheSet& set = cache.sets[set_index];
         const auto store_result = [&](const JitExecutionLookup& execution,
@@ -7378,9 +7749,7 @@ public:
             if (!way.IsValid() || way.guest_rip != guest_rip) {
                 continue;
             }
-            if (way.witness == nullptr ||
-                way.witness->revision.load(std::memory_order_acquire) !=
-                    way.observed_revision) {
+            if (way.witness == nullptr) {
                 way.Invalidate();
                 continue;
             }
@@ -7426,6 +7795,7 @@ public:
                 cached.witness->revision.fetch_add(
                     1, std::memory_order_release);
             }
+            AdvanceExecutionCacheEpoch();
             if (cached.block.entry != nullptr) {
                 if (cached.tier == LocalJitTier::Tier1) {
                     SaturatingDecrement(g_tiered_counts.tier1_active);
@@ -7492,6 +7862,8 @@ public:
         Arm64BlockEntry direct_target = nullptr;
         Arm64BlockEntry resident_entry = nullptr;
         Arm64BlockEntry static_gpr_entry = nullptr;
+        Arm64BlockEntry full_gpr_entry = nullptr;
+        std::uint32_t gpr_layout_signature = 0;
         bool compiled_chain_abi = false;
         bool compiled_native = false;
         const bool force_helper = JitForceHelperEnabled() ||
@@ -7754,7 +8126,9 @@ public:
                     stable.direct_segment_index, *decoded, primary_outbound_edge,
                     secondary_outbound_edge,
                     persistent_native_uses_indirect_pic ? indirect_edge_fanout : nullptr,
-                    compiled_entry, direct_target);
+                    compiled_entry, direct_target,
+                    stable.static_gpr_segment_index,
+                    stable.static_gpr_entry_offset, &static_gpr_entry);
                 if (restored_persistent_native) {
                     compiled_chain_abi =
                         (stable.native_flags &
@@ -7762,6 +8136,8 @@ public:
                     if (compiled_chain_abi) {
                         resident_entry = direct_target;
                         direct_target = compiled_entry;
+                    } else {
+                        static_gpr_entry = nullptr;
                     }
                     indirect_pic_used = persistent_native_uses_indirect_pic;
                     const std::uint64_t hits =
@@ -7788,12 +8164,15 @@ public:
                         secondary_outbound_edge, indirect_edge_fanout,
                         &indirect_pic_used, &compiled_chain_abi,
                         &resident_entry, nullptr, false,
-                        LocalJitTier::Tier0, &static_gpr_entry);
+                        LocalJitTier::Tier0, &static_gpr_entry,
+                        &full_gpr_entry, &gpr_layout_signature);
                 } catch (const std::exception& failure) {
                     compiled_entry = nullptr;
                     direct_target = nullptr;
                     resident_entry = nullptr;
                     static_gpr_entry = nullptr;
+                    full_gpr_entry = nullptr;
+                    gpr_layout_signature = 0;
                     indirect_pic_used = false;
                     compiled_chain_abi = false;
                     JitLog("[LSX4_NATIVE_EMIT_FALLBACK] pc=0x%llx reason=%s block=%s",
@@ -7804,6 +8183,8 @@ public:
                     direct_target = nullptr;
                     resident_entry = nullptr;
                     static_gpr_entry = nullptr;
+                    full_gpr_entry = nullptr;
+                    gpr_layout_signature = 0;
                     indirect_pic_used = false;
                     compiled_chain_abi = false;
                     JitLog("[LSX4_NATIVE_EMIT_FALLBACK] pc=0x%llx reason=unknown block=%s",
@@ -7982,6 +8363,8 @@ public:
         std::vector<JitNativeSegment> native_segments_to_remember;
         std::uint32_t native_entry_segment = kJitNativeNoSegment;
         std::uint32_t native_direct_segment = kJitNativeNoSegment;
+        std::uint32_t native_static_gpr_segment = kJitNativeNoSegment;
+        std::uint32_t native_static_gpr_offset = 0;
         const bool should_capture_persistent_native =
             compiled_native && persistent_native_mode && !restored_persistent_native &&
             compiled_entry != nullptr && persistent_ir_cache_.AcceptsNewRecords();
@@ -7995,7 +8378,9 @@ public:
                 primary_outbound_edge, secondary_outbound_edge,
                 indirect_pic_used ? indirect_edge_fanout : nullptr,
                 native_segments_to_remember,
-                native_entry_segment, native_direct_segment);
+                native_entry_segment, native_direct_segment,
+                compiled_chain_abi ? static_gpr_entry : nullptr,
+                &native_static_gpr_segment, &native_static_gpr_offset);
         if (captured_persistent_native) {
             const std::uint64_t captured =
                 g_jit_persistent_native_records_captured.fetch_add(
@@ -8015,6 +8400,8 @@ public:
             native_segments_to_remember.clear();
             native_entry_segment = kJitNativeNoSegment;
             native_direct_segment = kJitNativeNoSegment;
+            native_static_gpr_segment = kJitNativeNoSegment;
+            native_static_gpr_offset = 0;
         }
         if (compiled_entry == nullptr) {
             g_jit_blocks_unsupported.fetch_add(1, std::memory_order_relaxed);
@@ -8105,6 +8492,14 @@ public:
             direct_target != nullptr && compiled_chain_abi
                 ? static_gpr_entry
                 : nullptr;
+        installed.tier0_published_full_gpr =
+            direct_target != nullptr && compiled_chain_abi
+                ? full_gpr_entry
+                : nullptr;
+        installed.tier0_gpr_layout_signature =
+            direct_target != nullptr && compiled_chain_abi
+                ? gpr_layout_signature
+                : 0;
         if (compiled_entry != nullptr) {
             g_tiered_counts.tier0_compiled.fetch_add(
                 1, std::memory_order_relaxed);
@@ -8205,7 +8600,8 @@ public:
                           (indirect_pic_used
                               ? kJitNativeFlagIndirectPicSafeLinearV26
                               : 0u))
-                    : 0);
+                    : 0,
+                native_static_gpr_segment, native_static_gpr_offset);
         }
         if (compiled_native && compiled_entry != nullptr) {
             ReleaseNativeRuntimeInstructions(*decoded_ptr);
@@ -8216,7 +8612,9 @@ public:
                 compiled_chain_abi ? compiled_entry : direct_target,
                 compiled_chain_abi ? resident_entry : nullptr,
                 published_witness, result.flags,
-                compiled_chain_abi ? static_gpr_entry : nullptr);
+                compiled_chain_abi ? static_gpr_entry : nullptr,
+                compiled_chain_abi ? full_gpr_entry : nullptr,
+                compiled_chain_abi ? gpr_layout_signature : 0);
         }
         if (immediate_tier1_vector_loop) {
             bool queued_now = false;
@@ -8282,11 +8680,9 @@ public:
             edge->trace_validation.store(destination->trace_validation,
                                          std::memory_order_relaxed);
             edge->inspection_pending.store(1, std::memory_order_relaxed);
-            edge->target_accepts_static_gpr_cache.store(
-                DestinationAcceptsStaticGprCache(*destination, *edge),
-                std::memory_order_relaxed);
-            edge->target.store(SelectDestinationEntry(*destination, *edge),
-                               std::memory_order_release);
+            PublishEdgeDestinationSnapshot(
+                *edge, SelectDestinationEntry(*destination, *edge),
+                DestinationAcceptsStaticGprCache(*destination, *edge));
         }
         return edge;
     }
@@ -8309,17 +8705,13 @@ public:
             edge->trace_validation.store(destination->trace_validation,
                                          std::memory_order_relaxed);
             edge->inspection_pending.store(1, std::memory_order_relaxed);
-            edge->target_accepts_static_gpr_cache.store(
-                DestinationAcceptsStaticGprCache(*destination, *edge),
-                std::memory_order_relaxed);
-            edge->target.store(SelectDestinationEntry(*destination, *edge),
-                               std::memory_order_release);
+            PublishEdgeDestinationSnapshot(
+                *edge, SelectDestinationEntry(*destination, *edge),
+                DestinationAcceptsStaticGprCache(*destination, *edge));
         } else {
-            edge->target.store(nullptr, std::memory_order_release);
+            PublishEdgeDestinationSnapshot(*edge, nullptr, false);
             edge->code_witness.store(nullptr, std::memory_order_relaxed);
             edge->trace_validation.store(nullptr, std::memory_order_relaxed);
-            edge->target_accepts_static_gpr_cache.store(
-                0, std::memory_order_relaxed);
         }
     }
 
@@ -8380,7 +8772,9 @@ public:
                     {validation.baseline_external_entry,
                      validation.baseline_resident_entry,
                      validation.baseline_witness, nullptr,
-                     validation.baseline_static_gpr_entry});
+                     validation.baseline_static_gpr_entry,
+                     validation.baseline_full_gpr_entry,
+                     validation.baseline_gpr_layout_signature});
             }
             active = active_tiered_traces_.erase(active);
         }
@@ -8392,7 +8786,9 @@ public:
                                  Arm64BlockEntry resident_entry,
                                  const PublishedCodeWitness* code_witness,
                                  const std::uint32_t block_flags,
-                                 Arm64BlockEntry static_gpr_entry = nullptr) {
+                                 Arm64BlockEntry static_gpr_entry = nullptr,
+                                 Arm64BlockEntry full_gpr_entry = nullptr,
+                                 const std::uint32_t gpr_layout_signature = 0) {
         if (external_entry == nullptr ||
             TranslationHasFeature(block_flags, TranslationFeature::DispatcherBoundary)) {
             WithdrawPublishedDestination(guest_rip);
@@ -8402,7 +8798,8 @@ public:
         edge_directory_.PublishAndConnect(
             guest_rip,
             {external_entry, resident_entry, code_witness, nullptr,
-             static_gpr_entry});
+             static_gpr_entry, full_gpr_entry,
+             gpr_layout_signature});
     }
 
     void RetireDecodedOwnership(const std::uint64_t guest_rip) {
@@ -8413,8 +8810,13 @@ public:
     }
 
 private:
+    void AdvanceExecutionCacheEpoch() noexcept {
+        execution_cache_epoch_.fetch_add(1, std::memory_order_release);
+    }
+
     std::mutex edge_graph_mutex_;
     std::mutex block_cache_mutex_;
+    std::atomic<std::uint64_t> execution_cache_epoch_{1};
     PersistentIrBlockCache persistent_ir_cache_;
     NativeSegmentDepot native_depot_;
     EdgeDestinationDirectory edge_directory_;
@@ -8513,7 +8915,9 @@ void RetiringTranslationRuntime::ApplyTieredConfiguration(
                     {validation.baseline_external_entry,
                      validation.baseline_resident_entry,
                      validation.baseline_witness, nullptr,
-                     validation.baseline_static_gpr_entry});
+                     validation.baseline_static_gpr_entry,
+                     validation.baseline_full_gpr_entry,
+                     validation.baseline_gpr_layout_signature});
             } else {
                 edge_directory_.WithdrawAndDisconnect(seed);
             }
@@ -8884,8 +9288,13 @@ void RetiringTranslationRuntime::RecordTieredEdge(
     // merge and complete PGO-file rewrite every few hundred milliseconds.
     constexpr std::uint8_t kDenseProfileWindows = 4;
     constexpr std::uint16_t kStableProfilePeriod = 256;
+    constexpr std::uint16_t kTraceGrowthProfilePeriod = 8;
+    const std::uint16_t stable_profile_period =
+        trace_growth_seed != 0
+            ? kTraceGrowthProfilePeriod
+            : kStableProfilePeriod;
     if (selected->merged_windows >= kDenseProfileWindows) {
-        if (++selected->sparse_phase < kStableProfilePeriod) {
+        if (++selected->sparse_phase < stable_profile_period) {
             return;
         }
         selected->sparse_phase = 0;
@@ -9004,7 +9413,13 @@ void RetiringTranslationRuntime::RecordTieredEdge(
                 // worker time again. Loop requests publish at the backward
                 // edge target (the loop head), which gives natural OSR on the
                 // next Tier-1 edge into that header.
-                profile.retry_after_samples = profile.total_samples + 1024;
+                constexpr std::uint64_t kInitialTraceRetrySamples = 1024;
+                constexpr std::uint64_t kTraceGrowthRetrySamples = 64;
+                profile.retry_after_samples =
+                    profile.total_samples +
+                    (trace_growth_seed != 0
+                         ? kTraceGrowthRetrySamples
+                         : kInitialTraceRetrySamples);
                 if (queued_seed == source_rip) {
                     profile.queued = true;
                 } else {
@@ -9562,13 +9977,16 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         Arm64BlockEntry direct = nullptr;
         Arm64BlockEntry resident = nullptr;
         Arm64BlockEntry static_gpr = nullptr;
+        Arm64BlockEntry full_gpr = nullptr;
+        std::uint32_t gpr_layout_signature = 0;
         bool chain_abi = false;
         const auto* const tiered_guards =
             plan.guards.empty() ? nullptr : &plan.guards;
         Arm64BlockEntry external = native_depot_.EmitNativeControlFlowBlock(
             plan.combined, primary, &direct, secondary, nullptr, nullptr,
             &chain_abi, &resident, tiered_guards, plan.loop_head_osr,
-            LocalJitTier::Tier2, &static_gpr);
+            LocalJitTier::Tier2, &static_gpr, &full_gpr,
+            &gpr_layout_signature);
         const auto compile_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - compile_started)
@@ -9584,7 +10002,8 @@ void RetiringTranslationRuntime::CompileTieredTrace(
 
         std::uint64_t generated_bytes = 0;
         std::unordered_set<std::uint64_t> code_ranges;
-        for (const auto entry : {external, direct, resident, static_gpr}) {
+        for (const auto entry :
+             {external, direct, resident, static_gpr, full_gpr}) {
             const auto range = native_depot_.FindCodeRange(
                 reinterpret_cast<std::uint64_t>(entry));
             if (range && code_ranges.insert(range->base).second) {
@@ -9619,6 +10038,8 @@ void RetiringTranslationRuntime::CompileTieredTrace(
         artifact->external_entry = external;
         artifact->resident_entry = resident;
         artifact->static_gpr_entry = static_gpr;
+        artifact->full_gpr_entry = full_gpr;
+        artifact->gpr_layout_signature = gpr_layout_signature;
         artifact->primary_outbound_edge = primary;
         artifact->secondary_outbound_edge = secondary;
         artifact->generated_bytes = generated_bytes;
@@ -9680,6 +10101,10 @@ void RetiringTranslationRuntime::CompileTieredTrace(
                 replaced_trace->validation->baseline_resident_entry;
             artifact->validation->baseline_static_gpr_entry =
                 replaced_trace->validation->baseline_static_gpr_entry;
+            artifact->validation->baseline_full_gpr_entry =
+                replaced_trace->validation->baseline_full_gpr_entry;
+            artifact->validation->baseline_gpr_layout_signature =
+                replaced_trace->validation->baseline_gpr_layout_signature;
             artifact->validation->baseline_witness =
                 replaced_trace->validation->baseline_witness;
         } else {
@@ -9689,6 +10114,10 @@ void RetiringTranslationRuntime::CompileTieredTrace(
                 published->resident_entry;
             artifact->validation->baseline_static_gpr_entry =
                 published->static_gpr_entry;
+            artifact->validation->baseline_full_gpr_entry =
+                published->full_gpr_entry;
+            artifact->validation->baseline_gpr_layout_signature =
+                published->gpr_layout_signature;
             artifact->validation->baseline_witness =
                 published->code_witness;
         }
@@ -9718,7 +10147,9 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             plan.seed_rip,
             {active->external_entry, active->resident_entry,
              active->validation->baseline_witness,
-             active->validation.get(), active->static_gpr_entry});
+             active->validation.get(), active->static_gpr_entry,
+             active->full_gpr_entry,
+             active->gpr_layout_signature});
         tiered_active_code_bytes_.fetch_add(
             generated_bytes, std::memory_order_release);
         edge_lock.unlock();
@@ -9750,18 +10181,20 @@ void RetiringTranslationRuntime::CompileTieredTrace(
             plan.members.size() - 1u, std::memory_order_relaxed);
         g_tiered_counts.side_exits.fetch_add(
             plan.guards.size(), std::memory_order_relaxed);
-        JitLog(
-            "[EXECUTOR_TIERED_TRACE_ACTIVE] seed=0x%llx blocks=%zu "
-            "instructions=%zu guards=%zu faultable=%d loopOsr=%d bytes=%llu "
-            "compileUs=%lld external=%p resident=%p",
-            static_cast<unsigned long long>(plan.seed_rip),
-            plan.members.size(), plan.combined.instructions.size(),
-            plan.guards.size(), faultable_trace ? 1 : 0,
-            plan.loop_head_osr ? 1 : 0,
-            static_cast<unsigned long long>(generated_bytes),
-            static_cast<long long>(compile_us),
-            reinterpret_cast<void*>(active->external_entry),
-            reinterpret_cast<void*>(active->resident_entry));
+        if (JitTierEventLoggingEnabled()) {
+            JitLog(
+                "[EXECUTOR_TIERED_TRACE_ACTIVE] seed=0x%llx blocks=%zu "
+                "instructions=%zu guards=%zu faultable=%d loopOsr=%d bytes=%llu "
+                "compileUs=%lld external=%p resident=%p",
+                static_cast<unsigned long long>(plan.seed_rip),
+                plan.members.size(), plan.combined.instructions.size(),
+                plan.guards.size(), faultable_trace ? 1 : 0,
+                plan.loop_head_osr ? 1 : 0,
+                static_cast<unsigned long long>(generated_bytes),
+                static_cast<long long>(compile_us),
+                reinterpret_cast<void*>(active->external_entry),
+                reinterpret_cast<void*>(active->resident_entry));
+        }
     } catch (const std::exception& exception) {
         JitLog("[EXECUTOR_TIERED_TRACE_REJECT] seed=0x%llx reason=%s",
                static_cast<unsigned long long>(plan.seed_rip),
@@ -9788,6 +10221,7 @@ bool RetiringTranslationRuntime::DemoteTier1Locked(
         record.witness->revision.fetch_add(
             1, std::memory_order_release);
     }
+    AdvanceExecutionCacheEpoch();
 
     {
         std::lock_guard edge_lock{edge_graph_mutex_};
@@ -9799,7 +10233,9 @@ bool RetiringTranslationRuntime::DemoteTier1Locked(
                 {record.tier0_published_external,
                  record.tier0_published_resident,
                  record.witness, nullptr,
-                 record.tier0_published_static_gpr});
+                 record.tier0_published_static_gpr,
+                 record.tier0_published_full_gpr,
+                 record.tier0_gpr_layout_signature});
         } else {
             edge_directory_.WithdrawAndDisconnect(guest_rip);
         }
@@ -10006,12 +10442,15 @@ void RetiringTranslationRuntime::CompileTier1Block(
         Arm64BlockEntry direct = nullptr;
         Arm64BlockEntry resident = nullptr;
         Arm64BlockEntry static_gpr = nullptr;
+        Arm64BlockEntry full_gpr = nullptr;
+        std::uint32_t gpr_layout_signature = 0;
         bool chain_abi = false;
         Arm64BlockEntry external =
             native_depot_.EmitNativeControlFlowBlock(
                 *tier1_decoded, primary, &direct, secondary,
                 nullptr, nullptr, &chain_abi, &resident, nullptr,
-                false, LocalJitTier::Tier1, &static_gpr);
+                false, LocalJitTier::Tier1, &static_gpr, &full_gpr,
+                &gpr_layout_signature);
         const auto compile_us =
             std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() -
@@ -10052,7 +10491,8 @@ void RetiringTranslationRuntime::CompileTier1Block(
 
         std::uint64_t generated_bytes = 0;
         std::unordered_set<std::uint64_t> code_ranges;
-        for (const auto entry : {external, direct, resident, static_gpr}) {
+        for (const auto entry :
+             {external, direct, resident, static_gpr, full_gpr}) {
             const auto range = native_depot_.FindCodeRange(
                 reinterpret_cast<std::uint64_t>(entry));
             if (range && code_ranges.insert(range->base).second) {
@@ -10148,6 +10588,10 @@ void RetiringTranslationRuntime::CompileTier1Block(
                         chain_abi ? resident : nullptr;
                     current->tier1_published_static_gpr =
                         chain_abi ? static_gpr : nullptr;
+                    current->tier1_published_full_gpr =
+                        chain_abi ? full_gpr : nullptr;
+                    current->tier1_gpr_layout_signature =
+                        chain_abi ? gpr_layout_signature : 0;
                     current->tier = LocalJitTier::Tier1;
                     current->tier1_state =
                         Tier1PromotionState::Active;
@@ -10158,7 +10602,9 @@ void RetiringTranslationRuntime::CompileTier1Block(
                         {current->tier1_published_external,
                          current->tier1_published_resident,
                          current->witness, nullptr,
-                         current->tier1_published_static_gpr});
+                         current->tier1_published_static_gpr,
+                         current->tier1_published_full_gpr,
+                         current->tier1_gpr_layout_signature});
                 }
             }
         }
@@ -10191,18 +10637,20 @@ void RetiringTranslationRuntime::CompileTier1Block(
             static_cast<std::uint64_t>(
                 std::max<std::int64_t>(compile_us, 0)),
             std::memory_order_relaxed);
-        JitLog(
-            "[EXECUTOR_TIER1_ACTIVE] rip=0x%llx tier0=%p "
-            "tier1=%p resident=%p loopOsr=%d bytes=%llu "
-            "compileUs=%lld revision=%u",
-            static_cast<unsigned long long>(guest_rip),
-            reinterpret_cast<void*>(snapshot.tier0_block.entry),
-            reinterpret_cast<void*>(external),
-            reinterpret_cast<void*>(resident),
-            snapshot.loop_osr_candidate ? 1 : 0,
-            static_cast<unsigned long long>(generated_bytes),
-            static_cast<long long>(compile_us),
-            snapshot.revision + 1u);
+        if (JitTierEventLoggingEnabled()) {
+            JitLog(
+                "[EXECUTOR_TIER1_ACTIVE] rip=0x%llx tier0=%p "
+                "tier1=%p resident=%p loopOsr=%d bytes=%llu "
+                "compileUs=%lld revision=%u",
+                static_cast<unsigned long long>(guest_rip),
+                reinterpret_cast<void*>(snapshot.tier0_block.entry),
+                reinterpret_cast<void*>(external),
+                reinterpret_cast<void*>(resident),
+                snapshot.loop_osr_candidate ? 1 : 0,
+                static_cast<unsigned long long>(generated_bytes),
+                static_cast<long long>(compile_us),
+                snapshot.revision + 1u);
+        }
     } catch (const std::exception& exception) {
         reject(exception.what());
     } catch (...) {
@@ -10336,6 +10784,7 @@ void RetiringTranslationRuntime::RetirePublishedDestination(
     if (active == active_tiered_traces_.end() || active->second == nullptr ||
         !active->second->validation) {
         edge_directory_.WithdrawAndDisconnect(guest_rip);
+        AdvanceExecutionCacheEpoch();
         return;
     }
     TieredTraceArtifact& artifact = *active->second;
@@ -10360,10 +10809,13 @@ void RetiringTranslationRuntime::RetirePublishedDestination(
             {validation.baseline_external_entry,
              validation.baseline_resident_entry,
              validation.baseline_witness, nullptr,
-             validation.baseline_static_gpr_entry});
+             validation.baseline_static_gpr_entry,
+             validation.baseline_full_gpr_entry,
+             validation.baseline_gpr_layout_signature});
     } else {
         edge_directory_.WithdrawAndDisconnect(guest_rip);
     }
+    AdvanceExecutionCacheEpoch();
 }
 
 std::uint64_t RetiringTranslationRuntime::HandleTieredGuardDeopt(
@@ -10423,6 +10875,10 @@ std::uint64_t RetiringTranslationRuntime::HandleTieredGuardDeopt(
                 validation.baseline_resident_entry;
             const Arm64BlockEntry baseline_static_gpr_entry =
                 validation.baseline_static_gpr_entry;
+            const Arm64BlockEntry baseline_full_gpr_entry =
+                validation.baseline_full_gpr_entry;
+            const std::uint32_t baseline_gpr_layout_signature =
+                validation.baseline_gpr_layout_signature;
             const PublishedCodeWitness* const baseline_witness =
                 validation.baseline_witness;
             validation.active.store(false, std::memory_order_release);
@@ -10444,7 +10900,9 @@ std::uint64_t RetiringTranslationRuntime::HandleTieredGuardDeopt(
                     {baseline_external_entry,
                      baseline_resident_entry,
                      baseline_witness, nullptr,
-                     baseline_static_gpr_entry});
+                     baseline_static_gpr_entry,
+                     baseline_full_gpr_entry,
+                     baseline_gpr_layout_signature});
             } else {
                 edge_directory_.WithdrawAndDisconnect(seed_rip);
             }
@@ -10475,17 +10933,19 @@ std::uint64_t RetiringTranslationRuntime::HandleTieredGuardDeopt(
         profile.retry_after_samples =
             std::max(profile.retry_after_samples,
                      profile.total_samples + cooldown);
-        JitLog(
-            "[EXECUTOR_TIERED_TRACE_DEOPT] seed=0x%llx source=0x%llx "
-            "target=0x%llx exits=%llu hotEntries=%llu rollback=1 "
-            "rollbackCount=%u cooldownSamples=%llu",
-            static_cast<unsigned long long>(seed_rip),
-            static_cast<unsigned long long>(source_rip),
-            static_cast<unsigned long long>(cold_target),
-            static_cast<unsigned long long>(exits),
-            static_cast<unsigned long long>(hot_entries),
-            static_cast<unsigned>(profile.trace_rollback_count),
-            static_cast<unsigned long long>(cooldown));
+        if (JitTierEventLoggingEnabled()) {
+            JitLog(
+                "[EXECUTOR_TIERED_TRACE_DEOPT] seed=0x%llx source=0x%llx "
+                "target=0x%llx exits=%llu hotEntries=%llu rollback=1 "
+                "rollbackCount=%u cooldownSamples=%llu",
+                static_cast<unsigned long long>(seed_rip),
+                static_cast<unsigned long long>(source_rip),
+                static_cast<unsigned long long>(cold_target),
+                static_cast<unsigned long long>(exits),
+                static_cast<unsigned long long>(hot_entries),
+                static_cast<unsigned>(profile.trace_rollback_count),
+                static_cast<unsigned long long>(cooldown));
+        }
     }
     return cold_target;
 }
@@ -10653,6 +11113,11 @@ static_assert(kGsBaseStateOffset + sizeof(std::uint64_t) <=
 static_assert(kXmmStateOffset + (kXmmRegisterCount * kXmmRegisterBytes) <= sizeof(LsxMachineImage));
 
 NativeSegmentDepot::~NativeSegmentDepot() {
+    for (const auto& region : native_signal_fault_regions_) {
+        if (region) {
+            region->active.store(false, std::memory_order_release);
+        }
+    }
 #ifdef __ANDROID__
     for (const auto& slab : executable_slabs_) {
         if (slab && slab->base != nullptr && slab->size != 0) {
@@ -10663,6 +11128,32 @@ NativeSegmentDepot::~NativeSegmentDepot() {
         }
     }
 #endif
+}
+
+void NativeSegmentDepot::PublishSignalFaultSidecar(
+    const Arm64BlockEntry entry, const std::size_t reserved_slot,
+    std::vector<NativeSignalFaultSite> sites) {
+    if (entry == nullptr ||
+        reserved_slot == kInvalidSignalFaultRegion || sites.empty()) {
+        return;
+    }
+    const auto range = FindCommittedCodeRange(entry);
+    if (!range || range->size == 0 ||
+        range->size > std::numeric_limits<std::uint32_t>::max()) {
+        return;
+    }
+    auto region = std::make_unique<NativeSignalFaultRegion>();
+    region->host_begin =
+        reinterpret_cast<std::uintptr_t>(range->base);
+    region->host_end = region->host_begin + range->size;
+    region->sites = std::move(sites);
+    NativeSignalFaultRegion* const published = region.get();
+    {
+        std::lock_guard lock{auxiliary_fault_descriptors_mutex_};
+        native_signal_fault_regions_.push_back(std::move(region));
+    }
+    published->active.store(true, std::memory_order_release);
+    PublishSignalFaultRegion(reserved_slot, published);
 }
 
 NativeDescriptorBundle* NativeSegmentDepot::CreateDescriptorBundle() {
@@ -10832,10 +11323,19 @@ bool NativeSegmentDepot::CapturePersistentNativeBlock(
     IndirectEdgeFanout* const indirect_edge_fanout,
     std::vector<JitNativeSegment>& segments,
     std::uint32_t& entry_segment_index,
-    std::uint32_t& direct_segment_index) const {
+    std::uint32_t& direct_segment_index,
+    const Arm64BlockEntry static_gpr_entry,
+    std::uint32_t* const static_gpr_segment_index,
+    std::uint32_t* const static_gpr_entry_offset) const {
     segments.clear();
     entry_segment_index = kJitNativeNoSegment;
     direct_segment_index = kJitNativeNoSegment;
+    if (static_gpr_segment_index != nullptr) {
+        *static_gpr_segment_index = kJitNativeNoSegment;
+    }
+    if (static_gpr_entry_offset != nullptr) {
+        *static_gpr_entry_offset = 0;
+    }
     if (entry == nullptr) {
         return false;
     }
@@ -10867,6 +11367,38 @@ bool NativeSegmentDepot::CapturePersistentNativeBlock(
     } else {
         ranges.push_back(*entry_range);
         entry_segment_index = 0;
+    }
+
+    if (static_gpr_entry != nullptr) {
+        const auto static_address = reinterpret_cast<std::uintptr_t>(
+            static_gpr_entry);
+        bool found_static_entry = false;
+        for (std::size_t index = 0; index < ranges.size(); ++index) {
+            const auto range_begin = reinterpret_cast<std::uintptr_t>(
+                ranges[index].base);
+            if (static_address < range_begin ||
+                static_address - range_begin >= ranges[index].size) {
+                continue;
+            }
+            const std::size_t offset = static_address - range_begin;
+            if ((offset & 3u) != 0 ||
+                offset > std::numeric_limits<std::uint32_t>::max()) {
+                return false;
+            }
+            if (static_gpr_segment_index != nullptr) {
+                *static_gpr_segment_index =
+                    static_cast<std::uint32_t>(index);
+            }
+            if (static_gpr_entry_offset != nullptr) {
+                *static_gpr_entry_offset =
+                    static_cast<std::uint32_t>(offset);
+            }
+            found_static_entry = true;
+            break;
+        }
+        if (!found_static_entry) {
+            return false;
+        }
     }
 
     const std::uint64_t module_base = JitModuleBaseForNativeCache();
@@ -11032,13 +11564,70 @@ bool NativeSegmentDepot::RestorePersistentNativeBlock(
     OutboundEdgeState* const primary_outbound_edge,
     OutboundEdgeState* const secondary_outbound_edge,
     IndirectEdgeFanout* const indirect_edge_fanout, Arm64BlockEntry& entry,
-    Arm64BlockEntry& direct) {
+    Arm64BlockEntry& direct,
+    const std::uint32_t static_gpr_segment_index,
+    const std::uint32_t static_gpr_entry_offset,
+    Arm64BlockEntry* const static_gpr_entry) {
     entry = nullptr;
     direct = nullptr;
+    if (static_gpr_entry != nullptr) {
+        *static_gpr_entry = nullptr;
+    }
     if (segments.empty() || entry_segment_index >= segments.size() ||
         (direct_segment_index != kJitNativeNoSegment &&
-         direct_segment_index >= segments.size())) {
+         direct_segment_index >= segments.size()) ||
+        (static_gpr_segment_index != kJitNativeNoSegment &&
+         (static_gpr_segment_index >= segments.size() ||
+          static_gpr_entry_offset >=
+              segments[static_gpr_segment_index].bytes.size() ||
+          (static_gpr_entry_offset & 3u) != 0)) ||
+        (static_gpr_segment_index == kJitNativeNoSegment &&
+         static_gpr_entry_offset != 0)) {
         return false;
+    }
+    std::uint32_t effective_static_gpr_segment_index =
+        static_gpr_segment_index;
+    std::uint32_t effective_static_gpr_entry_offset =
+        static_gpr_entry_offset;
+    if (effective_static_gpr_segment_index == kJitNativeNoSegment &&
+        direct_segment_index != kJitNativeNoSegment) {
+        const auto& bytes = segments[direct_segment_index].bytes;
+        constexpr std::uint32_t kMovX21Zero = 0xd2800015u;
+        if (bytes.size() >= 12u) {
+            std::uint32_t first = 0;
+            std::memcpy(&first, bytes.data(), sizeof(first));
+            if (first == kMovX21Zero) {
+                const std::size_t scan_end =
+                    std::min<std::size_t>(bytes.size(), 512u);
+                for (std::size_t offset = 4u;
+                     offset + 8u <= scan_end; offset += 4u) {
+                    std::uint32_t instruction = 0;
+                    std::memcpy(&instruction, bytes.data() + offset,
+                                sizeof(instruction));
+                    if ((instruction & 0x7c000000u) != 0x14000000u) {
+                        continue;
+                    }
+                    const std::int64_t displacement =
+                        static_cast<std::int64_t>(
+                            static_cast<std::int32_t>(instruction << 6u) >> 4u);
+                    const std::int64_t target =
+                        static_cast<std::int64_t>(offset) + displacement;
+                    const std::size_t alternate = offset + 4u;
+                    std::uint32_t alternate_first = 0;
+                    std::memcpy(&alternate_first, bytes.data() + alternate,
+                                sizeof(alternate_first));
+                    if (alternate_first != first ||
+                        target <= static_cast<std::int64_t>(alternate) ||
+                        target > static_cast<std::int64_t>(bytes.size())) {
+                        break;
+                    }
+                    effective_static_gpr_segment_index = direct_segment_index;
+                    effective_static_gpr_entry_offset =
+                        static_cast<std::uint32_t>(alternate);
+                    break;
+                }
+            }
+        }
     }
     const std::uint64_t module_base = JitModuleBaseForNativeCache();
     if (module_base == 0) {
@@ -11234,6 +11823,12 @@ bool NativeSegmentDepot::RestorePersistentNativeBlock(
     direct = direct_segment_index == kJitNativeNoSegment
         ? nullptr
         : reinterpret_cast<Arm64BlockEntry>(committed_segments[direct_segment_index]);
+    if (static_gpr_entry != nullptr &&
+        effective_static_gpr_segment_index != kJitNativeNoSegment) {
+        *static_gpr_entry = reinterpret_cast<Arm64BlockEntry>(
+            committed_segments[effective_static_gpr_segment_index] +
+            effective_static_gpr_entry_offset);
+    }
     return entry != nullptr;
 }
 
@@ -11513,12 +12108,10 @@ LsxMachineImage* ActiveSignalContextFaultState(
     if (state == nullptr || state != FindActiveMachineImage()) {
         return nullptr;
     }
-    // Direct generated accesses publish an exact descriptor in x21. Helpers
-    // publish the current guest instruction through the existing TLS slot and
-    // preserve x19 by the AArch64 ABI. Require one of those two witnesses so an
-    // unrelated host fault is never converted into a guest fault.
     const bool generated = SignalContextPcIsGeneratedCode(raw_context);
     return context->uc_mcontext.regs[21] != 0 ||
+                   (generated &&
+                    ResolveSignalFaultPublication(raw_context) != 0) ||
                    (!generated && CurrentPublishedFaultInstruction())
                ? state
                : nullptr;
@@ -11559,8 +12152,11 @@ executor_jit_defer_synchronous_guest_fault(
     {
         const auto* const context =
             static_cast<const ucontext_t*>(raw_context);
-        const std::uint64_t descriptor =
+        std::uint64_t descriptor =
             context->uc_mcontext.regs[21];
+        if (descriptor == 0 && generated_fault) {
+            descriptor = ResolveSignalFaultPublication(raw_context);
+        }
         if (descriptor == 0 && generated_fault) {
             return 0;
         }
@@ -11638,14 +12234,12 @@ executor_jit_has_synchronous_guest_fault_frame(
         return 1;
     }
     // The Android SIGSEGV/SIGBUS route calls this before deferring a hardware
-    // fault. Helpers still publish through the machine image. Direct generated
-    // memory accesses keep the exact descriptor in x21 so the hot path avoids
-    // a state store before every load/store.
     if (SignalContextPcIsGeneratedCode(raw_context) &&
         raw_context != nullptr) {
         const auto* const context =
             static_cast<const ucontext_t*>(raw_context);
-        if (context->uc_mcontext.regs[21] != 0) {
+        if (context->uc_mcontext.regs[21] != 0 ||
+            ResolveSignalFaultPublication(raw_context) != 0) {
             if (frame != nullptr) {
                 return 1;
             }
@@ -11836,7 +12430,7 @@ void RetireRejectedDirectTarget(OutboundEdgeState& cell, const Arm64BlockEntry c
     if (cell.target.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel,
                                             std::memory_order_acquire)) {
         cell.target_accepts_static_gpr_cache.store(
-            0, std::memory_order_relaxed);
+            0, std::memory_order_release);
         const PublishedCodeWitness* const witness =
             cell.code_witness.load(std::memory_order_acquire);
         if (witness != nullptr) {
@@ -12060,10 +12654,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitCheckedNativeBlock(const LsxDecodedRegio
             offsetof(CheckedNativeBlockContext, validation) +
             offsetof(CheckedNativeBlockContext::ValidationState, accepted);
         code->add(code->x16, code->x1, rejected_offset);
-        code->ldar(code->w17, Xbyak_aarch64::ptr(code->x16));
+        EmitHostMetadataAcquire(
+            *code, code->w17, Xbyak_aarch64::ptr(code->x16));
         code->cbnz(code->w17, slow_path);
         code->add(code->x16, code->x1, accepted_offset);
-        code->ldar(code->w17, Xbyak_aarch64::ptr(code->x16));
+        EmitHostMetadataAcquire(
+            *code, code->w17, Xbyak_aarch64::ptr(code->x16));
         code->cbz(code->w17, slow_path);
         code->ldr(code->x16,
                   Xbyak_aarch64::ptr(
@@ -12227,7 +12823,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     const std::vector<TieredGuardEmission>* const tiered_guards,
     const bool force_local_loop_dispatch_safepoint,
     const LocalJitTier compilation_tier,
-    Arm64BlockEntry* const static_gpr_entry_out) {
+    Arm64BlockEntry* const static_gpr_entry_out,
+    Arm64BlockEntry* const full_gpr_entry_out,
+    std::uint32_t* const gpr_layout_signature_out) {
     if (direct_target_out != nullptr) {
         *direct_target_out = nullptr;
     }
@@ -12242,6 +12840,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     }
     if (static_gpr_entry_out != nullptr) {
         *static_gpr_entry_out = nullptr;
+    }
+    if (full_gpr_entry_out != nullptr) {
+        *full_gpr_entry_out = nullptr;
+    }
+    if (gpr_layout_signature_out != nullptr) {
+        *gpr_layout_signature_out = 0;
     }
     const auto finish_direct_native = [&](Arm64BlockEntry direct_target) {
         return PublishDirectEntry(direct_target_out, direct_target);
@@ -12469,6 +13073,20 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                          mnemonic == X86_MNEMONIC_VMULSS;
         if (!ir.can_execute_scalar_float ||
             !IsJitScalarFloatAddSubMulMnemonic(mnemonic) ||
+            ir.operand_count != (vex ? 3u : 2u) ||
+            !IsXmmOperand(ir.operands[0]) ||
+            !IsXmmOperand(ir.operands[vex ? 1u : 0u])) {
+            return false;
+        }
+        const auto& rhs = ir.operands[vex ? 2u : 1u];
+        return IsXmmOperand(rhs) ||
+               (rhs.type == X86_OPERAND_TYPE_MEMORY && rhs.size == 32);
+    };
+    const auto is_native_scalar_float_div = [](const LsxDecodedOp& ir) {
+        const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
+        const bool vex = mnemonic == X86_MNEMONIC_VDIVSS;
+        if (!ir.can_execute_scalar_float ||
+            (mnemonic != X86_MNEMONIC_DIVSS && !vex) ||
             ir.operand_count != (vex ? 3u : 2u) ||
             !IsXmmOperand(ir.operands[0]) ||
             !IsXmmOperand(ir.operands[vex ? 1u : 0u])) {
@@ -13479,7 +14097,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         if (is_native_scalar_vector_move(mnemonic)) {
             return ir.can_execute_scalar_float;
         }
-        if (is_native_scalar_float_add_sub_mul(ir)) {
+        if (is_native_scalar_float_add_sub_mul(ir) ||
+            is_native_scalar_float_div(ir)) {
             return true;
         }
 #if defined(LSX4_PS5_DESKTOP_PATH)
@@ -16577,6 +17196,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         Lsx4::Translation::CarryFlag | Lsx4::Translation::OverflowFlag;
     const auto unconditional_status_flag_kill_mask = [&](const LsxDecodedOp& ir) {
         const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
+        if (is_native_scalar_float_compare_flags(ir)) {
+            return kArithmeticStatusBits;
+        }
         if (immediate_nonzero_scalar_shift(ir)) {
             return kArithmeticStatusBits;
         }
@@ -16599,8 +17221,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             return std::uint64_t{0};
         }
     };
-    const auto status_flag_transparent_instruction = [](const LsxDecodedOp& ir) {
-        switch (static_cast<X86Mnemonic>(ir.mnemonic)) {
+    const auto status_flag_transparent_instruction = [&](const LsxDecodedOp& ir) {
+        const auto mnemonic = static_cast<X86Mnemonic>(ir.mnemonic);
+        if (is_native_simd_instruction(ir)) {
+            return !is_native_scalar_float_compare_flags(ir) &&
+                   mnemonic != X86_MNEMONIC_PTEST &&
+                   mnemonic != X86_MNEMONIC_VPTEST;
+        }
+        switch (mnemonic) {
         case X86_MNEMONIC_NOP:
         case X86_MNEMONIC_MOV:
         case X86_MNEMONIC_MOVZX:
@@ -16699,12 +17327,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
     // faulting memory operation.  A real fault materializes the recipe; on the
     // normal hot path a later unconditional writer simply replaces it.
     //
-    // Keep this path compiled but inactive until the deferred recipe has a
-    // proven unwind/RET contract on every guest worker. It did not improve the
-    // Bloodborne frame time and a long run exposed a null continuation after a
-    // faultable epilogue, so the ordinary exact inline flags are the safe fast
-    // path for now.
-    constexpr bool kEnableDeferredFaultFlagRecipes = false;
+    constexpr bool kEnableDeferredFaultFlagRecipes = true;
     std::vector<std::uint8_t> generic_defer_fault_status_flags(
         block.instructions.size(), 0);
     for (std::size_t instruction_index = 0;
@@ -16740,6 +17363,23 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 flags_still_live = kImulDefinedFlagMaskValue;
             }
             break;
+        case X86_MNEMONIC_INC:
+        case X86_MNEMONIC_DEC:
+            if (compilation_tier != LocalJitTier::Tier0 &&
+                candidate.operand_count == 1 &&
+                (candidate.operands[0].size == 8 ||
+                 candidate.operands[0].size == 16 ||
+                 candidate.operands[0].size == 32 ||
+                 candidate.operands[0].size == 64)) {
+                recipe_kind =
+                    candidate_mnemonic == X86_MNEMONIC_DEC
+                        ? DeferredFlagKind::Decrement
+                        : DeferredFlagKind::Increment;
+                flags_still_live =
+                    kArithmeticStatusBits &
+                    ~Lsx4::Translation::CarryFlag;
+            }
+            break;
         default:
             break;
         }
@@ -16761,6 +17401,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 flags_still_live &= ~killed;
                 if (flags_still_live == 0) {
                     if (kEnableDeferredFaultFlagRecipes &&
+                        compilation_tier != LocalJitTier::Tier0 &&
                         crossed_faultable_memory) {
                         generic_defer_fault_status_flags[instruction_index] =
                             static_cast<std::uint8_t>(recipe_kind);
@@ -16800,7 +17441,20 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
             return false;
         }
     };
-    // 1 = trace-internal guard, 2 = trace-local backedge terminator.
+    const auto direct_float_compare_branch_supported =
+        [](const X86Mnemonic mnemonic) {
+        switch (mnemonic) {
+        case X86_MNEMONIC_JB:
+        case X86_MNEMONIC_JBE:
+        case X86_MNEMONIC_JNB:
+        case X86_MNEMONIC_JNBE:
+        case X86_MNEMONIC_JNZ:
+        case X86_MNEMONIC_JZ:
+            return true;
+        default:
+            return false;
+        }
+    };
     //
     // A common console wait primitive is a read-only CMP/TEST + Jcc ring.
     // Keeping it as independent blocks expands every poll into full x86 flag
@@ -16845,7 +17499,82 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         tiered_guards != nullptr &&
         generic_read_only_poll_body;
     const bool kEnableDirectCompareBranchFusion =
-        tiered_read_only_poll_trace;
+        compilation_tier != LocalJitTier::Tier0;
+    constexpr std::size_t kNoFusedCompareIndex =
+        std::numeric_limits<std::size_t>::max();
+    std::vector<std::uint8_t>
+        generic_deferred_addsub_immediate_flags(
+            block.instructions.size(), 0);
+    std::vector<std::size_t> generic_guard_fused_compare_index(
+        block.instructions.size(), kNoFusedCompareIndex);
+    const auto same_architectural_register =
+        [&](const LsxRegisterCode left, const LsxRegisterCode right) {
+            std::uint32_t left_offset = 0;
+            std::uint32_t left_width = 0;
+            std::uint32_t right_offset = 0;
+            std::uint32_t right_width = 0;
+            if (register_state_offset(left, left_offset, left_width) &&
+                register_state_offset(right, right_offset, right_width)) {
+                return left_offset == right_offset;
+            }
+            if (vector_register_state_offset(
+                    left, left_offset, left_width) &&
+                vector_register_state_offset(
+                    right, right_offset, right_width)) {
+                return left_offset == right_offset;
+            }
+            return left == right;
+        };
+    const auto instruction_overwrites_compare_operand =
+        [&](const LsxDecodedOp& compare, const LsxDecodedOp& instruction) {
+            for (std::uint8_t compare_operand_index = 0;
+                 compare_operand_index < compare.operand_count;
+                 ++compare_operand_index) {
+                const auto& compare_operand =
+                    compare.operands[compare_operand_index];
+                if (compare_operand.type != X86_OPERAND_TYPE_REGISTER) {
+                    continue;
+                }
+                for (std::uint8_t operand_index = 0;
+                     operand_index < instruction.operand_count;
+                     ++operand_index) {
+                    const auto& operand = instruction.operands[operand_index];
+                    if (operand.type == X86_OPERAND_TYPE_REGISTER &&
+                        (operand.actions &
+                         X86_OPERAND_ACTION_MASK_WRITE) != 0 &&
+                        same_architectural_register(
+                            compare_operand.reg.value,
+                            operand.reg.value)) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+    const auto status_flags_overwritten_before_observation =
+        [&](const std::size_t begin, const std::size_t end) {
+            std::uint64_t live_flags = kArithmeticStatusBits;
+            for (std::size_t next_index = begin; next_index < end;
+                 ++next_index) {
+                if (tiered_guard_for_instruction(next_index) != nullptr) {
+                    break;
+                }
+                const auto& next = block.instructions[next_index];
+                const std::uint64_t killed =
+                    unconditional_status_flag_kill_mask(next);
+                if (killed != 0) {
+                    live_flags &= ~killed;
+                    if (live_flags == 0) {
+                        return true;
+                    }
+                    continue;
+                }
+                if (!status_flag_transparent_instruction(next)) {
+                    break;
+                }
+            }
+            return false;
+        };
     std::vector<std::uint8_t> generic_fused_compare_branch(
         block.instructions.size(), 0);
     for (std::size_t instruction_index = 0;
@@ -16854,34 +17583,100 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         const auto& candidate = block.instructions[instruction_index];
         const auto candidate_mnemonic =
             static_cast<X86Mnemonic>(candidate.mnemonic);
-        const TieredGuardEmission* const guard =
-            tiered_guard_for_instruction(instruction_index + 1);
+        const bool integer_compare =
+            candidate_mnemonic == X86_MNEMONIC_CMP ||
+            candidate_mnemonic == X86_MNEMONIC_TEST;
+        const bool integer_incdec =
+            (candidate_mnemonic == X86_MNEMONIC_INC ||
+             candidate_mnemonic == X86_MNEMONIC_DEC) &&
+            candidate.operand_count == 1 &&
+            candidate.operands[0].type ==
+                X86_OPERAND_TYPE_REGISTER &&
+            (candidate.operands[0].size == 32 ||
+             candidate.operands[0].size == 64);
+        const bool integer_logical_result =
+            (candidate_mnemonic == X86_MNEMONIC_AND ||
+             candidate_mnemonic == X86_MNEMONIC_OR ||
+             candidate_mnemonic == X86_MNEMONIC_XOR ||
+             candidate_mnemonic == X86_MNEMONIC_ANDN) &&
+            candidate.operand_count >= 2 &&
+            candidate.operands[0].type ==
+                X86_OPERAND_TYPE_REGISTER &&
+            (candidate.operands[0].size == 8 ||
+             candidate.operands[0].size == 16 ||
+             candidate.operands[0].size == 32 ||
+             candidate.operands[0].size == 64);
+        const bool scalar_float_compare =
+            is_native_scalar_float_compare_flags(candidate) &&
+            candidate.operand_count == 2 &&
+            IsXmmOperand(candidate.operands[0]) &&
+            IsXmmOperand(candidate.operands[1]);
         if (!kEnableDirectCompareBranchFusion ||
-            (candidate_mnemonic != X86_MNEMONIC_CMP &&
-             candidate_mnemonic != X86_MNEMONIC_TEST) ||
-            candidate.operand_count < 2 || guard == nullptr ||
-            !direct_compare_branch_supported(static_cast<X86Mnemonic>(
-                block.instructions[instruction_index + 1].mnemonic))) {
+            (!integer_compare && !integer_incdec &&
+             !integer_logical_result &&
+             !scalar_float_compare) ||
+            (!integer_incdec && !integer_logical_result &&
+             candidate.operand_count < 2)) {
             continue;
         }
-        bool reaches_full_writer = false;
-        for (std::size_t next_index = instruction_index + 2;
-             next_index < generic_scalar_instruction_count; ++next_index) {
-            if (tiered_guard_for_instruction(next_index) != nullptr) {
+        std::size_t guard_index = instruction_index + 1;
+        for (; guard_index < generic_scalar_instruction_count;
+             ++guard_index) {
+            if (tiered_guard_for_instruction(guard_index) != nullptr) {
                 break;
             }
-            const auto& next = block.instructions[next_index];
-            if (unconditional_status_flag_kill_mask(next) ==
-                kArithmeticStatusBits) {
-                reaches_full_writer = true;
-                break;
-            }
-            if (!status_flag_transparent_instruction(next)) {
+            const auto& between = block.instructions[guard_index];
+            if (!status_flag_transparent_instruction(between) ||
+                instruction_overwrites_compare_operand(candidate, between)) {
                 break;
             }
         }
-        if (reaches_full_writer) {
-            generic_fused_compare_branch[instruction_index] = 1;
+        const TieredGuardEmission* const guard =
+            guard_index < generic_scalar_instruction_count
+            ? tiered_guard_for_instruction(guard_index)
+            : nullptr;
+        if (guard == nullptr) {
+            continue;
+        }
+        const auto branch_mnemonic = static_cast<X86Mnemonic>(
+            block.instructions[guard_index].mnemonic);
+        const bool supported_branch =
+            integer_incdec
+                ? (branch_mnemonic == X86_MNEMONIC_JNZ ||
+                   branch_mnemonic == X86_MNEMONIC_JZ)
+                : (integer_compare || integer_logical_result
+                       ? direct_compare_branch_supported(branch_mnemonic)
+                       : direct_float_compare_branch_supported(
+                             branch_mnemonic));
+        if (!supported_branch) {
+            continue;
+        }
+        const bool delayed_guard =
+            guard_index != instruction_index + 1u;
+        if (integer_incdec && delayed_guard) {
+            continue;
+        }
+        if (delayed_guard && integer_compare &&
+            std::ranges::any_of(
+                std::span{candidate.operands}.first(candidate.operand_count),
+                [](const LsxOperandRecord& operand) {
+                    return operand.type == X86_OPERAND_TYPE_MEMORY;
+                })) {
+            continue;
+        }
+        if (status_flags_overwritten_before_observation(
+                guard_index + 1,
+                generic_scalar_instruction_count)) {
+            generic_fused_compare_branch[instruction_index] =
+                scalar_float_compare
+                    ? 3
+                    : (integer_incdec
+                           ? 5
+                           : (integer_logical_result
+                                  ? 6
+                                  : (delayed_guard ? 4 : 1)));
+            generic_guard_fused_compare_index[guard_index] =
+                instruction_index;
         }
     }
     const bool generic_has_guest_memory_write =
@@ -16968,22 +17763,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     if ((candidate_mnemonic == X86_MNEMONIC_CMP ||
                          candidate_mnemonic == X86_MNEMONIC_TEST) &&
                         block.instructions[candidate_index].operand_count >= 2) {
-                        bool reaches_full_writer = false;
-                        for (std::size_t next_index =
-                                 *generic_local_backedge_index;
-                             next_index < candidate_index; ++next_index) {
-                            const auto& next =
-                                block.instructions[next_index];
-                            if (unconditional_status_flag_kill_mask(next) ==
-                                kArithmeticStatusBits) {
-                                reaches_full_writer = true;
-                                break;
-                            }
-                            if (!status_flag_transparent_instruction(next)) {
-                                break;
-                            }
-                        }
-                        if (reaches_full_writer) {
+                        if (status_flags_overwritten_before_observation(
+                                *generic_local_backedge_index,
+                                candidate_index)) {
                             generic_fused_compare_branch[candidate_index] = 2;
                         }
                     }
@@ -16991,7 +17773,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 const bool generic_has_deferred_compare_flags =
                     std::ranges::any_of(
                         generic_fused_compare_branch,
-                        [](const std::uint8_t fused) { return fused != 0; });
+                        [](const std::uint8_t fused) {
+                            return fused == 1 || fused == 2 ||
+                                   fused == 4 || fused == 5 ||
+                                   fused == 6;
+                        });
                 const bool generic_has_deferred_status_flags =
                     generic_has_deferred_fault_flags ||
                     generic_has_deferred_compare_flags;
@@ -17003,19 +17789,37 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                                  generic_leaf_hle_target);
                 constexpr std::uint32_t kNoCachedGprOffset =
                     std::numeric_limits<std::uint32_t>::max();
+                const bool generic_signal_fault_sidecars_enabled =
+                    compilation_tier != LocalJitTier::Tier0;
+                const std::size_t generic_signal_fault_region_slot =
+                    generic_signal_fault_sidecars_enabled &&
+                            SignalFaultRegionSidecarsSupported() &&
+                            generic_has_faultable_memory_access
+                        ? ReserveSignalFaultRegion()
+                        : kInvalidSignalFaultRegion;
+                const bool generic_signal_fault_sidecar_enabled =
+                    generic_signal_fault_region_slot !=
+                    kInvalidSignalFaultRegion;
+                std::vector<NativeSignalFaultSite>
+                    generic_signal_fault_sites;
+                if (generic_signal_fault_sidecar_enabled) {
+                    generic_signal_fault_sites.reserve(
+                        block.instructions.size());
+                }
                 constexpr std::size_t kStaticResidentGprCount = 8;
                 constexpr std::array<std::uint32_t, 12>
                     kGenericCachedGprHostRegisters{
                         23, 24, 25, 26, 4, 6, 7, 8, 1, 2, 3, 5};
-                // Until every direct fault site can reconstruct all dirty
-                // guest registers from host-register metadata, memory must
-                // remain authoritative throughout faultable T2 code. A stale
-                // address/size reaching memcpy eventually corrupts Vulkan
-                // transfer descriptors. Non-faultable T2 retains write-back
-                // residency and zero-materialization region edges.
-                const bool generic_fault_write_through =
+                const bool generic_fault_gpr_loop_writeback_safe =
                     compilation_tier == LocalJitTier::Tier2 &&
-                    generic_has_faultable_memory_access;
+                    generic_has_local_backedge &&
+                    (tiered_guards == nullptr || tiered_guards->empty());
+                const bool generic_fault_loop_gpr_write_through_cache =
+                    compilation_tier == LocalJitTier::Tier2 &&
+                    generic_has_faultable_memory_access &&
+                    generic_has_local_backedge &&
+                    !generic_fault_gpr_loop_writeback_safe;
+                constexpr bool generic_fault_vector_write_through = false;
                 std::array<std::uint32_t, 12> generic_cached_gpr_offsets{};
                 generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                 std::array<bool, 12> generic_cached_gpr_dirty{};
@@ -17026,6 +17830,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     !JitLiveCheckedNativeEnabled();
                 bool generic_gpr_cache_shape_rejected = false;
                 std::array<std::uint32_t, 16> generic_gpr_access_count{};
+                std::array<std::uint32_t, 16> generic_gpr_read_count{};
                 std::array<bool, 16> generic_gpr_written{};
                 const auto account_cached_gpr = [&](const LsxRegisterCode reg,
                                                     const bool read,
@@ -17048,6 +17853,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                     const std::size_t slot =
                         state_offset / sizeof(std::uint64_t);
+                    generic_gpr_read_count[slot] +=
+                        static_cast<std::uint32_t>(read);
                     generic_gpr_access_count[slot] +=
                         static_cast<std::uint32_t>(read) +
                         static_cast<std::uint32_t>(write);
@@ -17065,7 +17872,49 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                     const auto candidate_mnemonic =
                         static_cast<X86Mnemonic>(candidate.mnemonic);
-                    switch (candidate_mnemonic) {
+                    const std::uint16_t implicit_read_mask =
+                        candidate.decoded.implicit_gpr_read_mask;
+                    const std::uint16_t implicit_write_mask =
+                        candidate.decoded.implicit_gpr_write_mask;
+                    const bool cache_aware_dword_divide =
+                        (candidate_mnemonic == X86_MNEMONIC_DIV ||
+                         candidate_mnemonic == X86_MNEMONIC_IDIV) &&
+                        candidate.operand_count == 1 &&
+                        candidate.operands[0].size == 32;
+                    const bool cache_aware_sign_extension =
+                        candidate_mnemonic == X86_MNEMONIC_CBW ||
+                        candidate_mnemonic == X86_MNEMONIC_CWDE ||
+                        candidate_mnemonic == X86_MNEMONIC_CDQE ||
+                        candidate_mnemonic == X86_MNEMONIC_CWD ||
+                        candidate_mnemonic == X86_MNEMONIC_CDQ ||
+                        candidate_mnemonic == X86_MNEMONIC_CQO;
+                    const bool cache_aware_implicit_gprs =
+                        cache_aware_dword_divide ||
+                        cache_aware_sign_extension;
+                    if ((implicit_read_mask != 0 ||
+                         implicit_write_mask != 0) &&
+                        !cache_aware_implicit_gprs) {
+                        generic_gpr_cache_shape_rejected = true;
+                        generic_gpr_cache_eligible = false;
+                        continue;
+                    }
+                    if (cache_aware_implicit_gprs) {
+                        for (std::uint32_t slot = 0; slot < 16u; ++slot) {
+                            const std::uint16_t bit =
+                                static_cast<std::uint16_t>(1u << slot);
+                            if (((implicit_read_mask |
+                                  implicit_write_mask) & bit) == 0) {
+                                continue;
+                            }
+                            account_cached_gpr(
+                                static_cast<LsxRegisterCode>(
+                                    X86_REGISTER_RAX + slot),
+                                (implicit_read_mask & bit) != 0,
+                                (implicit_write_mask & bit) != 0);
+                        }
+                    }
+                    if (!is_native_simd_fast(candidate)) {
+                        switch (candidate_mnemonic) {
                     case X86_MNEMONIC_NOP:
                     case X86_MNEMONIC_MOV:
                     case X86_MNEMONIC_MOVBE:
@@ -17105,17 +17954,44 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_VADDSS:
                     case X86_MNEMONIC_VSUBSS:
                     case X86_MNEMONIC_VMULSS:
+                    case X86_MNEMONIC_CBW:
+                    case X86_MNEMONIC_CWDE:
+                    case X86_MNEMONIC_CDQE:
+                    case X86_MNEMONIC_CWD:
+                    case X86_MNEMONIC_CDQ:
+                    case X86_MNEMONIC_CQO:
                         break;
+                    case X86_MNEMONIC_DIV:
+                    case X86_MNEMONIC_IDIV:
+                        if (cache_aware_dword_divide) {
+                            break;
+                        }
+                        generic_gpr_cache_shape_rejected = true;
+                        generic_gpr_cache_eligible = false;
+                        continue;
+                    case X86_MNEMONIC_BT:
+                    case X86_MNEMONIC_BTC:
+                    case X86_MNEMONIC_BTR:
+                    case X86_MNEMONIC_BTS:
+                        if (candidate.operand_count == 2 &&
+                            candidate.operands[0].type ==
+                                X86_OPERAND_TYPE_REGISTER) {
+                            break;
+                        }
+                        generic_gpr_cache_shape_rejected = true;
+                        generic_gpr_cache_eligible = false;
+                        continue;
                     case X86_MNEMONIC_IMUL:
                         if (candidate.operand_count == 2 ||
                             candidate.operand_count == 3) {
                             break;
                         }
                         [[fallthrough]];
-                    default:
-                        generic_gpr_cache_shape_rejected = true;
-                        generic_gpr_cache_eligible = false;
-                        continue;
+                        default:
+                            generic_gpr_cache_shape_rejected = true;
+                            generic_gpr_cache_eligible = false;
+                            continue;
+                        }
                     }
                     for (std::uint8_t operand_index = 0;
                          generic_gpr_cache_eligible &&
@@ -17152,36 +18028,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                 }
                 if (generic_gpr_cache_eligible) {
-                    std::uint32_t generic_fault_publication_count = 0;
-                    if (generic_has_faultable_memory_access) {
-                        for (std::size_t instruction_index = 0;
-                             instruction_index < generic_scalar_instruction_count;
-                             ++instruction_index) {
-                            const auto& candidate =
-                                block.instructions[instruction_index];
-                            std::uint32_t publications = 0;
-                            for (std::uint8_t operand_index = 0;
-                                 operand_index < candidate.operand_count;
-                                 ++operand_index) {
-                                const auto& operand =
-                                    candidate.operands[operand_index];
-                                if (operand.type != X86_OPERAND_TYPE_MEMORY) {
-                                    continue;
-                                }
-                                publications += static_cast<std::uint32_t>(
-                                    (operand.actions &
-                                     X86_OPERAND_ACTION_MASK_READ) != 0);
-                                publications += static_cast<std::uint32_t>(
-                                    (operand.actions &
-                                     X86_OPERAND_ACTION_MASK_WRITE) != 0);
-                            }
-                            if (publications == 0 &&
-                                instruction_has_faultable_memory_access(candidate)) {
-                                publications = 1;
-                            }
-                            generic_fault_publication_count += publications;
-                        }
-                    }
                     struct CachedGprCandidate {
                         std::uint32_t state_offset;
                         std::uint32_t saved_accesses;
@@ -17192,26 +18038,24 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     for (std::size_t slot = 0;
                          slot < generic_gpr_access_count.size(); ++slot) {
                         // A trace-local loop pays its cache fill once and can
-                        // reuse a read-only guest register for every polling
-                        // iteration.  Treating that fill like a per-block
-                        // access prevented single-use loop operands (the
-                        // common CMP [reg],reg shape) from becoming resident.
+                        const std::uint32_t reusable_accesses =
+                            generic_fault_loop_gpr_write_through_cache
+                            ? generic_gpr_read_count[slot]
+                            : generic_gpr_access_count[slot];
                         const std::uint32_t cost =
-                            static_cast<std::uint32_t>(
-                                !generic_has_local_backedge) +
-                            static_cast<std::uint32_t>(
-                                     generic_gpr_written[slot]) +
-                            (generic_gpr_written[slot] &&
-                                     compilation_tier == LocalJitTier::Tier0
-                                 ? generic_fault_publication_count
-                                 : 0u);
-                        if (generic_gpr_access_count[slot] <= cost) {
+                            generic_fault_loop_gpr_write_through_cache
+                            ? 0u
+                            : static_cast<std::uint32_t>(
+                                  !generic_has_local_backedge) +
+                                  static_cast<std::uint32_t>(
+                                      generic_gpr_written[slot]);
+                        if (reusable_accesses <= cost) {
                             continue;
                         }
                         candidates[candidate_count++] = {
                             static_cast<std::uint32_t>(
                                 slot * sizeof(std::uint64_t)),
-                            generic_gpr_access_count[slot] - cost,
+                            reusable_accesses - cost,
                             generic_gpr_written[slot],
                         };
                     }
@@ -17224,30 +18068,37 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                               });
                     generic_cached_gpr_offsets.fill(kNoCachedGprOffset);
                     generic_cached_gpr_dirty.fill(false);
-                    for (std::size_t cache_index = 0;
-                         cache_index < kStaticResidentGprCount;
-                         ++cache_index) {
-                        generic_cached_gpr_offsets[cache_index] =
-                            static_cast<std::uint32_t>(
-                                cache_index * sizeof(std::uint64_t));
-                        generic_cached_gpr_dirty[cache_index] = true;
+                    if (!generic_fault_loop_gpr_write_through_cache) {
+                        for (std::size_t cache_index = 0;
+                             cache_index < kStaticResidentGprCount;
+                             ++cache_index) {
+                            generic_cached_gpr_offsets[cache_index] =
+                                static_cast<std::uint32_t>(
+                                    cache_index * sizeof(std::uint64_t));
+                            generic_cached_gpr_dirty[cache_index] = true;
+                        }
                     }
-                    std::size_t local_cache_index = kStaticResidentGprCount;
+                    std::size_t local_cache_index =
+                        generic_fault_loop_gpr_write_through_cache
+                            ? 0
+                            : kStaticResidentGprCount;
                     std::uint64_t saved_accesses = 0;
                     for (std::size_t candidate_index = 0;
                          candidate_index < candidate_count &&
                          local_cache_index < generic_cached_gpr_offsets.size();
                          ++candidate_index) {
                         const auto& candidate = candidates[candidate_index];
-                        if (candidate.state_offset <
-                            kStaticResidentGprCount *
-                                sizeof(std::uint64_t)) {
+                        if (!generic_fault_loop_gpr_write_through_cache &&
+                            candidate.state_offset <
+                                kStaticResidentGprCount *
+                                    sizeof(std::uint64_t)) {
                             continue;
                         }
                         generic_cached_gpr_offsets[local_cache_index] =
                             candidate.state_offset;
                         generic_cached_gpr_dirty[local_cache_index] =
-                            candidate.dirty;
+                            candidate.dirty &&
+                            !generic_fault_loop_gpr_write_through_cache;
                         saved_accesses += candidate.saved_accesses;
                         ++local_cache_index;
                     }
@@ -17262,27 +18113,84 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         1, std::memory_order_relaxed);
                 }
                 const bool generic_static_gpr_cache =
-                    generic_gpr_cache_eligible;
+                    generic_gpr_cache_eligible &&
+                    !generic_fault_loop_gpr_write_through_cache;
+                std::uint32_t generic_gpr_layout_signature = 0;
+                if (generic_static_gpr_cache) {
+                    generic_gpr_layout_signature = 0x80000000u;
+                    for (std::size_t cache_index = kStaticResidentGprCount;
+                         cache_index < generic_cached_gpr_offsets.size();
+                         ++cache_index) {
+                        const std::uint32_t state_offset =
+                            generic_cached_gpr_offsets[cache_index];
+                        const std::uint32_t encoded =
+                            state_offset == kNoCachedGprOffset
+                                ? 0xfu
+                                : state_offset /
+                                      sizeof(std::uint64_t);
+                        generic_gpr_layout_signature |=
+                            (encoded & 0xfu) <<
+                            ((cache_index - kStaticResidentGprCount) * 4u);
+                        if (generic_cached_gpr_dirty[cache_index]) {
+                            generic_gpr_layout_signature |=
+                                1u << (16u + cache_index -
+                                       kStaticResidentGprCount);
+                        }
+                    }
+                    if (primary_outbound_edge != nullptr) {
+                        primary_outbound_edge->source_gpr_layout_signature =
+                            generic_gpr_layout_signature;
+                    }
+                    if (secondary_outbound_edge != nullptr) {
+                        secondary_outbound_edge->source_gpr_layout_signature =
+                            generic_gpr_layout_signature;
+                    }
+                }
+                const bool generic_any_gpr_cache =
+                    std::ranges::any_of(
+                        generic_cached_gpr_offsets,
+                        [&](const std::uint32_t offset) {
+                            return offset != kNoCachedGprOffset;
+                        });
+                const bool generic_fault_gpr_write_through =
+                    compilation_tier == LocalJitTier::Tier2 &&
+                    generic_has_faultable_memory_access &&
+                    generic_has_local_backedge &&
+                    !generic_fault_gpr_loop_writeback_safe;
                 constexpr std::uint32_t kNoCachedVectorHalfOffset =
                     std::numeric_limits<std::uint32_t>::max();
-                std::array<std::uint32_t, 14> generic_cached_vector_half_offsets{};
+                constexpr std::array<std::uint32_t, 21>
+                    kGenericCachedVectorHalfHostRegisters{
+                        16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
+                        27, 28, 29, 9, 10, 11, 12, 13, 14, 15};
+                std::array<std::uint32_t, 21>
+                    generic_cached_vector_half_offsets{};
                 generic_cached_vector_half_offsets.fill(kNoCachedVectorHalfOffset);
-                std::array<bool, 14> generic_cached_vector_half_dirty{};
+                std::array<bool, 21> generic_cached_vector_half_dirty{};
                 std::array<std::uint32_t, 32> generic_vector_half_reads{};
                 std::array<std::uint32_t, 32> generic_vector_half_writes{};
                 std::array<bool, 32> generic_vector_half_blocked{};
+                std::array<bool, 32> generic_vector_half_explicit_access{};
+                std::array<std::uint32_t, 32>
+                    generic_vector_half_implicit_zero_writes{};
                 std::array<std::size_t, 32> generic_vector_half_first_write;
+                std::array<std::size_t, 32> generic_vector_half_first_read;
                 InitializeUnwrittenVectorLanes(
                     generic_vector_half_first_write);
+                InitializeUnwrittenVectorLanes(
+                    generic_vector_half_first_read);
+                std::array<bool, 21>
+                    generic_cached_vector_half_entry_load_elided{};
                 bool generic_vector_cache_eligible =
                     !generic_has_call_terminator;
+                std::size_t generic_vector_cache_instruction_limit =
+                    generic_scalar_instruction_count;
                 bool generic_vector_writeback_enabled =
                     !generic_has_dynamic_control_terminator &&
                     !generic_has_call_terminator && !generic_has_ret_terminator &&
                     !generic_has_counted_terminator &&
                     !JitLiveCheckedNativeEnabled();
-                const bool tiered_vector_residency =
-                    compilation_tier != LocalJitTier::Tier0;
+                constexpr bool tiered_vector_residency = true;
                 const auto is_vector_cache_pair_instruction =
                     [&](const LsxDecodedOp& candidate) {
                     const auto mnemonic =
@@ -17300,14 +18208,35 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             X86_OPERAND_TYPE_IMMEDIATE;
                     return IsWholeVectorTransferMnemonic(mnemonic) ||
                            is_native_vector_bitwise(mnemonic) ||
+                           is_native_variable_blend(candidate) ||
+                           is_native_immediate_blend(candidate) ||
+                           is_native_packed_horizontal_add(candidate) ||
+                           is_native_half_vector_move(candidate) ||
+                           is_native_dot_product_ps(candidate) ||
+                           is_native_packed_compare(candidate) ||
+                           is_native_integer_unpack(candidate) ||
+                           is_native_packed_reciprocal(candidate) ||
+                           is_native_packed_multiply(candidate) ||
+                           is_native_packed_extend(candidate) ||
+                           is_native_packed_float_width_convert(candidate) ||
+                           is_native_packed_min_max(mnemonic) ||
+                           is_native_packed_saturating_pack(mnemonic) ||
+                           is_native_packed_horizontal_dword(mnemonic) ||
                            is_native_vector_unpack(mnemonic) ||
                            is_native_vector_align_right(mnemonic) ||
                            is_native_packed_sad_byte(mnemonic) ||
                            is_native_packed_saturating_add_sub(mnemonic) ||
                            is_native_packed_add_sub(mnemonic) ||
                            (tiered_vector_residency &&
-                             (is_native_scalar_vector_move(mnemonic) ||
-                              is_native_scalar_float_add_sub_mul(candidate) ||
+                              (is_native_scalar_vector_move(mnemonic) ||
+                               is_native_scalar_float_add_sub_mul(candidate) ||
+                               is_native_scalar_float_div(candidate) ||
+                               is_native_scalar_float_v4(candidate) ||
+                               is_native_scalar_float_compare_flags(candidate) ||
+                               ((kJitResidentSimdDirectEnabled ||
+                                 g_jit_selftest_production_direct_active) &&
+                                is_native_scalar_int_to_float(candidate)) ||
+                               is_native_insert_ps(candidate) ||
                               is_native_packed_float_arith(candidate) ||
                               is_native_shufps(candidate) ||
                               is_native_packed_float_compare(candidate) ||
@@ -17316,63 +18245,30 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 };
                 const auto is_vector_cache_nonsemantic_instruction =
                     [&](const LsxDecodedOp& candidate) {
-                    if (requires_native_scalar_semantic_instruction(candidate)) {
-                        return false;
-                    }
                     if (is_native_simd_fast(candidate)) {
                         return true;
                     }
+                    for (std::uint8_t operand_index = 0;
+                         operand_index < candidate.operand_count;
+                         ++operand_index) {
+                        const auto& operand = candidate.operands[operand_index];
+                        std::uint32_t ignored_offset = 0;
+                        std::uint32_t ignored_width = 0;
+                        if (operand.type == X86_OPERAND_TYPE_REGISTER &&
+                            vector_register_state_offset(
+                                operand.reg.value, ignored_offset,
+                                ignored_width)) {
+                            return false;
+                        }
+                    }
                     switch (static_cast<X86Mnemonic>(candidate.mnemonic)) {
-                    case X86_MNEMONIC_NOP:
-                    case X86_MNEMONIC_PREFETCH:
-                    case X86_MNEMONIC_PREFETCHIT0:
-                    case X86_MNEMONIC_PREFETCHIT1:
-                    case X86_MNEMONIC_PREFETCHNTA:
-                    case X86_MNEMONIC_PREFETCHT0:
-                    case X86_MNEMONIC_PREFETCHT1:
-                    case X86_MNEMONIC_PREFETCHT2:
-                    case X86_MNEMONIC_PREFETCHW:
-                    case X86_MNEMONIC_PREFETCHWT1:
-                    case X86_MNEMONIC_PAUSE:
-                    case X86_MNEMONIC_LFENCE:
-                    case X86_MNEMONIC_MFENCE:
-                    case X86_MNEMONIC_SFENCE:
-                    case X86_MNEMONIC_CLFLUSH:
-                    case X86_MNEMONIC_CLFLUSHOPT:
-                    case X86_MNEMONIC_MOV:
-                    case X86_MNEMONIC_MOVBE:
-                    case X86_MNEMONIC_MOVZX:
-                    case X86_MNEMONIC_MOVSX:
-                    case X86_MNEMONIC_MOVSXD:
-                    case X86_MNEMONIC_LEA:
-                    case X86_MNEMONIC_ADD:
-                    case X86_MNEMONIC_SUB:
-                    case X86_MNEMONIC_AND:
-                    case X86_MNEMONIC_OR:
-                    case X86_MNEMONIC_XOR:
-                    case X86_MNEMONIC_CMP:
-                    case X86_MNEMONIC_TEST:
-                    case X86_MNEMONIC_ANDN:
-                    case X86_MNEMONIC_INC:
-                    case X86_MNEMONIC_DEC:
-                    case X86_MNEMONIC_NEG:
-                    case X86_MNEMONIC_NOT:
-                    case X86_MNEMONIC_BEXTR:
-                    case X86_MNEMONIC_BLSI:
-                    case X86_MNEMONIC_BLSR:
-                    case X86_MNEMONIC_SHLX:
-                    case X86_MNEMONIC_SHRX:
-                    case X86_MNEMONIC_SARX:
-                    case X86_MNEMONIC_RORX:
-                    case X86_MNEMONIC_SHL:
-                    case X86_MNEMONIC_SHR:
-                    case X86_MNEMONIC_SAR:
-                        return true;
-                    case X86_MNEMONIC_IMUL:
-                        return candidate.operand_count == 2 ||
-                               candidate.operand_count == 3;
-                    default:
+                    case X86_MNEMONIC_FXSAVE:
+                    case X86_MNEMONIC_FXSAVE64:
+                    case X86_MNEMONIC_FXRSTOR:
+                    case X86_MNEMONIC_FXRSTOR64:
                         return false;
+                    default:
+                        return true;
                     }
                 };
                 constexpr std::size_t kNoDeferredLoopFlagInstruction =
@@ -17381,9 +18277,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     kNoDeferredLoopFlagInstruction;
                 std::uint32_t generic_deferred_loop_dec_state_offset = 0;
                 std::uint32_t generic_deferred_loop_dec_width = 0;
-                std::vector<std::uint8_t>
-                    generic_deferred_addsub_immediate_flags(
-                        block.instructions.size(), 0);
                 const auto is_deferred_loop_flag_safe =
                     [&](const LsxDecodedOp& candidate) {
                     if (is_vector_cache_pair_instruction(candidate) ||
@@ -17422,12 +18315,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_SHR:
                     case X86_MNEMONIC_SAR:
                         return true;
+                    case X86_MNEMONIC_IMUL:
+                        return candidate.operand_count == 2 ||
+                               candidate.operand_count == 3;
                     default:
                         return false;
                     }
                 };
                 if (tiered_vector_residency && generic_has_local_backedge &&
-                    tiered_guards == nullptr &&
                     generic_scalar_instruction_count != 0 &&
                     (generic_last_mnemonic == X86_MNEMONIC_JNZ ||
                      generic_last_mnemonic == X86_MNEMONIC_JZ)) {
@@ -17474,10 +18369,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 candidate.operand_count != 2 ||
                                 candidate.operands[0].type !=
                                     X86_OPERAND_TYPE_REGISTER ||
-                                candidate.operands[1].type !=
-                                    X86_OPERAND_TYPE_IMMEDIATE ||
                                 (candidate.operands[0].size != 32 &&
                                  candidate.operands[0].size != 64)) {
+                                continue;
+                            }
+                            if (generic_elide_status_flags[
+                                    instruction_index] != 0) {
                                 continue;
                             }
                             std::uint32_t ignored_offset = 0;
@@ -17487,24 +18384,150 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     ignored_offset, ignored_width)) {
                                 continue;
                             }
-                            const std::int64_t immediate =
-                                candidate.operands[1].imm.is_signed
-                                    ? candidate.operands[1].imm.value.s
-                                    : static_cast<std::int64_t>(
-                                          candidate.operands[1].imm.value.u);
-                            constexpr std::int64_t kMinPackedImmediate =
-                                -(INT64_C(1) << 47);
-                            constexpr std::int64_t kMaxPackedImmediate =
-                                (INT64_C(1) << 47) - 1;
-                            if (immediate < kMinPackedImmediate ||
-                                immediate > kMaxPackedImmediate) {
-                                continue;
-                            }
                             generic_deferred_addsub_immediate_flags[
                                 instruction_index] =
                                 candidate_mnemonic == X86_MNEMONIC_ADD
-                                    ? 1
-                                    : 2;
+                                    ? 3
+                                    : 4;
+                        }
+                    }
+                }
+                enum class NativeFlagSpanKind : std::uint8_t {
+                    None,
+                    Addition,
+                    Subtraction,
+                    Logical,
+                };
+                std::vector<std::uint8_t> generic_native_flag_span_producer(
+                    block.instructions.size(), 0);
+                std::vector<std::uint8_t> generic_native_flag_span_consumer(
+                    block.instructions.size(), 0);
+                const auto native_flag_span_kind =
+                    [](const LsxDecodedOp& candidate) {
+                    switch (static_cast<X86Mnemonic>(candidate.mnemonic)) {
+                    case X86_MNEMONIC_ADD:
+                        return NativeFlagSpanKind::Addition;
+                    case X86_MNEMONIC_SUB:
+                    case X86_MNEMONIC_CMP:
+                        return NativeFlagSpanKind::Subtraction;
+                    case X86_MNEMONIC_AND:
+                    case X86_MNEMONIC_OR:
+                    case X86_MNEMONIC_XOR:
+                    case X86_MNEMONIC_TEST:
+                        return NativeFlagSpanKind::Logical;
+                    default:
+                        return NativeFlagSpanKind::None;
+                    }
+                };
+                const auto condition_uses_parity =
+                    [](const X86Mnemonic mnemonic) {
+                    switch (mnemonic) {
+                    case X86_MNEMONIC_JP:
+                    case X86_MNEMONIC_JNP:
+                    case X86_MNEMONIC_CMOVP:
+                    case X86_MNEMONIC_CMOVNP:
+                    case X86_MNEMONIC_SETP:
+                    case X86_MNEMONIC_SETNP:
+                        return true;
+                    default:
+                        return false;
+                    }
+                };
+                const auto register_only_native_flag_consumer =
+                    [&](const LsxDecodedOp& candidate) {
+                    const auto mnemonic =
+                        static_cast<X86Mnemonic>(candidate.mnemonic);
+                    if ((!IsSetccMnemonic(mnemonic) &&
+                         !IsCmovMnemonic(mnemonic)) ||
+                        !NativeCondition::Supports(mnemonic) ||
+                        condition_uses_parity(mnemonic)) {
+                        return false;
+                    }
+                    return std::ranges::none_of(
+                        std::span{candidate.operands}.first(
+                            candidate.operand_count),
+                        [](const LsxOperandRecord& operand) {
+                            return operand.type == X86_OPERAND_TYPE_MEMORY;
+                        });
+                };
+                const auto host_nzcv_transparent_instruction =
+                    [&](const LsxDecodedOp& candidate) {
+                    if (instruction_has_faultable_memory_access(candidate)) {
+                        return false;
+                    }
+                    switch (static_cast<X86Mnemonic>(candidate.mnemonic)) {
+                    case X86_MNEMONIC_NOP:
+                    case X86_MNEMONIC_MOV:
+                    case X86_MNEMONIC_MOVZX:
+                    case X86_MNEMONIC_MOVSX:
+                    case X86_MNEMONIC_MOVSXD:
+                    case X86_MNEMONIC_LEA:
+                    case X86_MNEMONIC_NOT:
+                        return true;
+                    default:
+                        return false;
+                    }
+                };
+                constexpr bool kEnableClosedNativeFlagSpans = true;
+                if (kEnableClosedNativeFlagSpans &&
+                    compilation_tier != LocalJitTier::Tier0 &&
+                    JitHostHasFlagM()) {
+                    for (std::size_t producer_index = 0;
+                         producer_index < generic_scalar_instruction_count;
+                         ++producer_index) {
+                        const auto kind = native_flag_span_kind(
+                            block.instructions[producer_index]);
+                        const std::uint32_t width =
+                            block.instructions[producer_index].operand_count != 0
+                            ? block.instructions[producer_index].operands[0].size
+                            : 0;
+                        if (kind == NativeFlagSpanKind::None ||
+                            (width != 8 && width != 16 &&
+                             width != 32 && width != 64) ||
+                            tiered_guard_for_instruction(producer_index) !=
+                                nullptr ||
+                            generic_elide_status_flags[producer_index] != 0 ||
+                            generic_defer_fault_status_flags[producer_index] != 0 ||
+                            generic_fused_compare_branch[producer_index] != 0 ||
+                            generic_deferred_addsub_immediate_flags[
+                                producer_index] != 0) {
+                            continue;
+                        }
+                        std::vector<std::size_t> consumers;
+                        bool closed_by_full_writer = false;
+                        for (std::size_t next_index = producer_index + 1;
+                             next_index < generic_scalar_instruction_count;
+                             ++next_index) {
+                            if (tiered_guard_for_instruction(next_index) !=
+                                    nullptr ||
+                                instruction_has_faultable_memory_access(
+                                    block.instructions[next_index])) {
+                                break;
+                            }
+                            if (register_only_native_flag_consumer(
+                                    block.instructions[next_index])) {
+                                consumers.push_back(next_index);
+                                continue;
+                            }
+                            if (unconditional_status_flag_kill_mask(
+                                    block.instructions[next_index]) ==
+                                kArithmeticStatusBits) {
+                                closed_by_full_writer = true;
+                                break;
+                            }
+                            if (!host_nzcv_transparent_instruction(
+                                    block.instructions[next_index])) {
+                                break;
+                            }
+                        }
+                        if (!closed_by_full_writer || consumers.empty()) {
+                            continue;
+                        }
+                        generic_native_flag_span_producer[producer_index] =
+                            static_cast<std::uint8_t>(kind);
+                        for (const std::size_t consumer_index : consumers) {
+                            generic_native_flag_span_consumer[consumer_index] =
+                                static_cast<std::uint8_t>(kind);
                         }
                     }
                 }
@@ -17518,7 +18541,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         continue;
                     }
                     if (!is_vector_cache_nonsemantic_instruction(candidate)) {
-                        generic_vector_cache_eligible = false;
+                        generic_vector_cache_instruction_limit =
+                            instruction_index;
+                        generic_vector_cache_eligible =
+                            instruction_index != 0;
                         break;
                     }
                     const bool pair_instruction =
@@ -17544,6 +18570,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             (operand.actions & X86_OPERAND_ACTION_MASK_WRITE) != 0;
                         for (std::size_t half = 0; half < half_count; ++half) {
                             const std::size_t slot = first_half + half;
+                            generic_vector_half_explicit_access[slot] = true;
                             if (!pair_instruction) {
                                 generic_vector_half_blocked[slot] = true;
                                 continue;
@@ -17552,6 +18579,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 static_cast<std::uint32_t>(read);
                             generic_vector_half_writes[slot] +=
                                 static_cast<std::uint32_t>(write);
+                            if (read) {
+                                generic_vector_half_first_read[slot] =
+                                    std::min(
+                                        generic_vector_half_first_read[
+                                            slot],
+                                        instruction_index);
+                            }
                             if (write) {
                                 generic_vector_half_first_write[slot] =
                                     std::min(generic_vector_half_first_write[slot],
@@ -17570,6 +18604,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 generic_vector_half_blocked[upper_slot] = true;
                             } else {
                                 ++generic_vector_half_writes[upper_slot];
+                                ++generic_vector_half_implicit_zero_writes[
+                                    upper_slot];
                                 generic_vector_half_first_write[upper_slot] =
                                     std::min(generic_vector_half_first_write[upper_slot],
                                              instruction_index);
@@ -17579,58 +18615,42 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 }
                 generic_vector_writeback_enabled =
                     generic_vector_writeback_enabled && generic_vector_cache_eligible;
+                std::array<bool, 32> generic_vector_half_deferred_zero{};
+                std::uint32_t generic_vector_deferred_zero_candidate_mask = 0;
                 if (generic_vector_cache_eligible) {
-                    std::array<std::uint32_t, 32>
-                        generic_vector_half_fault_publications{};
                     for (std::size_t slot = 0;
-                         slot < generic_vector_half_first_write.size(); ++slot) {
-                        const std::size_t first_write =
-                            generic_vector_half_first_write[slot];
-                        if (first_write ==
-                            std::numeric_limits<std::size_t>::max()) {
-                            continue;
-                        }
-                        for (std::size_t instruction_index = first_write + 1;
-                             instruction_index < generic_scalar_instruction_count;
-                             ++instruction_index) {
-                            const auto& candidate =
-                                block.instructions[instruction_index];
-                            if (!instruction_has_faultable_memory_access(candidate)) {
-                                continue;
-                            }
-                            std::uint32_t publications = 0;
-                            for (std::uint8_t operand_index = 0;
-                                 operand_index < candidate.operand_count;
-                                 ++operand_index) {
-                                const auto& operand =
-                                    candidate.operands[operand_index];
-                                if (operand.type !=
-                                    X86_OPERAND_TYPE_MEMORY) {
-                                    continue;
-                                }
-                                publications += static_cast<std::uint32_t>(
-                                    (operand.actions &
-                                     X86_OPERAND_ACTION_MASK_READ) != 0);
-                                publications += static_cast<std::uint32_t>(
-                                    (operand.actions &
-                                     X86_OPERAND_ACTION_MASK_WRITE) != 0);
-                            }
-                            generic_vector_half_fault_publications[slot] +=
-                                std::max<std::uint32_t>(publications, 1u);
+                         slot < generic_vector_half_deferred_zero.size();
+                         ++slot) {
+                        const bool zero_only =
+                            generic_vector_half_implicit_zero_writes[slot] !=
+                                0 &&
+                            !generic_vector_half_explicit_access[slot] &&
+                            !generic_vector_half_blocked[slot];
+                        generic_vector_half_deferred_zero[slot] = zero_only;
+                        if (zero_only) {
+                            generic_vector_deferred_zero_candidate_mask |=
+                                std::uint32_t{1} << slot;
                         }
                     }
+                }
+                if (generic_vector_cache_eligible) {
                     struct CachedVectorHalfCandidate {
                         std::uint32_t state_offset;
                         std::uint32_t saved_state_accesses;
                         bool dirty;
+                        bool entry_load_elided;
                     };
                     std::array<CachedVectorHalfCandidate, 32> candidates{};
                     std::size_t candidate_count = 0;
                     for (std::size_t slot = 0;
                          slot < generic_vector_half_reads.size(); ++slot) {
+                        const bool entry_load_elided =
+                            generic_vector_half_first_write[slot] <
+                            generic_vector_half_first_read[slot];
                         const std::uint32_t write_through_cost =
                             static_cast<std::uint32_t>(
-                                !generic_has_local_backedge) +
+                                !generic_has_local_backedge &&
+                                !entry_load_elided) +
                             generic_vector_half_writes[slot];
                         const std::uint32_t write_through_savings =
                             generic_vector_half_reads[slot] > write_through_cost
@@ -17638,10 +18658,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                       write_through_cost
                                 : 0u;
                         const std::uint32_t writeback_cost =
-                            (generic_has_local_backedge ? 0u : 2u) +
-                            (compilation_tier == LocalJitTier::Tier0
-                                 ? generic_vector_half_fault_publications[slot]
-                                 : 0u);
+                            generic_has_local_backedge
+                                ? 0u
+                                : 1u + static_cast<std::uint32_t>(
+                                           !entry_load_elided);
                         const std::uint32_t writeback_accesses =
                             generic_vector_half_reads[slot] +
                             generic_vector_half_writes[slot];
@@ -17658,6 +18678,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             dirty ? writeback_savings
                                   : write_through_savings;
                         if (generic_vector_half_blocked[slot] ||
+                            generic_vector_half_deferred_zero[slot] ||
                             saved_state_accesses == 0) {
                             continue;
                         }
@@ -17666,6 +18687,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 kStateYmm0Offset + slot * 16u),
                             saved_state_accesses,
                             dirty,
+                            entry_load_elided,
                         };
                     }
                     std::sort(candidates.begin(),
@@ -17684,6 +18706,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             candidates[cache_index].state_offset;
                         generic_cached_vector_half_dirty[cache_index] =
                             candidates[cache_index].dirty;
+                        generic_cached_vector_half_entry_load_elided[
+                            cache_index] =
+                            candidates[cache_index].entry_load_elided;
                     }
                     if (cached_count != 0) {
                         std::uint64_t saved_accesses = 0;
@@ -17741,6 +18766,17 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             descriptor;
                     }
                 }
+                std::uint32_t generic_vector_deferred_zero_mask = 0;
+                std::uint32_t generic_vector_cache_written_mask = 0;
+                bool generic_vector_cache_active =
+                    generic_vector_cache_eligible &&
+                    generic_vector_cache_instruction_limit != 0;
+                std::uint32_t generic_gpr_cache_written_mask =
+                    generic_static_gpr_cache
+                        ? (std::uint32_t{1} <<
+                           kStaticResidentGprCount) -
+                              1u
+                        : 0u;
                 const bool generic_fault_cache_recovery_enabled =
                     generic_has_faultable_memory_access &&
                     (std::ranges::any_of(
@@ -17748,7 +18784,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                          [](const bool dirty) { return dirty; }) ||
                      std::ranges::any_of(
                          generic_cached_vector_half_dirty,
-                         [](const bool dirty) { return dirty; }));
+                         [](const bool dirty) { return dirty; }) ||
+                     generic_vector_deferred_zero_candidate_mask != 0);
                 NativeFaultRecoveryDescriptor*
                     generic_fault_recovery_base = nullptr;
                 if (generic_fault_cache_recovery_enabled) {
@@ -17773,6 +18810,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         : static_cast<const void*>(generic_fault_descriptor_base);
                 const bool generic_relative_fault_publication_enabled =
                     generic_fault_publication_base != nullptr;
+                const bool generic_inline_relative_fault_publication_enabled =
+                    generic_relative_fault_publication_enabled &&
+                    !generic_signal_fault_sidecar_enabled;
                 std::array<const LsxDecodedOp*, kJitMaxTraceInstructions>
                     generic_fault_recovery_sources{};
                 std::array<const NativeFaultRecoveryDescriptor*,
@@ -17814,20 +18854,43 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         };
                     }
                     for (std::size_t cache_index = 0;
+                         generic_vector_cache_active &&
                          cache_index <
                          generic_cached_vector_half_offsets.size();
                          ++cache_index) {
                         const std::uint32_t state_offset =
                             generic_cached_vector_half_offsets[cache_index];
                         if (state_offset == kNoCachedVectorHalfOffset ||
-                            !generic_cached_vector_half_dirty[cache_index]) {
+                            !generic_cached_vector_half_dirty[cache_index] ||
+                            (generic_cached_vector_half_entry_load_elided[
+                                 cache_index] &&
+                             (generic_vector_cache_written_mask &
+                              (std::uint32_t{1} << cache_index)) == 0)) {
                             continue;
                         }
                         assert(recovery.vector_count <
                                recovery.vector.size());
                         recovery.vector[recovery.vector_count++] = {
                             static_cast<std::uint16_t>(state_offset),
-                            static_cast<std::uint8_t>(16u + cache_index),
+                            static_cast<std::uint8_t>(
+                                kGenericCachedVectorHalfHostRegisters[
+                                    cache_index]),
+                            0,
+                        };
+                    }
+                    for (std::size_t slot = 0;
+                         slot < generic_vector_half_deferred_zero.size();
+                         ++slot) {
+                        if ((generic_vector_deferred_zero_mask &
+                             (std::uint32_t{1} << slot)) == 0) {
+                            continue;
+                        }
+                        assert(recovery.vector_count <
+                               recovery.vector.size());
+                        recovery.vector[recovery.vector_count++] = {
+                            static_cast<std::uint16_t>(
+                                kStateYmm0Offset + slot * 16u),
+                            30,
                             0,
                         };
                     }
@@ -17910,8 +18973,22 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                         return false;
                     }();
+                const bool generic_frame_preserves_vector_cache =
+                    generic_chain_abi ||
+                    [&]() {
+                        for (std::size_t cache_index = 14;
+                             cache_index <
+                             generic_cached_vector_half_offsets.size();
+                             ++cache_index) {
+                            if (generic_cached_vector_half_offsets[cache_index] !=
+                                kNoCachedVectorHalfOffset) {
+                                return true;
+                            }
+                        }
+                        return false;
+                    }();
                 const std::uint32_t generic_frame_size =
-                    generic_chain_abi
+                    generic_frame_preserves_vector_cache
                         ? kGenericSharedChainFrameSize
                         : (generic_frame_preserves_extended_gpr_cache
                                ? 96u
@@ -17920,6 +18997,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     generic_frame_size,
                     generic_frame_preserves_x21_x22,
                     generic_frame_preserves_extended_gpr_cache,
+                    generic_frame_preserves_vector_cache,
                 };
                 const auto cached_gpr_host_index =
                     [&](const std::uint32_t state_offset) -> int {
@@ -17947,54 +19025,100 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 };
                 const auto cached_vector_half_host_index =
                     [&](const std::uint32_t state_offset) -> int {
+                    if (!generic_vector_cache_active) {
+                        return -1;
+                    }
                     for (std::size_t cache_index = 0;
                          cache_index < generic_cached_vector_half_offsets.size();
                          ++cache_index) {
                         if (generic_cached_vector_half_offsets[cache_index] ==
                             state_offset) {
-                            return static_cast<int>(16u + cache_index);
+                            return static_cast<int>(
+                                kGenericCachedVectorHalfHostRegisters[
+                                    cache_index]);
                         }
                     }
                     return -1;
                 };
+                const auto cached_vector_half_cache_index =
+                    [&](const int host_index) -> int {
+                    const auto found = std::ranges::find(
+                        kGenericCachedVectorHalfHostRegisters,
+                        static_cast<std::uint32_t>(host_index));
+                    return found ==
+                                   kGenericCachedVectorHalfHostRegisters.end()
+                               ? -1
+                               : static_cast<int>(std::distance(
+                                     kGenericCachedVectorHalfHostRegisters
+                                         .begin(),
+                                     found));
+                };
                 const auto cached_vector_half_is_writeback =
                     [&](const int host_index) {
-                    if (generic_fault_write_through ||
+                    const int cache_index =
+                        cached_vector_half_cache_index(host_index);
+                    if (generic_fault_vector_write_through ||
                         !generic_vector_writeback_enabled ||
-                        host_index < 16 || host_index >= 30) {
+                        cache_index < 0) {
                         return false;
                     }
                     return generic_cached_vector_half_dirty[
-                        static_cast<std::size_t>(host_index - 16)];
+                        static_cast<std::size_t>(cache_index)];
                 };
-                std::uint32_t generic_vector_cache_written_mask = 0;
-                std::uint32_t generic_gpr_cache_written_mask =
-                    generic_static_gpr_cache
-                        ? (std::uint32_t{1} << kStaticResidentGprCount) - 1u
-                        : 0u;
                 const auto mark_cached_vector_half_written =
                     [&](const int host_index) {
                     if (cached_vector_half_is_writeback(host_index)) {
+                        const int cache_index =
+                            cached_vector_half_cache_index(host_index);
+                        assert(cache_index >= 0);
                         generic_vector_cache_written_mask |=
                             std::uint32_t{1} << static_cast<std::uint32_t>(
-                                host_index - 16);
+                                cache_index);
                     }
                 };
-                const auto emit_reload_vector_cache = [&]() {
+                const auto emit_reload_vector_cache =
+                    [&](const bool force_all = false) {
+                    if (!generic_vector_cache_active) {
+                        return;
+                    }
                     for (std::size_t cache_index = 0;
                          cache_index < generic_cached_vector_half_offsets.size();
                          ++cache_index) {
                         const std::uint32_t state_offset =
                             generic_cached_vector_half_offsets[cache_index];
-                        if (state_offset == kNoCachedVectorHalfOffset) {
+                        if (state_offset == kNoCachedVectorHalfOffset ||
+                            (!force_all &&
+                             generic_cached_vector_half_entry_load_elided[
+                                 cache_index])) {
                             continue;
                         }
                         code->ldr(
-                            QReg(static_cast<std::uint32_t>(16u + cache_index)),
+                            QReg(kGenericCachedVectorHalfHostRegisters[
+                                cache_index]),
                             Xbyak_aarch64::ptr(code->x19, state_offset));
                     }
                 };
+                const auto emit_materialize_deferred_vector_zeros = [&]() {
+                    for (std::size_t slot = 0;
+                         slot < generic_vector_half_deferred_zero.size();
+                         ++slot) {
+                        if ((generic_vector_deferred_zero_mask &
+                             (std::uint32_t{1} << slot)) == 0) {
+                            continue;
+                        }
+                        code->str(
+                            code->q30,
+                            Xbyak_aarch64::ptr(
+                                code->x19,
+                                static_cast<std::uint32_t>(
+                                    kStateYmm0Offset + slot * 16u)));
+                    }
+                };
                 const auto emit_flush_vector_cache = [&]() {
+                    if (!generic_vector_cache_active) {
+                        return;
+                    }
+                    emit_materialize_deferred_vector_zeros();
                     if (!generic_vector_writeback_enabled ||
                         generic_vector_cache_written_mask == 0) {
                         return;
@@ -18011,7 +19135,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             continue;
                         }
                         code->str(
-                            QReg(static_cast<std::uint32_t>(16u + cache_index)),
+                            QReg(kGenericCachedVectorHalfHostRegisters[
+                                cache_index]),
                             Xbyak_aarch64::ptr(code->x19, state_offset));
                     }
                 };
@@ -18063,7 +19188,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     emit_flush_gpr_cache();
                 };
                 const auto emit_flush_register_caches_for_edge =
-                    [&](const XReg& edge_address) {
+                    [&](const XReg& edge_address,
+                        const XReg& observed_target) {
                     emit_flush_vector_cache();
                     if (!generic_static_gpr_cache) {
                         emit_flush_gpr_cache();
@@ -18071,14 +19197,21 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                     Xbyak_aarch64::Label flush_all_gpr;
                     Xbyak_aarch64::Label flushed_gpr;
-                    code->ldrb(
-                        code->w11,
-                        Xbyak_aarch64::ptr(
-                            edge_address,
-                            static_cast<std::uint32_t>(offsetof(
-                                OutboundEdgeState,
-                                target_accepts_static_gpr_cache))));
+                    code->add(
+                        code->x10, edge_address,
+                        static_cast<std::uint32_t>(offsetof(
+                            OutboundEdgeState,
+                            target_accepts_static_gpr_cache)));
+                    code->ldarb(
+                        code->w11, Xbyak_aarch64::ptr(code->x10));
+                    EmitHostMetadataAcquire(
+                        *code, code->x10,
+                        Xbyak_aarch64::ptr(edge_address));
+                    code->cmp(code->x10, observed_target);
+                    code->bne(flush_all_gpr);
                     code->cbz(code->w11, flush_all_gpr);
+                    code->cmp(code->w11, 2);
+                    code->beq(flushed_gpr);
                     emit_flush_gpr_cache(true);
                     code->b(flushed_gpr);
                     code->L(flush_all_gpr);
@@ -18088,7 +19221,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 const auto emit_reload_register_caches =
                     [&](const bool after_abi_call = false) {
                     emit_reload_gpr_cache(after_abi_call);
-                    emit_reload_vector_cache();
+                    emit_reload_vector_cache(after_abi_call);
+                    if (generic_vector_deferred_zero_candidate_mask != 0) {
+                        code->movi(code->v30.b16, 0);
+                    }
                     generic_vector_half_known_zero.fill(false);
                 };
                 // The shared-chain ABI reserves w28 for the edge safepoint
@@ -18125,7 +19261,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     [&](const LsxDecodedOp& ir) {
                     const NativeFaultDescriptor* const descriptor =
                         preserve_fault_descriptor(ir);
-                    if (generic_relative_fault_publication_enabled &&
+                    if (generic_inline_relative_fault_publication_enabled &&
                         !generic_fault_cache_recovery_enabled) {
                         const std::uintptr_t offset =
                             reinterpret_cast<std::uintptr_t>(descriptor) -
@@ -18154,18 +19290,50 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     if (!force && !generic_deferred_loop_flags) {
                         return;
                     }
-                    emit_flush_register_caches();
-                    emit_sync_native_edge_phase();
+                    const bool has_extended_caller_saved_gpr =
+                        std::ranges::any_of(
+                            generic_cached_gpr_offsets.begin() +
+                                kStaticResidentGprCount,
+                            generic_cached_gpr_offsets.end(),
+                            [&](const std::uint32_t offset) {
+                                return offset != kNoCachedGprOffset;
+                            });
+                    const void* materializer = nullptr;
+                    if (!generic_any_gpr_cache) {
+                        materializer = reinterpret_cast<const void*>(
+                            &Lsx4MaterializeDeferredFlagsBody);
+                        g_jit_deferred_flag_direct_body_sites.fetch_add(
+                            1, std::memory_order_relaxed);
+                    } else if (!has_extended_caller_saved_gpr) {
+                        materializer = reinterpret_cast<const void*>(
+                            &Lsx4MaterializeDeferredFlagsStaticGprJitAbi);
+                        g_jit_deferred_flag_static_gpr_sites.fetch_add(
+                            1, std::memory_order_relaxed);
+                    } else {
+                        materializer = reinterpret_cast<const void*>(
+                            &Lsx4MaterializeDeferredFlagsJitAbi);
+                        g_jit_deferred_flag_full_gpr_sites.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                     code->mov(code->x0, code->x19);
                     EmitJitRelocatablePointer(
                         *code, code->x16,
-                        reinterpret_cast<std::uint64_t>(
-                            &MaterializeDeferredFlags));
+                        reinterpret_cast<std::uint64_t>(materializer));
                     code->blr(code->x16);
-                    emit_reload_native_edge_phase();
-                    emit_reload_register_caches();
                 };
-                const auto emit_epilogue_restore = [&]() {
+                const auto emit_materialize_pending_fault_flags = [&]() {
+                    if (!generic_has_deferred_fault_flags) {
+                        return;
+                    }
+                    Xbyak_aarch64::Label done;
+                    load_machine_word(
+                        code->x17, kStateDeferredFlagsMetaOffset);
+                    code->cbz(code->x17, done);
+                    emit_materialize_deferred_flags(true);
+                    code->L(done);
+                };
+                const auto emit_epilogue_prepare = [&]() {
+                    emit_materialize_pending_fault_flags();
                     emit_flush_register_caches();
                     emit_sync_native_edge_phase();
                     if (generic_has_faultable_memory_access) {
@@ -18175,6 +19343,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             Xbyak_aarch64::ptr(
                                 code->x19, kStateNativeFaultIrOffset));
                     }
+                };
+                const auto emit_epilogue_restore = [&]() {
+                    emit_epilogue_prepare();
                     EmitNativeFrameExit(*code, generic_frame_layout);
                 };
                 const auto emit_epilogue_exit = [&] {
@@ -18186,8 +19357,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     emit_epilogue_exit();
                 };
                 const auto emit_epilogue_return_reg = [&](const XReg& target) {
-                    code->mov(code->x0, target);
-                    emit_epilogue_exit();
+                    store_machine_word(target, kStateRipOffset);
+                    emit_epilogue_prepare();
+                    load_machine_word(code->x0, kStateRipOffset);
+                    EmitNativeFrameExit(*code, generic_frame_layout);
+                    code->ret();
                 };
                 const auto emit_static_edge_tail =
                     [&](const std::uint64_t target,
@@ -18203,6 +19377,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     if (JitLiveCheckedNativeEnabled() || edge_slot == nullptr) {
                         return false;
                     }
+                    emit_materialize_pending_fault_flags();
                     Xbyak_aarch64::Label refill_chain_budget;
                     Xbyak_aarch64::Label validate;
                     Xbyak_aarch64::Label chain;
@@ -18210,7 +19385,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     EmitJitRelocatablePointer(
                         *code, code->x17,
                         reinterpret_cast<std::uint64_t>(edge_slot));
-                    code->ldar(code->x16, Xbyak_aarch64::ptr(code->x17));
+                    EmitHostMetadataAcquire(
+                        *code, code->x16,
+                        Xbyak_aarch64::ptr(code->x17));
                     code->cbz(code->x16, fallback);
 
                     if (force_validation) {
@@ -18270,7 +19447,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->str(code->x9,
                               Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
                     if (generic_chain_abi) {
-                        emit_flush_register_caches_for_edge(code->x17);
+                        emit_flush_register_caches_for_edge(
+                            code->x17, code->x16);
                         if (generic_has_faultable_memory_access) {
                             code->mov(code->x9, 0);
                             code->str(
@@ -18307,13 +19485,16 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     Xbyak_aarch64::Label fallback;
 
                     code->mov(code->x20, target);
+                    emit_materialize_pending_fault_flags();
                     EmitJitRelocatablePointer(
                         *code, code->x9,
                         reinterpret_cast<std::uint64_t>(indirect_edge_fanout));
                     code->add(code->x12, code->x9,
                               static_cast<std::uint32_t>(
                                   offsetof(IndirectEdgeFanout, active)));
-                    code->ldar(code->w14, Xbyak_aarch64::ptr(code->x12));
+                    EmitHostMetadataAcquire(
+                        *code, code->w14,
+                        Xbyak_aarch64::ptr(code->x12));
                     code->cbz(code->w14, fallback);
 
                     code->add(code->x12, code->x9,
@@ -18327,7 +19508,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 offsetof(IndirectEdgeFanout, way_count))));
 
                     code->L(search_way);
-                    code->ldar(code->x13, Xbyak_aarch64::ptr(code->x12));
+                    EmitHostMetadataAcquire(
+                        *code, code->x13,
+                        Xbyak_aarch64::ptr(code->x12));
                     code->cbz(code->x13, next_way);
                     code->ldr(code->x14,
                               Xbyak_aarch64::ptr(
@@ -18362,7 +19545,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->cbz(code->x13, fallback);
 
                     code->L(have_slot);
-                    code->ldar(code->x16, Xbyak_aarch64::ptr(code->x13));
+                    EmitHostMetadataAcquire(
+                        *code, code->x16,
+                        Xbyak_aarch64::ptr(code->x13));
                     code->cbz(code->x16, fallback);
 
                     if (generic_chain_abi) {
@@ -18410,7 +19595,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->add(code->x12, code->x9,
                               static_cast<std::uint32_t>(
                                   offsetof(IndirectEdgeFanout, active)));
-                    code->ldar(code->w17, Xbyak_aarch64::ptr(code->x12));
+                    EmitHostMetadataAcquire(
+                        *code, code->w17,
+                        Xbyak_aarch64::ptr(code->x12));
                     code->cbz(code->w17, fallback);
                     code->mov(code->x0, code->x19);
                     code->str(code->x20,
@@ -18428,7 +19615,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emit_epilogue_restore();
                         code->br(code->x16);
                         code->L(resident_target);
-                        emit_flush_register_caches_for_edge(code->x13);
+                        emit_flush_register_caches_for_edge(
+                            code->x13, code->x16);
                         if (generic_has_faultable_memory_access) {
                             code->mov(code->x9, 0);
                             code->str(code->x9,
@@ -18526,20 +19714,26 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             operand.mem.base != X86_REGISTER_NONE;
                         const bool has_index =
                             operand.mem.index != X86_REGISTER_NONE;
+                        const auto cached_address_host =
+                            [&](const LsxRegisterCode reg) -> int {
+                            const auto location =
+                                resolve_register_location(reg);
+                            return location && location->width == 64
+                                ? cached_gpr_host_index(location->offset)
+                                : -1;
+                        };
+                        const int cached_base =
+                            has_base
+                                ? cached_address_host(operand.mem.base)
+                                : -1;
+                        const int cached_index =
+                            has_index
+                                ? cached_address_host(operand.mem.index)
+                                : -1;
+                        bool displacement_folded = false;
                         if (!has_base && !has_index) {
                             code->mov(dst, 0);
-                        } else if (has_base &&
-                                   !emit_gpr_load(
-                                       operand.mem.base, 64, dst)) {
-                            return false;
-                        }
-                        const bool index_ready = !has_index ||
-                            emit_gpr_load(
-                                operand.mem.index, 64, code->x15);
-                        if (!index_ready) {
-                            return false;
-                        }
-                        if (has_index) {
+                        } else if (has_base && has_index) {
                             std::uint32_t scale_shift = 0;
                             switch (operand.mem.scale) {
                             case 1:
@@ -18556,16 +19750,124 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             default:
                                 return false;
                             }
-                            if (has_base) {
+                            if (cached_base >= 0 &&
+                                cached_index >= 0) {
+                                code->add(
+                                    dst,
+                                    XReg{static_cast<std::uint32_t>(
+                                        cached_base)},
+                                    XReg{static_cast<std::uint32_t>(
+                                        cached_index)},
+                                    Xbyak_aarch64::LSL, scale_shift);
+                            } else if (cached_base >= 0) {
+                                if (!emit_gpr_load(
+                                        operand.mem.index, 64,
+                                        code->x15)) {
+                                    return false;
+                                }
+                                code->add(
+                                    dst,
+                                    XReg{static_cast<std::uint32_t>(
+                                        cached_base)},
+                                    code->x15,
+                                    Xbyak_aarch64::LSL, scale_shift);
+                            } else if (cached_index >= 0) {
+                                if (!emit_gpr_load(
+                                        operand.mem.base, 64, dst)) {
+                                    return false;
+                                }
+                                code->add(
+                                    dst, dst,
+                                    XReg{static_cast<std::uint32_t>(
+                                        cached_index)},
+                                    Xbyak_aarch64::LSL, scale_shift);
+                            } else {
+                                if (!emit_gpr_load(
+                                        operand.mem.base, 64, dst) ||
+                                    !emit_gpr_load(
+                                        operand.mem.index, 64,
+                                        code->x15)) {
+                                    return false;
+                                }
                                 code->add(dst, dst, code->x15,
                                           Xbyak_aarch64::LSL, scale_shift);
-                            } else if (scale_shift != 0) {
-                                code->lsl(dst, code->x15, scale_shift);
+                            }
+                        } else if (has_base) {
+                            if (cached_base >= 0) {
+                                const XReg source{
+                                    static_cast<std::uint32_t>(
+                                        cached_base)};
+                                const std::int64_t displacement =
+                                    SignedMemoryDisplacement(operand);
+                                const std::uint64_t magnitude =
+                                    static_cast<std::uint64_t>(
+                                        displacement < 0
+                                            ? -displacement
+                                            : displacement);
+                                if (operand.mem.disp.size != 0 &&
+                                    magnitude != 0 &&
+                                    magnitude <= 4095) {
+                                    if (displacement < 0) {
+                                        code->sub(
+                                            dst, source,
+                                            static_cast<std::uint32_t>(
+                                                magnitude));
+                                    } else {
+                                        code->add(
+                                            dst, source,
+                                            static_cast<std::uint32_t>(
+                                                magnitude));
+                                    }
+                                    displacement_folded = true;
+                                } else {
+                                    code->mov(dst, source);
+                                }
+                            } else if (!emit_gpr_load(
+                                           operand.mem.base, 64, dst)) {
+                                return false;
+                            }
+                        } else {
+                            std::uint32_t scale_shift = 0;
+                            switch (operand.mem.scale) {
+                            case 1:
+                                break;
+                            case 2:
+                                scale_shift = 1;
+                                break;
+                            case 4:
+                                scale_shift = 2;
+                                break;
+                            case 8:
+                                scale_shift = 3;
+                                break;
+                            default:
+                                return false;
+                            }
+                            if (cached_index >= 0) {
+                                const XReg source{
+                                    static_cast<std::uint32_t>(
+                                        cached_index)};
+                                if (scale_shift != 0) {
+                                    code->lsl(dst, source, scale_shift);
+                                } else {
+                                    code->mov(dst, source);
+                                }
                             } else {
-                                code->mov(dst, code->x15);
+                                if (!emit_gpr_load(
+                                        operand.mem.index, 64,
+                                        code->x15)) {
+                                    return false;
+                                }
+                                if (scale_shift != 0) {
+                                    code->lsl(
+                                        dst, code->x15, scale_shift);
+                                } else {
+                                    code->mov(dst, code->x15);
+                                }
                             }
                         }
-                        if (operand.mem.disp.size != 0) {
+                        if (operand.mem.disp.size != 0 &&
+                            !displacement_folded) {
                             const std::int64_t displacement =
                                 SignedMemoryDisplacement(operand);
                             const std::uint64_t magnitude = static_cast<std::uint64_t>(
@@ -18603,12 +19905,62 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         segment_state_offset);
                     return true;
                 };
+                struct CachedGuestAddress {
+                    std::uint32_t host_register = 0;
+                    std::uint32_t displacement = 0;
+                };
+                const auto cached_guest_address =
+                    [&](const LsxOperandRecord& operand,
+                        const std::uint32_t access_bytes)
+                        -> std::optional<CachedGuestAddress> {
+                    if (operand.type != X86_OPERAND_TYPE_MEMORY ||
+                        operand.mem.base == X86_REGISTER_NONE ||
+                        IsGuestInstructionPointerRegister(
+                            operand.mem.base) ||
+                        operand.mem.index != X86_REGISTER_NONE ||
+                        operand.mem.segment == X86_REGISTER_FS ||
+                        operand.mem.segment == X86_REGISTER_GS ||
+                        access_bytes == 0) {
+                        return std::nullopt;
+                    }
+                    const auto location =
+                        resolve_register_location(operand.mem.base);
+                    if (!location || location->width != 64) {
+                        return std::nullopt;
+                    }
+                    const int cached =
+                        cached_gpr_host_index(location->offset);
+                    const std::int64_t displacement =
+                        SignedMemoryDisplacement(operand);
+                    constexpr std::uint32_t kMaximumScaledOffset = 4095;
+                    if (cached < 0 || displacement < 0 ||
+                        (static_cast<std::uint64_t>(displacement) %
+                         access_bytes) != 0 ||
+                        static_cast<std::uint64_t>(displacement) /
+                                access_bytes >
+                            kMaximumScaledOffset) {
+                        return std::nullopt;
+                    }
+                    return CachedGuestAddress{
+                        static_cast<std::uint32_t>(cached),
+                        static_cast<std::uint32_t>(displacement),
+                    };
+                };
                 const auto emit_publish_fault_ir_fast =
                     [&](const LsxDecodedOp& ir) {
                     if (generic_fault_cache_recovery_enabled) {
                         const NativeFaultRecoveryDescriptor* const descriptor =
                             preserve_fault_recovery_descriptor(ir);
-                        if (generic_relative_fault_publication_enabled) {
+                        if (generic_signal_fault_sidecar_enabled) {
+                            generic_signal_fault_sites.push_back({
+                                static_cast<std::uint32_t>(
+                                    code->getSize()),
+                                reinterpret_cast<std::uintptr_t>(
+                                    descriptor) |
+                                    kNativeFaultRecoveryTag,
+                            });
+                        } else if (
+                            generic_inline_relative_fault_publication_enabled) {
                             const std::uintptr_t offset =
                                 reinterpret_cast<std::uintptr_t>(descriptor) -
                                 reinterpret_cast<std::uintptr_t>(
@@ -18627,9 +19979,19 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                         return;
                     }
+                    if (generic_signal_fault_sidecar_enabled) {
+                        const NativeFaultDescriptor* const descriptor =
+                            preserve_fault_descriptor(ir);
+                        generic_signal_fault_sites.push_back({
+                            static_cast<std::uint32_t>(code->getSize()),
+                            reinterpret_cast<std::uintptr_t>(descriptor),
+                        });
+                        return;
+                    }
                     emit_flush_register_caches();
                     emit_load_plain_fault_descriptor(ir);
                 };
+                bool generic_inline_fault_publication_live = false;
                 const auto emit_publish_fault_ir =
                     [&](const LsxDecodedOp& ir) {
                     // Helpers observe the machine image and may clobber
@@ -18642,6 +20004,23 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->x21,
                         Xbyak_aarch64::ptr(
                             code->x19, kStateNativeFaultIrOffset));
+                    generic_inline_fault_publication_live =
+                        generic_signal_fault_sidecar_enabled;
+                };
+                const auto close_signal_fault_site = [&]() {
+                    if (!generic_signal_fault_sidecar_enabled ||
+                        generic_signal_fault_sites.empty() ||
+                        generic_signal_fault_sites.back().publication == 0) {
+                        return;
+                    }
+                    const auto end_offset = static_cast<std::uint32_t>(
+                        code->getSize());
+                    if (generic_signal_fault_sites.back().host_offset ==
+                        end_offset) {
+                        generic_signal_fault_sites.back().publication = 0;
+                        return;
+                    }
+                    generic_signal_fault_sites.push_back({end_offset, 0});
                 };
                 const auto emit_faultable_memory_address =
                     [&](const LsxDecodedOp& ir,
@@ -18924,7 +20303,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     generic_cached_gpr_dirty[
                                         static_cast<std::size_t>(
                                             cache_index)] &&
-                                    !generic_fault_write_through) {
+                                    !generic_fault_gpr_write_through) {
                                     generic_gpr_cache_written_mask |=
                                         std::uint32_t{1} <<
                                         static_cast<std::uint32_t>(
@@ -18934,7 +20313,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     XReg(static_cast<std::uint32_t>(
                                         cached_host_index)),
                                     src, 8, 8);
-                                if (generic_fault_write_through) {
+                                if (generic_fault_gpr_write_through) {
                                     code->str(
                                         XReg(static_cast<std::uint32_t>(
                                             cached_host_index)),
@@ -18969,7 +20348,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             if (cache_index >= 0 &&
                                 generic_cached_gpr_dirty[
                                     static_cast<std::size_t>(cache_index)] &&
-                                !generic_fault_write_through) {
+                                !generic_fault_gpr_write_through) {
                                 generic_gpr_cache_written_mask |=
                                     std::uint32_t{1} <<
                                     static_cast<std::uint32_t>(cache_index);
@@ -18987,7 +20366,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             } else {
                                 return false;
                             }
-                            if (generic_fault_write_through) {
+                            if (generic_fault_gpr_write_through) {
                                 code->str(
                                     cached,
                                     Xbyak_aarch64::ptr(
@@ -19039,6 +20418,70 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     return emit_read_operand(ir, source, shuttle) &&
                            emit_write_operand(ir, destination, shuttle);
                 };
+                const auto commit_cached_gpr_direct_write =
+                    [&](const std::uint32_t state_offset,
+                        const XReg& cached) {
+                    const int cache_index =
+                        cached_gpr_cache_index(state_offset);
+                    if (cache_index >= 0 &&
+                        generic_cached_gpr_dirty[
+                            static_cast<std::size_t>(cache_index)] &&
+                        !generic_fault_gpr_write_through) {
+                        generic_gpr_cache_written_mask |=
+                            std::uint32_t{1} <<
+                            static_cast<std::uint32_t>(cache_index);
+                    }
+                    if (generic_fault_gpr_write_through) {
+                        code->str(
+                            cached,
+                            Xbyak_aarch64::ptr(code->x19, state_offset));
+                    }
+                };
+                const auto emit_write_implicit_gpr =
+                    [&](const std::uint32_t state_offset,
+                        const std::uint32_t size_bits,
+                        const XReg& source) {
+                    const int cached_host =
+                        cached_gpr_host_index(state_offset);
+                    if (cached_host < 0) {
+                        switch (size_bits) {
+                        case 16:
+                            store_machine_half(
+                                WReg(source.getIdx()), state_offset);
+                            return true;
+                        case 32:
+                            EmitZeroExtendedDwordStore(
+                                *code, WReg(source.getIdx()),
+                                code->x19, state_offset);
+                            return true;
+                        case 64:
+                            store_machine_word(source, state_offset);
+                            return true;
+                        default:
+                            return false;
+                        }
+                    }
+                    const XReg cached{
+                        static_cast<std::uint32_t>(cached_host)};
+                    switch (size_bits) {
+                    case 16:
+                        code->bfi(cached, source, 0, 16);
+                        break;
+                    case 32:
+                        code->mov(
+                            WReg(cached.getIdx()),
+                            WReg(source.getIdx()));
+                        break;
+                    case 64:
+                        code->mov(cached, source);
+                        break;
+                    default:
+                        return false;
+                    }
+                    commit_cached_gpr_direct_write(
+                        state_offset, cached);
+                    return true;
+                };
                 const auto publish_x12_to_first_operand =
                     [&](const LsxDecodedOp& instruction) {
                         return emit_write_operand(
@@ -19075,8 +20518,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     return false;
                 };
                 const auto emit_vector_load_pair = [&](const LsxDecodedOp& ir,
-                                                        const LsxOperandRecord& operand,
-                                                        const QReg& low, const QReg& high,
+                                                         const LsxOperandRecord& operand,
+                                                         const QReg& low, const QReg& high,
                                                         std::uint32_t& width_bytes) {
                     if (operand.type == X86_OPERAND_TYPE_REGISTER) {
                         std::uint32_t state_offset = 0;
@@ -19113,11 +20556,33 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         return true;
                     }
                     if (operand.type != X86_OPERAND_TYPE_MEMORY ||
-                        (operand.size != 128 && operand.size != 256) ||
-                        !emit_memory_address(ir, operand, code->x14)) {
+                        (operand.size != 128 && operand.size != 256)) {
                         return false;
                     }
                     width_bytes = operand.size == 256 ? 32u : 16u;
+                    const auto direct =
+                        cached_guest_address(operand, 16);
+                    if (direct.has_value() &&
+                        (width_bytes == 16 ||
+                         direct->displacement <= 65504u)) {
+                        emit_publish_fault_ir_fast(ir);
+                        const XReg base{direct->host_register};
+                        code->ldr(
+                            low,
+                            Xbyak_aarch64::ptr(
+                                base, direct->displacement));
+                        if (width_bytes == 32) {
+                            code->ldr(
+                                high,
+                                Xbyak_aarch64::ptr(
+                                    base,
+                                    direct->displacement + 16u));
+                        }
+                        return true;
+                    }
+                    if (!emit_memory_address(ir, operand, code->x14)) {
+                        return false;
+                    }
                     emit_publish_fault_ir_fast(ir);
                     code->ldr(low, Xbyak_aarch64::ptr(code->x14));
                     if (width_bytes == 32) {
@@ -19181,6 +20646,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             if (generic_vector_half_known_zero[upper_slot]) {
                                 return true;
                             }
+                            if (generic_vector_half_deferred_zero[upper_slot]) {
+                                generic_vector_deferred_zero_mask |=
+                                    std::uint32_t{1} << upper_slot;
+                                generic_vector_half_known_zero[upper_slot] = true;
+                                return true;
+                            }
                             clear_vector_scratch();
                             const int high_cache =
                                 cached_vector_half_host_index(state_offset + 16);
@@ -19202,8 +20673,37 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                     if (operand.type != X86_OPERAND_TYPE_MEMORY ||
                         ((width_bytes == 16 && operand.size != 128) ||
-                         (width_bytes == 32 && operand.size != 256)) ||
-                        !emit_memory_address(ir, operand, code->x14)) {
+                         (width_bytes == 32 && operand.size != 256))) {
+                        return false;
+                    }
+                    const auto direct =
+                        cached_guest_address(operand, 16);
+                    if (direct.has_value() &&
+                        (width_bytes == 16 ||
+                         direct->displacement <= 65504u)) {
+                        emit_publish_fault_ir_fast(ir);
+                        const XReg base{direct->host_register};
+                        code->str(
+                            low,
+                            Xbyak_aarch64::ptr(
+                                base, direct->displacement));
+                        if (width_bytes == 32) {
+                            code->str(
+                                high,
+                                Xbyak_aarch64::ptr(
+                                    base,
+                                    direct->displacement + 16u));
+                        }
+                        if (JitDiagnosticStoreWatchRange().Enabled()) {
+                            if (!emit_memory_address(
+                                    ir, operand, code->x14)) {
+                                return false;
+                            }
+                        }
+                        emit_diagnostic_store_watch(ir, width_bytes);
+                        return true;
+                    }
+                    if (!emit_memory_address(ir, operand, code->x14)) {
                         return false;
                     }
                     emit_publish_fault_ir_fast(ir);
@@ -19225,6 +20725,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         generic_vector_half_known_zero[upper_slot]) {
                         return;
                     }
+                    if (generic_vector_half_deferred_zero[upper_slot]) {
+                        generic_vector_deferred_zero_mask |=
+                            std::uint32_t{1} << upper_slot;
+                        generic_vector_half_known_zero[upper_slot] = true;
+                        return;
+                    }
                     clear_vector_scratch();
                     const int upper_cache =
                         cached_vector_half_host_index(upper_offset);
@@ -19244,6 +20750,19 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     generic_vector_half_known_zero[upper_slot] = true;
                 };
                 bool generic_rflags_live_in_x9 = false;
+                const auto emit_inline_even_parity = [&]() {
+                    code->eor(
+                        code->w15, code->w12, code->w12,
+                        Xbyak_aarch64::LSR, 4);
+                    code->eor(
+                        code->w15, code->w15, code->w15,
+                        Xbyak_aarch64::LSR, 2);
+                    code->eor(
+                        code->w15, code->w15, code->w15,
+                        Xbyak_aarch64::LSR, 1);
+                    code->mvn(code->w15, code->w15);
+                    code->bfi(code->x13, code->x15, kPfBit, 1);
+                };
                 const auto publish_inline_status = [&](const std::uint64_t affected_bits) {
                     code->mov(code->x17, affected_bits);
                     load_machine_word(code->x9, kStateRflagsOffset);
@@ -19257,6 +20776,37 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             code->x17, kStateDeferredFlagsMetaOffset);
                     }
                     generic_rflags_live_in_x9 = true;
+                };
+                const auto emit_inline_flags_addsub_from_nzcv =
+                    [&](const bool is_sub, const bool preserve_cf = false) {
+                    if (preserve_cf) {
+                        code->mov(code->x13, 0);
+                    } else {
+                        code->cset(
+                            code->x13,
+                            is_sub ? Xbyak_aarch64::CC
+                                   : Xbyak_aarch64::CS);
+                    }
+                    code->cset(code->x14, Xbyak_aarch64::EQ);
+                    code->bfi(code->x13, code->x14, kZfBit, 1);
+                    code->cset(code->x14, Xbyak_aarch64::MI);
+                    code->bfi(code->x13, code->x14, kSfBit, 1);
+                    code->cset(code->x14, Xbyak_aarch64::VS);
+                    code->bfi(code->x13, code->x14, kOfBit, 1);
+
+                    code->eor(code->x14, code->x10, code->x11);
+                    code->eor(code->x14, code->x14, code->x12);
+                    code->and_(code->x14, code->x14,
+                               std::uint32_t{1} << kAfBit);
+                    code->orr(code->x13, code->x13, code->x14);
+
+                    emit_inline_even_parity();
+
+                    const std::uint64_t affected_bits = preserve_cf
+                        ? kArithmeticStatusBits &
+                              ~(std::uint64_t{1} << kCfBit)
+                        : kArithmeticStatusBits;
+                    publish_inline_status(affected_bits);
                 };
                 const auto emit_inline_flags_addsub = [&](const bool is_sub,
                                                           const std::uint32_t size_bits,
@@ -19292,44 +20842,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                     }
 
-                    if (preserve_cf) {
-                        code->mov(code->x13, 0);
-                    } else {
-                        code->cset(
-                            code->x13,
-                            is_sub ? Xbyak_aarch64::CC
-                                   : Xbyak_aarch64::CS);
-                    }
-                    code->cset(code->x14, Xbyak_aarch64::EQ);
-                    code->bfi(code->x13, code->x14, kZfBit, 1);
-                    code->cset(code->x14, Xbyak_aarch64::MI);
-                    code->bfi(code->x13, code->x14, kSfBit, 1);
-                    code->cset(code->x14, Xbyak_aarch64::VS);
-                    code->bfi(code->x13, code->x14, kOfBit, 1);
-
-                    code->eor(code->x14, code->x10, code->x11);
-                    code->eor(code->x14, code->x14, code->x12);
-                    code->ubfx(code->x14, code->x14, 4, 1);
-                    code->lsl(code->x14, code->x14, kAfBit);
-                    code->orr(code->x13, code->x13, code->x14);
-
-                    code->eor(
-                        code->w15, code->w12, code->w12,
-                        Xbyak_aarch64::LSR, 4);
-                    code->and_(code->w15, code->w15, 0xf);
-                    code->mov(code->w17, 0x9669);
-                    code->lsrv(code->w15, code->w17, code->w15);
-                    code->and_(code->w15, code->w15, 1);
-                    code->lsl(code->x15, code->x15, kPfBit);
-                    code->orr(code->x13, code->x13, code->x15);
-
-                    const std::uint64_t affected_bits = preserve_cf
-                        ? kArithmeticStatusBits & ~(std::uint64_t{1} << kCfBit)
-                        : kArithmeticStatusBits;
-                    publish_inline_status(affected_bits);
+                    emit_inline_flags_addsub_from_nzcv(
+                        is_sub, preserve_cf);
                 };
                 const auto emit_deferred_addsub_immediate_flags =
-                    [&](const LsxDecodedOp& ir, const bool is_sub) {
+                    [&](const LsxDecodedOp& ir, const bool is_sub,
+                        const bool carry_only) {
                     const std::uint32_t size_bits = ir.operands[0].size;
                     if (size_bits == 32) {
                         if (is_sub) {
@@ -19348,11 +20866,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->x13,
                         is_sub ? Xbyak_aarch64::CC : Xbyak_aarch64::CS);
                     load_machine_word(code->x14, kStateRflagsOffset);
-                    code->mov(code->x17, std::uint64_t{1} << kCfBit);
-                    code->bic(code->x14, code->x14, code->x17);
-                    code->orr(code->x14, code->x14, code->x13);
+                    code->bfi(code->x14, code->x13, kCfBit, 1);
                     store_machine_word(code->x14, kStateRflagsOffset);
 
+                    if (carry_only) {
+                        generic_rflags_live_in_x9 = false;
+                        return;
+                    }
                     store_machine_word(code->x10, kStateDeferredFlagsLhsOffset);
                     const std::int64_t immediate =
                         ir.operands[1].imm.is_signed
@@ -19424,7 +20944,20 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                     }
 
-                    if (size_bits == 8 || size_bits == 16) {
+                    if ((size_bits == 8 || size_bits == 16) &&
+                        JitHostHasFlagM()) {
+                        if (size_bits == 8) {
+                            code->setf8(code->w12);
+                        } else {
+                            code->setf16(code->w12);
+                        }
+                        if (g_host_flagm_small_nz_emissions.fetch_add(
+                                1, std::memory_order_relaxed) == 0) {
+                            JitLog("[EXECUTOR_HOST_ISA_LOWERING] "
+                                   "feature=flagm operation=logical_nz8_16 "
+                                   "active=1");
+                        }
+                    } else if (size_bits == 8 || size_bits == 16) {
                         code->lsl(code->w13, code->w12, 32u - size_bits);
                         code->ands(code->wzr, code->w13, code->w13);
                     } else if (size_bits == 32) {
@@ -19437,17 +20970,136 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     code->lsl(code->x13, code->x13, kZfBit);
                     code->bfi(code->x13, code->x14, kSfBit, 1);
 
-                    code->eor(
-                        code->w15, code->w12, code->w12,
-                        Xbyak_aarch64::LSR, 4);
-                    code->and_(code->w15, code->w15, 0xf);
-                    code->mov(code->w17, 0x9669);
-                    code->lsrv(code->w15, code->w17, code->w15);
-                    code->and_(code->w15, code->w15, 1);
-                    code->lsl(code->x15, code->x15, kPfBit);
-                    code->orr(code->x13, code->x13, code->x15);
+                    emit_inline_even_parity();
 
                     publish_inline_status(kArithmeticStatusBits);
+                };
+                const auto emit_native_flag_span_status =
+                    [&](const NativeFlagSpanKind kind,
+                        const std::uint32_t size_bits) {
+                    if (kind == NativeFlagSpanKind::Logical) {
+                        if (size_bits == 8) {
+                            code->setf8(code->w12);
+                        } else if (size_bits == 16) {
+                            code->setf16(code->w12);
+                        } else if (size_bits == 32) {
+                            code->ands(code->wzr, code->w12, code->w12);
+                        } else {
+                            code->ands(code->xzr, code->x12, code->x12);
+                        }
+                        return;
+                    }
+                    const bool subtract =
+                        kind == NativeFlagSpanKind::Subtraction;
+                    if (size_bits == 8 || size_bits == 16) {
+                        const std::uint32_t shift = 32u - size_bits;
+                        code->lsl(code->w13, code->w10, shift);
+                        code->lsl(code->w14, code->w11, shift);
+                        if (subtract) {
+                            code->subs(code->wzr, code->w13, code->w14);
+                        } else {
+                            code->adds(code->wzr, code->w13, code->w14);
+                        }
+                    } else if (size_bits == 32) {
+                        if (subtract) {
+                            code->subs(code->wzr, code->w10, code->w11);
+                        } else {
+                            code->adds(code->wzr, code->w10, code->w11);
+                        }
+                    } else if (subtract) {
+                        code->subs(code->xzr, code->x10, code->x11);
+                    } else {
+                        code->adds(code->xzr, code->x10, code->x11);
+                    }
+                };
+                const auto emit_native_flag_span_condition_value =
+                    [&](const X86Mnemonic mnemonic,
+                        const NativeFlagSpanKind kind) {
+                    const bool subtraction =
+                        kind == NativeFlagSpanKind::Subtraction;
+                    const bool logical =
+                        kind == NativeFlagSpanKind::Logical;
+                    const auto emit_simple =
+                        [&](const Xbyak_aarch64::Cond condition) {
+                        code->cset(code->x12, condition);
+                        return true;
+                    };
+                    switch (mnemonic) {
+                    case X86_MNEMONIC_SETB:
+                    case X86_MNEMONIC_CMOVB:
+                        if (logical) {
+                            code->mov(code->x12, 0);
+                            return true;
+                        }
+                        return emit_simple(
+                            subtraction ? Xbyak_aarch64::CC
+                                        : Xbyak_aarch64::CS);
+                    case X86_MNEMONIC_SETNB:
+                    case X86_MNEMONIC_CMOVNB:
+                        if (logical) {
+                            code->mov(code->x12, 1);
+                            return true;
+                        }
+                        return emit_simple(
+                            subtraction ? Xbyak_aarch64::CS
+                                        : Xbyak_aarch64::CC);
+                    case X86_MNEMONIC_SETBE:
+                    case X86_MNEMONIC_CMOVBE:
+                        if (logical) {
+                            return emit_simple(Xbyak_aarch64::EQ);
+                        }
+                        if (subtraction) {
+                            return emit_simple(Xbyak_aarch64::LS);
+                        }
+                        code->cset(code->x12, Xbyak_aarch64::CS);
+                        code->cset(code->x13, Xbyak_aarch64::EQ);
+                        code->orr(code->x12, code->x12, code->x13);
+                        return true;
+                    case X86_MNEMONIC_SETNBE:
+                    case X86_MNEMONIC_CMOVNBE:
+                        if (logical) {
+                            return emit_simple(Xbyak_aarch64::NE);
+                        }
+                        if (subtraction) {
+                            return emit_simple(Xbyak_aarch64::HI);
+                        }
+                        code->cset(code->x12, Xbyak_aarch64::CC);
+                        code->cset(code->x13, Xbyak_aarch64::NE);
+                        code->and_(code->x12, code->x12, code->x13);
+                        return true;
+                    case X86_MNEMONIC_SETL:
+                    case X86_MNEMONIC_CMOVL:
+                        return emit_simple(Xbyak_aarch64::LT);
+                    case X86_MNEMONIC_SETLE:
+                    case X86_MNEMONIC_CMOVLE:
+                        return emit_simple(Xbyak_aarch64::LE);
+                    case X86_MNEMONIC_SETNL:
+                    case X86_MNEMONIC_CMOVNL:
+                        return emit_simple(Xbyak_aarch64::GE);
+                    case X86_MNEMONIC_SETNLE:
+                    case X86_MNEMONIC_CMOVNLE:
+                        return emit_simple(Xbyak_aarch64::GT);
+                    case X86_MNEMONIC_SETNO:
+                    case X86_MNEMONIC_CMOVNO:
+                        return emit_simple(Xbyak_aarch64::VC);
+                    case X86_MNEMONIC_SETNS:
+                    case X86_MNEMONIC_CMOVNS:
+                        return emit_simple(Xbyak_aarch64::PL);
+                    case X86_MNEMONIC_SETNZ:
+                    case X86_MNEMONIC_CMOVNZ:
+                        return emit_simple(Xbyak_aarch64::NE);
+                    case X86_MNEMONIC_SETO:
+                    case X86_MNEMONIC_CMOVO:
+                        return emit_simple(Xbyak_aarch64::VS);
+                    case X86_MNEMONIC_SETS:
+                    case X86_MNEMONIC_CMOVS:
+                        return emit_simple(Xbyak_aarch64::MI);
+                    case X86_MNEMONIC_SETZ:
+                    case X86_MNEMONIC_CMOVZ:
+                        return emit_simple(Xbyak_aarch64::EQ);
+                    default:
+                        return false;
+                    }
                 };
                 const auto emit_inline_count_flags = [&]() {
                     code->cmp(code->x11, 0);
@@ -19464,10 +21116,133 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         *code, mnemonic, code->x9, code->x12, code->x10,
                         code->x11);
                 };
-                const auto emit_fused_compare_condition =
+                const auto emit_scalar_float_compare_flags_from_nzcv = [&]() {
+                    code->cset(code->x10, Xbyak_aarch64::VS);
+                    if (JitHostHasFlagM2()) {
+                        code->dd(0xd500405f);
+                        code->cset(code->x11, Xbyak_aarch64::CC);
+                        code->cset(code->x12, Xbyak_aarch64::EQ);
+                        if (g_host_flagm2_fp_compare_emissions.fetch_add(
+                                1, std::memory_order_relaxed) == 0) {
+                            JitLog("[EXECUTOR_HOST_ISA_LOWERING] "
+                                   "feature=flagm2 operation=fp_compare active=1");
+                        }
+                    } else {
+                        const auto condition_or_unordered =
+                            [&](const XReg& destination,
+                                const Xbyak_aarch64::Cond condition) {
+                            code->cset(destination, condition);
+                            code->orr(destination, destination, code->x10);
+                        };
+                        condition_or_unordered(code->x11,
+                                               Xbyak_aarch64::CC);
+                        condition_or_unordered(code->x12,
+                                               Xbyak_aarch64::EQ);
+                    }
+                    code->lsl(code->x10, code->x10, kPfBit);
+                    code->lsl(code->x12, code->x12, kZfBit);
+                    code->orr(code->x11, code->x11, code->x10);
+                    code->orr(code->x11, code->x11, code->x12);
+                    load_machine_word(code->x9, kStateRflagsOffset);
+                    code->mov(code->x13, kArithmeticStatusBits);
+                    code->bic(code->x9, code->x9, code->x13);
+                    code->orr(code->x9, code->x9, code->x11);
+                    store_machine_word(code->x9, kStateRflagsOffset);
+                };
+                const auto emit_fused_scalar_float_condition =
                     [&](const X86Mnemonic branch_mnemonic,
                         const LsxDecodedOp& compare,
                         Xbyak_aarch64::Cond& condition) {
+                    const auto compare_mnemonic =
+                        static_cast<X86Mnemonic>(compare.mnemonic);
+                    const bool double_lane =
+                        compare_mnemonic == X86_MNEMONIC_COMISD ||
+                        compare_mnemonic == X86_MNEMONIC_VCOMISD ||
+                        compare_mnemonic == X86_MNEMONIC_UCOMISD ||
+                        compare_mnemonic == X86_MNEMONIC_VUCOMISD;
+                    std::uint32_t lhs_offset = 0;
+                    std::uint32_t lhs_width = 0;
+                    std::uint32_t rhs_offset = 0;
+                    std::uint32_t rhs_width = 0;
+                    if (compare.operand_count != 2 ||
+                        !vector_register_state_offset(
+                            compare.operands[0].reg.value,
+                            lhs_offset, lhs_width) ||
+                        !vector_register_state_offset(
+                            compare.operands[1].reg.value,
+                            rhs_offset, rhs_width) ||
+                        lhs_width != 16 || rhs_width != 16) {
+                        return false;
+                    }
+                    std::uint32_t lhs_host = 0;
+                    std::uint32_t rhs_host = 1;
+                    const int cached_lhs =
+                        cached_vector_half_host_index(lhs_offset);
+                    const int cached_rhs =
+                        cached_vector_half_host_index(rhs_offset);
+                    if (cached_lhs >= 0) {
+                        lhs_host = static_cast<std::uint32_t>(cached_lhs);
+                    } else if (double_lane) {
+                        code->ldr(
+                            code->d0,
+                            Xbyak_aarch64::ptr(code->x19, lhs_offset));
+                    } else {
+                        code->ldr(
+                            code->s0,
+                            Xbyak_aarch64::ptr(code->x19, lhs_offset));
+                    }
+                    if (cached_rhs >= 0) {
+                        rhs_host = static_cast<std::uint32_t>(cached_rhs);
+                    } else if (double_lane) {
+                        code->ldr(
+                            code->d1,
+                            Xbyak_aarch64::ptr(code->x19, rhs_offset));
+                    } else {
+                        code->ldr(
+                            code->s1,
+                            Xbyak_aarch64::ptr(code->x19, rhs_offset));
+                    }
+                    if (double_lane) {
+                        code->fcmp(DReg{lhs_host}, DReg{rhs_host});
+                    } else {
+                        code->fcmp(SReg{lhs_host}, SReg{rhs_host});
+                    }
+                    condition = Xbyak_aarch64::EQ;
+                    switch (branch_mnemonic) {
+                    case X86_MNEMONIC_JBE:
+                        condition = Xbyak_aarch64::LE;
+                        return true;
+                    case X86_MNEMONIC_JNBE:
+                        condition = Xbyak_aarch64::GT;
+                        return true;
+                    case X86_MNEMONIC_JZ:
+                    case X86_MNEMONIC_JNZ:
+                        code->cset(code->w12, Xbyak_aarch64::EQ);
+                        code->cset(code->w13, Xbyak_aarch64::VS);
+                        break;
+                    case X86_MNEMONIC_JB:
+                    case X86_MNEMONIC_JNB:
+                        code->cset(code->w12, Xbyak_aarch64::CC);
+                        code->cset(code->w13, Xbyak_aarch64::VS);
+                        break;
+                    default:
+                        return false;
+                    }
+                    code->orr(code->w12, code->w12, code->w13);
+                    code->cmp(code->w12, 0);
+                    condition =
+                        branch_mnemonic == X86_MNEMONIC_JNZ ||
+                                branch_mnemonic == X86_MNEMONIC_JNB
+                            ? Xbyak_aarch64::EQ
+                            : Xbyak_aarch64::NE;
+                    return true;
+                };
+                const auto emit_fused_compare_condition =
+                    [&](const X86Mnemonic branch_mnemonic,
+                        const LsxDecodedOp& compare,
+                        Xbyak_aarch64::Cond& condition,
+                        const bool reload_operands,
+                        const bool logical_result = false) {
                     const std::uint32_t width = compare.operands[0].size;
                     if (width != 8 && width != 16 &&
                         width != 32 && width != 64) {
@@ -19475,7 +21250,27 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                     const bool logical =
                         static_cast<X86Mnemonic>(compare.mnemonic) ==
-                        X86_MNEMONIC_TEST;
+                            X86_MNEMONIC_TEST ||
+                        logical_result;
+                    if (reload_operands) {
+                        if (logical_result) {
+                            if (!emit_read_operand(
+                                    compare, compare.operands[0],
+                                    code->x12)) {
+                                return false;
+                            }
+                        } else if (!emit_read_operand(
+                                       compare, compare.operands[0],
+                                       code->x10) ||
+                                   !emit_read_operand(
+                                       compare, compare.operands[1],
+                                       code->x11)) {
+                            return false;
+                        } else if (logical) {
+                            code->and_(
+                                code->x12, code->x10, code->x11);
+                        }
+                    }
                     if (logical) {
                         if (width == 8 || width == 16) {
                             code->lsl(code->w13, code->w12, 32u - width);
@@ -19544,6 +21339,30 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                     return true;
                 };
+                const auto emit_fused_incdec_condition =
+                    [&](const X86Mnemonic branch_mnemonic,
+                        const LsxDecodedOp& adjust,
+                        Xbyak_aarch64::Cond& condition) {
+                    const std::uint32_t width =
+                        adjust.operands[0].size;
+                    if ((branch_mnemonic != X86_MNEMONIC_JNZ &&
+                         branch_mnemonic != X86_MNEMONIC_JZ) ||
+                        (width != 32 && width != 64) ||
+                        !emit_read_operand(
+                            adjust, adjust.operands[0], code->x10)) {
+                        return false;
+                    }
+                    if (width == 32) {
+                        code->cmp(code->w10, 0);
+                    } else {
+                        code->cmp(code->x10, 0);
+                    }
+                    condition =
+                        branch_mnemonic == X86_MNEMONIC_JNZ
+                            ? Xbyak_aarch64::NE
+                            : Xbyak_aarch64::EQ;
+                    return true;
+                };
                 const auto inverted_condition =
                     [](const Xbyak_aarch64::Cond condition) {
                     return static_cast<Xbyak_aarch64::Cond>(
@@ -19558,7 +21377,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     // Every direct faultable access replaces it immediately
                     // before touching guest memory.
                     code->mov(code->x21, 0);
-                    if (generic_relative_fault_publication_enabled) {
+                    if (generic_vector_deferred_zero_candidate_mask != 0) {
+                        code->movi(code->v30.b16, 0);
+                    }
+                    if (generic_inline_relative_fault_publication_enabled) {
                         EmitJitRelocatablePointer(
                             *code,
                             generic_has_local_backedge ? code->x27
@@ -19568,15 +21390,23 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                 };
                 std::size_t generic_static_gpr_entry_offset = 0;
+                std::size_t generic_full_gpr_entry_offset = 0;
                 emit_resident_block_initialization();
                 emit_reload_gpr_cache();
                 if (generic_chain_abi && generic_static_gpr_cache) {
-                    Xbyak_aarch64::Label after_static_gpr_entry;
-                    code->b(after_static_gpr_entry);
+                    Xbyak_aarch64::Label after_gpr_entries;
+                    code->b(after_gpr_entries);
                     generic_static_gpr_entry_offset = code->getSize();
                     emit_resident_block_initialization();
                     emit_reload_gpr_cache(false, true);
-                    code->L(after_static_gpr_entry);
+                    if (kFullAdaptiveGprChainIsObserverComplete &&
+                        (generic_gpr_layout_signature &
+                         kAdaptiveGprDirtyLayoutMask) == 0) {
+                        code->b(after_gpr_entries);
+                        generic_full_gpr_entry_offset = code->getSize();
+                        emit_resident_block_initialization();
+                    }
+                    code->L(after_gpr_entries);
                 }
                 emit_reload_vector_cache();
                 generic_vector_half_known_zero.fill(false);
@@ -19606,10 +21436,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                 bool emitted = true;
                 std::uint64_t emitted_simd_fast = 0;
                 std::uint64_t emitted_simd_semantic = 0;
+                std::uint64_t emitted_relaxed_fma = 0;
                 std::uint64_t emitted_scalar_semantic = 0;
                 std::uint64_t emitted_scalar_shift_inline = 0;
                 std::uint64_t emitted_scalar_imul_inline = 0;
                 std::uint64_t emitted_scalar_dead_flag_elisions = 0;
+                std::uint64_t emitted_relaxed_neon_reductions = 0;
                 bool scalar_semantic_exit_used = false;
                 const auto emit_scalar_semantic_instruction = [&]
                     (const LsxDecodedOp& ir) {
@@ -19643,8 +21475,636 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     scalar_semantic_exit_used = true;
                     return true;
                 };
+                struct ScalarFloatReductionPlan {
+                    std::size_t length = 0;
+                    std::uint32_t destination_offset = 0;
+                    std::uint32_t destination_host = 0;
+                    std::uint32_t source_bytes = 0;
+                };
+                const auto plan_scalar_float_reduction =
+                    [&](const std::size_t begin)
+                        -> std::optional<ScalarFloatReductionPlan> {
+                    if (!RelaxedFpFusionEnabled() ||
+                        !tiered_vector_residency ||
+                        begin >= generic_scalar_instruction_count) {
+                        return std::nullopt;
+                    }
+                    const LsxDecodedOp& first =
+                        block.instructions[begin];
+                    if (static_cast<X86Mnemonic>(first.mnemonic) !=
+                            X86_MNEMONIC_VMOVSS ||
+                        first.decoded.encoding !=
+                            X86_INSTRUCTION_ENCODING_VEX ||
+                        first.operand_count != 2 ||
+                        !IsXmmOperand(first.operands[0]) ||
+                        first.operands[1].type !=
+                            X86_OPERAND_TYPE_MEMORY ||
+                        first.operands[1].size != 32 ||
+                        tiered_guard_for_instruction(begin) != nullptr) {
+                        return std::nullopt;
+                    }
+                    std::uint32_t destination_offset = 0;
+                    std::uint32_t destination_width = 0;
+                    if (!vector_register_state_offset(
+                            first.operands[0].reg.value,
+                            destination_offset, destination_width) ||
+                        destination_width != 16) {
+                        return std::nullopt;
+                    }
+                    const int destination_cache =
+                        cached_vector_half_host_index(
+                            destination_offset);
+                    const std::size_t upper_slot =
+                        (destination_offset + 16u -
+                         kStateYmm0Offset) /
+                        16u;
+                    if (destination_cache < 0 ||
+                        upper_slot >=
+                            generic_vector_half_deferred_zero.size() ||
+                        !generic_vector_half_deferred_zero[upper_slot]) {
+                        return std::nullopt;
+                    }
+                    const LsxMemoryOperand& source_memory =
+                        first.operands[1].mem;
+                    const auto same_source_base =
+                        [&](const LsxOperandRecord& operand) {
+                        return operand.type ==
+                                   X86_OPERAND_TYPE_MEMORY &&
+                               operand.size == 32 &&
+                               operand.mem.segment ==
+                                   source_memory.segment &&
+                               operand.mem.base ==
+                                   source_memory.base &&
+                               operand.mem.index ==
+                                   source_memory.index &&
+                               operand.mem.scale ==
+                                   source_memory.scale;
+                    };
+                    const std::int64_t first_displacement =
+                        SignedMemoryDisplacement(first.operands[1]);
+                    std::size_t float_count = 1;
+                    while (begin + float_count <
+                               generic_scalar_instruction_count &&
+                           float_count < 8) {
+                        const std::size_t index =
+                            begin + float_count;
+                        const LsxDecodedOp& candidate =
+                            block.instructions[index];
+                        if (static_cast<X86Mnemonic>(
+                                candidate.mnemonic) !=
+                                X86_MNEMONIC_VADDSS ||
+                            candidate.decoded.encoding !=
+                                X86_INSTRUCTION_ENCODING_VEX ||
+                            candidate.operand_count != 3 ||
+                            !IsXmmOperand(candidate.operands[0]) ||
+                            !IsXmmOperand(candidate.operands[1]) ||
+                            candidate.operands[0].reg.value !=
+                                first.operands[0].reg.value ||
+                            candidate.operands[1].reg.value !=
+                                first.operands[0].reg.value ||
+                            !same_source_base(
+                                candidate.operands[2]) ||
+                            tiered_guard_for_instruction(index) !=
+                                nullptr ||
+                            SignedMemoryDisplacement(
+                                candidate.operands[2]) !=
+                                first_displacement +
+                                    static_cast<std::int64_t>(
+                                        float_count * 4u) ||
+                            (generic_local_backedge_index.has_value() &&
+                             *generic_local_backedge_index == index)) {
+                            break;
+                        }
+                        ++float_count;
+                    }
+                    if (float_count != 6 && float_count != 8) {
+                        return std::nullopt;
+                    }
+                    return ScalarFloatReductionPlan{
+                        .length = float_count,
+                        .destination_offset =
+                            destination_offset,
+                        .destination_host =
+                            static_cast<std::uint32_t>(
+                                destination_cache),
+                        .source_bytes =
+                            static_cast<std::uint32_t>(
+                                float_count * 4u),
+                    };
+                };
+                const auto emit_scalar_float_reduction =
+                    [&](const std::size_t begin,
+                        const ScalarFloatReductionPlan& plan) {
+                    const LsxDecodedOp& first =
+                        block.instructions[begin];
+                    Xbyak_aarch64::Label scalar_fallback;
+                    Xbyak_aarch64::Label reduction_done;
+
+                    if (!emit_memory_address(
+                            first, first.operands[1],
+                            code->x14)) {
+                        return false;
+                    }
+                    code->ubfx(code->x15, code->x14, 0, 12);
+                    code->cmp(
+                        code->x15,
+                        4096u - plan.source_bytes);
+                    code->b(
+                        Xbyak_aarch64::HI,
+                        scalar_fallback);
+
+                    emit_publish_fault_ir_fast(first);
+                    code->ldr(
+                        code->q0,
+                        Xbyak_aarch64::ptr(code->x14));
+                    if (plan.length == 8) {
+                        code->ldr(
+                            code->q1,
+                            Xbyak_aarch64::ptr(
+                                code->x14, 16));
+                    } else {
+                        code->ldr(
+                            code->d1,
+                            Xbyak_aarch64::ptr(
+                                code->x14, 16));
+                    }
+                    code->faddp(
+                        code->v0.s4, code->v0.s4,
+                        code->v1.s4);
+                    code->faddp(
+                        code->v0.s4, code->v0.s4,
+                        code->v0.s4);
+                    code->fadd(
+                        code->s0, code->s0, code->s1);
+                    code->movi(
+                        VReg16B{plan.destination_host},
+                        0);
+                    code->ins(
+                        VReg4S{plan.destination_host}[0],
+                        code->v0.s4[0]);
+                    code->b(reduction_done);
+
+                    mark_cached_vector_half_written(
+                        static_cast<int>(
+                            plan.destination_host));
+                    const std::size_t upper_slot =
+                        (plan.destination_offset + 16u -
+                         kStateYmm0Offset) /
+                        16u;
+                    generic_vector_deferred_zero_mask |=
+                        std::uint32_t{1} << upper_slot;
+                    generic_vector_half_known_zero[
+                        upper_slot] = true;
+
+                    code->L(scalar_fallback);
+                    for (std::size_t reduction_index = 0;
+                         reduction_index < plan.length;
+                         ++reduction_index) {
+                        const LsxDecodedOp& instruction =
+                            block.instructions[
+                                begin + reduction_index];
+                        const LsxOperandRecord& source =
+                            instruction.operands[
+                                reduction_index == 0 ? 1u
+                                                     : 2u];
+                        if (!emit_memory_address(
+                                instruction, source,
+                                code->x14)) {
+                            return false;
+                        }
+                        emit_publish_fault_ir_fast(
+                            instruction);
+                        code->ldr(
+                            code->s2,
+                            Xbyak_aarch64::ptr(code->x14));
+                        if (reduction_index == 0) {
+                            code->movi(
+                                VReg16B{
+                                    plan.destination_host},
+                                0);
+                            code->ins(
+                                VReg4S{
+                                    plan.destination_host}[0],
+                                code->v2.s4[0]);
+                        } else {
+                            code->fadd(
+                                code->s0,
+                                SReg{
+                                    plan.destination_host},
+                                code->s2);
+                            code->ins(
+                                VReg4S{
+                                    plan.destination_host}[0],
+                                code->v0.s4[0]);
+                        }
+                        if (!cached_vector_half_is_writeback(
+                                static_cast<int>(
+                                    plan.destination_host))) {
+                            code->str(
+                                QReg{
+                                    plan.destination_host},
+                                Xbyak_aarch64::ptr(
+                                    code->x19,
+                                    plan.destination_offset));
+                        }
+                    }
+                    code->L(reduction_done);
+                    if (!cached_vector_half_is_writeback(
+                            static_cast<int>(
+                                plan.destination_host))) {
+                        code->str(
+                            QReg{plan.destination_host},
+                            Xbyak_aarch64::ptr(
+                                code->x19,
+                                plan.destination_offset));
+                    }
+                    return true;
+                };
+                struct DeadScalarChainPlan {
+                    std::size_t length = 0;
+                    std::uint32_t temporary_offset = 0;
+                    std::uint32_t destination_offset = 0;
+                    std::uint32_t merge_source_offset = 0;
+                    bool final_temporary_is_lhs = false;
+                    bool relaxed_fma = false;
+                };
+                const auto plan_dead_scalar_chain =
+                    [&](const std::size_t begin)
+                        -> std::optional<DeadScalarChainPlan> {
+                    if (!tiered_vector_residency ||
+                        begin + 1u >= generic_scalar_instruction_count) {
+                        return std::nullopt;
+                    }
+                    const auto vex_scalar_arithmetic =
+                        [&](const LsxDecodedOp& candidate) {
+                        const auto candidate_mnemonic =
+                            static_cast<X86Mnemonic>(
+                                candidate.mnemonic);
+                        return candidate.operand_count == 3 &&
+                               candidate.decoded.encoding ==
+                                   X86_INSTRUCTION_ENCODING_VEX &&
+                               (candidate_mnemonic ==
+                                    X86_MNEMONIC_VADDSS ||
+                                candidate_mnemonic ==
+                                    X86_MNEMONIC_VSUBSS ||
+                                candidate_mnemonic ==
+                                    X86_MNEMONIC_VMULSS) &&
+                               is_native_scalar_float_add_sub_mul(
+                                   candidate);
+                    };
+                    const auto scalar_register_offset =
+                        [&](const LsxOperandRecord& operand,
+                            std::uint32_t& offset) {
+                        std::uint32_t width = 0;
+                        return operand.type ==
+                                   X86_OPERAND_TYPE_REGISTER &&
+                               vector_register_state_offset(
+                                   operand.reg.value, offset, width) &&
+                               width == 16;
+                    };
+
+                    const LsxDecodedOp& first =
+                        block.instructions[begin];
+                    if (!vex_scalar_arithmetic(first) ||
+                        tiered_guard_for_instruction(begin) != nullptr) {
+                        return std::nullopt;
+                    }
+                    std::uint32_t temporary_offset = 0;
+                    std::uint32_t first_lhs_offset = 0;
+                    std::uint32_t first_rhs_offset = 0;
+                    if (!scalar_register_offset(
+                            first.operands[0], temporary_offset) ||
+                        (scalar_register_offset(
+                             first.operands[1], first_lhs_offset) &&
+                         first_lhs_offset == temporary_offset) ||
+                        (scalar_register_offset(
+                             first.operands[2], first_rhs_offset) &&
+                         first_rhs_offset == temporary_offset)) {
+                        return std::nullopt;
+                    }
+
+                    const auto count_memory =
+                        [&](const LsxDecodedOp& op) {
+                        std::size_t count = 0;
+                        for (std::uint8_t operand_index = 1;
+                             operand_index < op.operand_count;
+                             ++operand_index) {
+                            count +=
+                                static_cast<std::size_t>(
+                                    op.operands[operand_index].type ==
+                                    X86_OPERAND_TYPE_MEMORY);
+                        }
+                        return count;
+                    };
+                    const std::size_t memory_operands =
+                        count_memory(first);
+                    if (memory_operands > 1u) {
+                        return std::nullopt;
+                    }
+                    const std::size_t final_index = begin + 1u;
+                    if ((generic_local_backedge_index.has_value() &&
+                         *generic_local_backedge_index == final_index) ||
+                        tiered_guard_for_instruction(final_index) != nullptr) {
+                        return std::nullopt;
+                    }
+                    const LsxDecodedOp& final =
+                        block.instructions[final_index];
+                    if (!vex_scalar_arithmetic(final) ||
+                        count_memory(final) != 0) {
+                        return std::nullopt;
+                    }
+                    std::uint32_t destination_offset = 0;
+                    std::uint32_t final_lhs_offset = 0;
+                    std::uint32_t final_rhs_offset = 0;
+                    if (!scalar_register_offset(
+                            final.operands[0], destination_offset) ||
+                        !scalar_register_offset(
+                            final.operands[1], final_lhs_offset)) {
+                        return std::nullopt;
+                    }
+                    const bool lhs_is_temporary =
+                        final_lhs_offset == temporary_offset;
+                    const bool rhs_is_temporary =
+                        scalar_register_offset(
+                            final.operands[2], final_rhs_offset) &&
+                        final_rhs_offset == temporary_offset;
+                    if (!lhs_is_temporary && !rhs_is_temporary) {
+                        return std::nullopt;
+                    }
+                    const std::uint32_t merge_source_offset =
+                        lhs_is_temporary
+                            ? first_lhs_offset
+                            : final_lhs_offset;
+                    const bool relaxed_fma =
+                        RelaxedFpFusionEnabled() &&
+                        static_cast<X86Mnemonic>(first.mnemonic) ==
+                            X86_MNEMONIC_VMULSS &&
+                        static_cast<X86Mnemonic>(final.mnemonic) ==
+                            X86_MNEMONIC_VADDSS;
+                    if (cached_vector_half_host_index(
+                            merge_source_offset) < 0 ||
+                        cached_vector_half_host_index(
+                            destination_offset) < 0) {
+                        return std::nullopt;
+                    }
+                    for (std::size_t index = begin;
+                         index <= final_index; ++index) {
+                        const LsxDecodedOp& candidate =
+                            block.instructions[index];
+                        for (std::uint8_t operand_index = 1;
+                             operand_index < candidate.operand_count;
+                             ++operand_index) {
+                            const auto& operand =
+                                candidate.operands[operand_index];
+                            if (operand.type !=
+                                X86_OPERAND_TYPE_REGISTER) {
+                                continue;
+                            }
+                            std::uint32_t offset = 0;
+                            if (!scalar_register_offset(
+                                    operand, offset) ||
+                                (offset != temporary_offset &&
+                                 cached_vector_half_host_index(
+                                     offset) < 0)) {
+                                return std::nullopt;
+                            }
+                        }
+                    }
+
+                    if (destination_offset == temporary_offset) {
+                        return DeadScalarChainPlan{
+                            2u,
+                            temporary_offset,
+                            destination_offset,
+                            merge_source_offset,
+                            lhs_is_temporary,
+                            relaxed_fma,
+                        };
+                    }
+
+                    for (std::size_t index = final_index + 1u;
+                         index < generic_scalar_instruction_count;
+                         ++index) {
+                        const LsxDecodedOp& candidate =
+                            block.instructions[index];
+                        if (instruction_has_faultable_memory_access(
+                                candidate)) {
+                            return std::nullopt;
+                        }
+                        bool writes_temporary = false;
+                        for (std::uint8_t operand_index = 0;
+                             operand_index < candidate.operand_count;
+                             ++operand_index) {
+                            const auto& operand =
+                                candidate.operands[operand_index];
+                            std::uint32_t offset = 0;
+                            std::uint32_t width = 0;
+                            if (operand.type !=
+                                    X86_OPERAND_TYPE_REGISTER ||
+                                !vector_register_state_offset(
+                                    operand.reg.value, offset, width) ||
+                                offset != temporary_offset) {
+                                continue;
+                            }
+                            if ((operand.actions &
+                                 X86_OPERAND_ACTION_MASK_READ) != 0) {
+                                return std::nullopt;
+                            }
+                            writes_temporary |=
+                                (operand.actions &
+                                 X86_OPERAND_ACTION_MASK_WRITE) != 0;
+                        }
+                        if (writes_temporary) {
+                            return DeadScalarChainPlan{
+                                2u,
+                                temporary_offset,
+                                destination_offset,
+                                merge_source_offset,
+                                lhs_is_temporary,
+                                relaxed_fma,
+                            };
+                        }
+                    }
+                    return std::nullopt;
+                };
+                const auto emit_dead_scalar_chain =
+                    [&](const std::size_t begin,
+                        const DeadScalarChainPlan& plan) {
+                    const auto resolve_scalar_source =
+                        [&](const LsxDecodedOp& instruction,
+                            const LsxOperandRecord& operand,
+                            const std::uint32_t scratch_host,
+                            std::uint32_t& host) {
+                        if (operand.type ==
+                            X86_OPERAND_TYPE_REGISTER) {
+                            std::uint32_t offset = 0;
+                            std::uint32_t width = 0;
+                            if (!vector_register_state_offset(
+                                    operand.reg.value, offset, width) ||
+                                width != 16) {
+                                return false;
+                            }
+                            if (offset ==
+                                plan.temporary_offset) {
+                                host = 0;
+                                return true;
+                            }
+                            const int cached =
+                                cached_vector_half_host_index(offset);
+                            if (cached < 0) {
+                                return false;
+                            }
+                            host = static_cast<std::uint32_t>(
+                                cached);
+                            return true;
+                        }
+                        if (operand.type !=
+                                X86_OPERAND_TYPE_MEMORY ||
+                            operand.size != 32) {
+                            return false;
+                        }
+                        if (const auto direct =
+                                cached_guest_address(operand, 4);
+                            direct.has_value()) {
+                            emit_publish_fault_ir_fast(instruction);
+                            code->ldr(
+                                SReg{scratch_host},
+                                Xbyak_aarch64::ptr(
+                                    XReg{direct->host_register},
+                                    direct->displacement));
+                            host = scratch_host;
+                            return true;
+                        }
+                        if (!emit_memory_address(
+                                instruction, operand, code->x14)) {
+                            return false;
+                        }
+                        emit_publish_fault_ir_fast(instruction);
+                        code->ldr(
+                            SReg{scratch_host},
+                            Xbyak_aarch64::ptr(code->x14));
+                        host = scratch_host;
+                        return true;
+                    };
+                    if (plan.relaxed_fma) {
+                        const LsxDecodedOp& multiply =
+                            block.instructions[begin];
+                        const LsxDecodedOp& add =
+                            block.instructions[begin + 1u];
+                        std::uint32_t lhs_host = 0;
+                        std::uint32_t rhs_host = 0;
+                        std::uint32_t addend_host = 0;
+                        if (!resolve_scalar_source(
+                                multiply, multiply.operands[1], 2,
+                                lhs_host) ||
+                            !resolve_scalar_source(
+                                multiply, multiply.operands[2], 4,
+                                rhs_host) ||
+                            !resolve_scalar_source(
+                                add,
+                                add.operands[
+                                    plan.final_temporary_is_lhs ? 2 : 1],
+                                6, addend_host)) {
+                            return false;
+                        }
+                        code->fmadd(code->s0, SReg{lhs_host},
+                                    SReg{rhs_host}, SReg{addend_host});
+                    } else for (std::size_t chain_index = 0;
+                                chain_index < plan.length;
+                                ++chain_index) {
+                        const LsxDecodedOp& instruction =
+                            block.instructions[begin + chain_index];
+                        std::uint32_t lhs_host = 0;
+                        std::uint32_t rhs_host = 0;
+                        if (!resolve_scalar_source(
+                                instruction,
+                                instruction.operands[1], 2,
+                                lhs_host) ||
+                            !resolve_scalar_source(
+                                instruction,
+                                instruction.operands[2], 4,
+                                rhs_host)) {
+                            return false;
+                        }
+                        const auto operation =
+                            static_cast<X86Mnemonic>(
+                                instruction.mnemonic);
+                        if (operation ==
+                            X86_MNEMONIC_VADDSS) {
+                            code->fadd(
+                                code->s0, SReg{lhs_host},
+                                SReg{rhs_host});
+                        } else if (operation ==
+                                   X86_MNEMONIC_VSUBSS) {
+                            code->fsub(
+                                code->s0, SReg{lhs_host},
+                                SReg{rhs_host});
+                        } else {
+                            code->fmul(
+                                code->s0, SReg{lhs_host},
+                                SReg{rhs_host});
+                        }
+                    }
+                    const int destination_cache =
+                        cached_vector_half_host_index(
+                            plan.destination_offset);
+                    const int merge_source_cache =
+                        cached_vector_half_host_index(
+                            plan.merge_source_offset);
+                    if (destination_cache < 0 ||
+                        merge_source_cache < 0) {
+                        return false;
+                    }
+                    const std::uint32_t destination_host =
+                        static_cast<std::uint32_t>(
+                            destination_cache);
+                    if (destination_cache != merge_source_cache) {
+                        code->orr(
+                            VReg16B{destination_host},
+                            VReg16B{
+                                static_cast<std::uint32_t>(
+                                    merge_source_cache)},
+                            VReg16B{
+                                static_cast<std::uint32_t>(
+                                    merge_source_cache)});
+                    }
+                    code->ins(
+                        VReg4S{destination_host}[0],
+                        code->v0.s4[0]);
+                    if (!cached_vector_half_is_writeback(
+                            destination_cache)) {
+                        code->str(
+                            QReg{destination_host},
+                            Xbyak_aarch64::ptr(
+                                code->x19,
+                                plan.destination_offset));
+                    }
+                    mark_cached_vector_half_written(
+                        destination_cache);
+                    emit_zero_vector_upper_half(
+                        plan.temporary_offset);
+                    emit_zero_vector_upper_half(
+                        plan.destination_offset);
+                    return true;
+                };
                 for (std::size_t i = 0;
                      emitted && i < generic_scalar_instruction_count; ++i) {
+                    generic_inline_fault_publication_live = false;
+                    JitEmissionScopeExit close_fault_site_after_instruction{
+                        [&]() {
+                            close_signal_fault_site();
+                            if (generic_inline_fault_publication_live) {
+                                code->mov(code->x21, 0);
+                            }
+                        }};
+                    if (generic_vector_cache_active &&
+                        i == generic_vector_cache_instruction_limit) {
+                        emit_flush_vector_cache();
+                        generic_vector_cache_active = false;
+                        generic_vector_cache_written_mask = 0;
+                        generic_vector_deferred_zero_mask = 0;
+                        generic_vector_half_known_zero.fill(false);
+                    }
                     if (generic_local_backedge_index == i) {
                         code->L(local_loop_body);
                         generic_vector_half_known_zero.fill(false);
@@ -19655,16 +22115,53 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     if (const TieredGuardEmission* const guard =
                             tiered_guard_for_instruction(i);
                         guard != nullptr) {
+                        const std::size_t fused_compare_index =
+                            i < generic_guard_fused_compare_index.size()
+                                ? generic_guard_fused_compare_index[i]
+                                : kNoFusedCompareIndex;
+                        const std::uint8_t fused_compare_kind =
+                            fused_compare_index <
+                                    generic_fused_compare_branch.size()
+                                ? generic_fused_compare_branch[
+                                      fused_compare_index]
+                                : 0;
                         const bool fused_compare =
-                            i != 0 &&
-                            generic_fused_compare_branch[i - 1u] == 1;
+                            fused_compare_kind == 1 ||
+                            fused_compare_kind == 4 ||
+                            fused_compare_kind == 6;
+                        const bool fused_float_compare =
+                            fused_compare_kind == 3;
+                        const bool delayed_fused_compare =
+                            fused_compare_kind == 4 ||
+                            fused_compare_kind == 6;
+                        const bool fused_logical_result =
+                            fused_compare_kind == 6;
+                        const bool fused_incdec =
+                            fused_compare_kind == 5;
                         Xbyak_aarch64::Label hot_path;
-                        if (fused_compare) {
+                        if (fused_compare || fused_float_compare ||
+                            fused_incdec) {
                             Xbyak_aarch64::Cond condition =
                                 Xbyak_aarch64::EQ;
-                            emitted = emit_fused_compare_condition(
-                                mnemonic, block.instructions[i - 1u],
-                                condition);
+                            emitted = fused_float_compare
+                                ? emit_fused_scalar_float_condition(
+                                      mnemonic,
+                                      block.instructions[
+                                          fused_compare_index],
+                                      condition)
+                                : (fused_incdec
+                                       ? emit_fused_incdec_condition(
+                                             mnemonic,
+                                             block.instructions[
+                                                 fused_compare_index],
+                                             condition)
+                                       : emit_fused_compare_condition(
+                                             mnemonic,
+                                             block.instructions[
+                                                 fused_compare_index],
+                                             condition,
+                                             delayed_fused_compare,
+                                             fused_logical_result));
                             if (emitted) {
                                 code->b(
                                     guard->hot_path_is_taken
@@ -19687,7 +22184,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
                         if (fused_compare) {
                             emit_deferred_fused_compare_flags(
-                                block.instructions[i - 1u]);
+                                block.instructions[fused_compare_index]);
+                            emit_materialize_deferred_flags(true);
+                        } else if (fused_float_compare) {
+                            emit_scalar_float_compare_flags_from_nzcv();
+                        } else if (fused_incdec) {
                             emit_materialize_deferred_flags(true);
                         }
                         if (guard->deopt_context == nullptr) {
@@ -19716,6 +22217,35 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             emit_epilogue_return_reg(code->x20);
                         }
                         code->L(hot_path);
+                        continue;
+                    }
+                    const auto scalar_float_reduction =
+                        plan_scalar_float_reduction(i);
+                    if (scalar_float_reduction.has_value()) {
+                        emitted = emit_scalar_float_reduction(
+                            i, *scalar_float_reduction);
+                        if (emitted) {
+                            emitted_simd_fast +=
+                                scalar_float_reduction->length;
+                            ++emitted_relaxed_neon_reductions;
+                            i +=
+                                scalar_float_reduction->length -
+                                1u;
+                        }
+                        continue;
+                    }
+                    const auto dead_scalar_chain =
+                        plan_dead_scalar_chain(i);
+                    if (dead_scalar_chain.has_value()) {
+                        emitted = emit_dead_scalar_chain(
+                            i, *dead_scalar_chain);
+                        if (emitted) {
+                            emitted_simd_fast +=
+                                dead_scalar_chain->length;
+                            emitted_relaxed_fma +=
+                                dead_scalar_chain->relaxed_fma ? 1u : 0u;
+                            i += dead_scalar_chain->length - 1u;
+                        }
                         continue;
                     }
                     if (is_native_fp_control_transfer(ir)) {
@@ -20104,13 +22634,27 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         continue;
                     }
                     if (IsSetccMnemonic(mnemonic)) {
-                        emitted = emit_condition_value(mnemonic) &&
+                        const auto native_span_kind =
+                            static_cast<NativeFlagSpanKind>(
+                                generic_native_flag_span_consumer[i]);
+                        emitted =
+                            (native_span_kind != NativeFlagSpanKind::None
+                                 ? emit_native_flag_span_condition_value(
+                                       mnemonic, native_span_kind)
+                                 : emit_condition_value(mnemonic)) &&
                                   emit_write_operand(ir, ir.operands[0], code->x12);
                         continue;
                     }
                     if (IsCmovMnemonic(mnemonic)) {
                         Xbyak_aarch64::Label condition_false;
-                        emitted = emit_condition_value(mnemonic);
+                        const auto native_span_kind =
+                            static_cast<NativeFlagSpanKind>(
+                                generic_native_flag_span_consumer[i]);
+                        emitted =
+                            native_span_kind != NativeFlagSpanKind::None
+                            ? emit_native_flag_span_condition_value(
+                                  mnemonic, native_span_kind)
+                            : emit_condition_value(mnemonic);
                         if (emitted) {
                             code->cbz(code->w12, condition_false);
                             emitted = emit_operand_copy(
@@ -20165,6 +22709,213 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         continue;
                     }
                     if (IsWholeVectorTransferMnemonic(mnemonic)) {
+                        const bool vex_register_write =
+                            ir.decoded.encoding ==
+                                X86_INSTRUCTION_ENCODING_VEX ||
+                            ir.decoded.encoding ==
+                                X86_INSTRUCTION_ENCODING_EVEX ||
+                            ir.decoded.encoding ==
+                                X86_INSTRUCTION_ENCODING_XOP;
+                        if ((kJitResidentSimdDirectEnabled ||
+                             g_jit_selftest_production_direct_active) &&
+                            tiered_vector_residency &&
+                            ir.operand_count == 2) {
+                            const auto& destination = ir.operands[0];
+                            const auto& source = ir.operands[1];
+                            std::uint32_t destination_offset = 0;
+                            std::uint32_t destination_width = 0;
+                            std::uint32_t source_offset = 0;
+                            std::uint32_t source_width = 0;
+                            const bool destination_register =
+                                destination.type ==
+                                    X86_OPERAND_TYPE_REGISTER &&
+                                vector_register_state_offset(
+                                    destination.reg.value,
+                                    destination_offset,
+                                    destination_width);
+                            const bool source_register =
+                                source.type ==
+                                    X86_OPERAND_TYPE_REGISTER &&
+                                vector_register_state_offset(
+                                    source.reg.value, source_offset,
+                                    source_width);
+                            const bool destination_memory =
+                                destination.type ==
+                                    X86_OPERAND_TYPE_MEMORY &&
+                                (destination.size == 128 ||
+                                 destination.size == 256);
+                            const bool source_memory =
+                                source.type == X86_OPERAND_TYPE_MEMORY &&
+                                (source.size == 128 ||
+                                 source.size == 256);
+                            const std::uint32_t transfer_width =
+                                destination_register
+                                    ? destination_width
+                                    : (source_register
+                                           ? source_width
+                                           : destination.size == 256 ||
+                                                     source.size == 256
+                                                 ? 32u
+                                                 : 16u);
+                            const int destination_low_cache =
+                                destination_register
+                                    ? cached_vector_half_host_index(
+                                          destination_offset)
+                                    : -1;
+                            const int destination_high_cache =
+                                destination_register &&
+                                        transfer_width == 32
+                                    ? cached_vector_half_host_index(
+                                          destination_offset + 16u)
+                                    : -1;
+                            const int source_low_cache =
+                                source_register
+                                    ? cached_vector_half_host_index(
+                                          source_offset)
+                                    : -1;
+                            const int source_high_cache =
+                                source_register && transfer_width == 32
+                                    ? cached_vector_half_host_index(
+                                          source_offset + 16u)
+                                    : -1;
+                            bool direct_ready =
+                                (transfer_width == 16 ||
+                                 transfer_width == 32) &&
+                                (!destination_register ||
+                                 (destination_low_cache >= 0 &&
+                                  (transfer_width == 16 ||
+                                   destination_high_cache >= 0))) &&
+                                (!source_register ||
+                                 (source_low_cache >= 0 &&
+                                  (transfer_width == 16 ||
+                                   source_high_cache >= 0))) &&
+                                ((destination_register &&
+                                  (source_register || source_memory)) ||
+                                 (destination_memory &&
+                                  source_register));
+                            if (destination_register &&
+                                source_register) {
+                                direct_ready =
+                                    direct_ready &&
+                                    destination_width == source_width;
+                            }
+                            if (destination_register && source_memory) {
+                                direct_ready =
+                                    direct_ready &&
+                                    source.size ==
+                                        transfer_width * 8u;
+                            }
+                            if (destination_memory && source_register) {
+                                direct_ready =
+                                    direct_ready &&
+                                    destination.size ==
+                                        transfer_width * 8u;
+                            }
+                            if (direct_ready && source_memory) {
+                                std::uint32_t loaded_width = 0;
+                                direct_ready = emit_vector_load_pair(
+                                                   ir, source, code->q0,
+                                                   code->q1,
+                                                   loaded_width) &&
+                                               loaded_width ==
+                                                   transfer_width;
+                                if (direct_ready) {
+                                    code->orr(
+                                        VReg16B{static_cast<std::uint32_t>(
+                                            destination_low_cache)},
+                                        code->v0.b16, code->v0.b16);
+                                    if (transfer_width == 32) {
+                                        code->orr(
+                                            VReg16B{static_cast<
+                                                std::uint32_t>(
+                                                destination_high_cache)},
+                                            code->v1.b16, code->v1.b16);
+                                    }
+                                }
+                            } else if (
+                                direct_ready && destination_memory) {
+                                direct_ready = emit_vector_store_pair(
+                                    ir, destination,
+                                    QReg{static_cast<std::uint32_t>(
+                                        source_low_cache)},
+                                    QReg{static_cast<std::uint32_t>(
+                                        source_high_cache >= 0
+                                            ? source_high_cache
+                                            : source_low_cache)},
+                                    transfer_width);
+                            } else if (direct_ready) {
+                                if (destination_low_cache !=
+                                    source_low_cache) {
+                                    code->orr(
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(
+                                            destination_low_cache)},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(
+                                            source_low_cache)},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(
+                                            source_low_cache)});
+                                }
+                                if (transfer_width == 32 &&
+                                    destination_high_cache !=
+                                        source_high_cache) {
+                                    code->orr(
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(
+                                            destination_high_cache)},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(
+                                            source_high_cache)},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(
+                                            source_high_cache)});
+                                }
+                            }
+                            if (direct_ready && destination_register) {
+                                generic_vector_half_known_zero[
+                                    (destination_offset -
+                                     kStateYmm0Offset) /
+                                    16u] = false;
+                                if (!cached_vector_half_is_writeback(
+                                        destination_low_cache)) {
+                                    code->str(
+                                        QReg{static_cast<std::uint32_t>(
+                                            destination_low_cache)},
+                                        Xbyak_aarch64::ptr(
+                                            code->x19,
+                                            destination_offset));
+                                }
+                                mark_cached_vector_half_written(
+                                    destination_low_cache);
+                                if (transfer_width == 32) {
+                                    generic_vector_half_known_zero[
+                                        (destination_offset + 16u -
+                                         kStateYmm0Offset) /
+                                        16u] = false;
+                                    if (!cached_vector_half_is_writeback(
+                                            destination_high_cache)) {
+                                        code->str(
+                                            QReg{static_cast<
+                                                std::uint32_t>(
+                                                destination_high_cache)},
+                                            Xbyak_aarch64::ptr(
+                                                code->x19,
+                                                destination_offset +
+                                                    16u));
+                                    }
+                                    mark_cached_vector_half_written(
+                                        destination_high_cache);
+                                } else if (vex_register_write) {
+                                    emit_zero_vector_upper_half(
+                                        destination_offset);
+                                }
+                            }
+                            if (direct_ready) {
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+                        }
                         std::uint32_t width = 0;
                         emitted = ir.operand_count == 2 &&
                                   emit_vector_load_pair(ir, ir.operands[1], code->q0,
@@ -20298,13 +23049,44 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                     : -1;
                             direct_ready =
                                 direct_ready && source_cache >= 0;
+                            const auto direct_address =
+                                direct_ready
+                                    ? cached_guest_address(
+                                          ir.operands[0],
+                                          scalar_bytes)
+                                    : std::nullopt;
                             if (direct_ready) {
-                                direct_ready = emit_memory_address(
-                                    ir, ir.operands[0], code->x14);
+                                direct_ready =
+                                    direct_address.has_value() ||
+                                    emit_memory_address(
+                                        ir, ir.operands[0],
+                                        code->x14);
                             }
                             if (direct_ready) {
                                 emit_publish_fault_ir_fast(ir);
-                                if (is_double) {
+                                if (direct_address.has_value() &&
+                                    is_double) {
+                                    code->str(
+                                        DReg{static_cast<std::uint32_t>(
+                                            source_cache)},
+                                        Xbyak_aarch64::ptr(
+                                            XReg{
+                                                direct_address
+                                                    ->host_register},
+                                            direct_address
+                                                ->displacement));
+                                } else if (
+                                    direct_address.has_value()) {
+                                    code->str(
+                                        SReg{static_cast<std::uint32_t>(
+                                            source_cache)},
+                                        Xbyak_aarch64::ptr(
+                                            XReg{
+                                                direct_address
+                                                    ->host_register},
+                                            direct_address
+                                                ->displacement));
+                                } else if (is_double) {
                                     code->str(
                                         DReg{static_cast<std::uint32_t>(
                                             source_cache)},
@@ -20368,6 +23150,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 ir.operands[ir.operand_count - 1];
                             int source_cache = -1;
                             bool source_memory = false;
+                            bool destination_loaded_directly = false;
                             if (direct_ready &&
                                 scalar_source.type ==
                                     X86_OPERAND_TYPE_REGISTER) {
@@ -20394,11 +23177,81 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 direct_ready = source_memory;
                             }
                             if (direct_ready && source_memory) {
-                                direct_ready = emit_memory_address(
-                                    ir, scalar_source, code->x14);
+                                const auto direct_address =
+                                    cached_guest_address(
+                                        scalar_source,
+                                        scalar_bytes);
+                                direct_ready =
+                                    direct_address.has_value() ||
+                                    emit_memory_address(
+                                        ir, scalar_source,
+                                        code->x14);
                                 if (direct_ready) {
                                     emit_publish_fault_ir_fast(ir);
-                                    if (is_double) {
+                                    const std::uint32_t destination_host =
+                                        static_cast<std::uint32_t>(
+                                            destination_cache);
+                                    if (direct_address.has_value() &&
+                                        vex_memory_zero_merge &&
+                                        is_double) {
+                                        code->ldr(
+                                            DReg{destination_host},
+                                            Xbyak_aarch64::ptr(
+                                                XReg{
+                                                    direct_address
+                                                        ->host_register},
+                                                direct_address
+                                                    ->displacement));
+                                        destination_loaded_directly = true;
+                                    } else if (
+                                        direct_address.has_value() &&
+                                        vex_memory_zero_merge) {
+                                        code->ldr(
+                                            SReg{destination_host},
+                                            Xbyak_aarch64::ptr(
+                                                XReg{
+                                                    direct_address
+                                                        ->host_register},
+                                                direct_address
+                                                    ->displacement));
+                                        destination_loaded_directly = true;
+                                    } else if (
+                                        direct_address.has_value() &&
+                                        is_double) {
+                                        code->ldr(
+                                            code->d0,
+                                            Xbyak_aarch64::ptr(
+                                                XReg{
+                                                    direct_address
+                                                        ->host_register},
+                                                direct_address
+                                                    ->displacement));
+                                    } else if (
+                                        direct_address.has_value()) {
+                                        code->ldr(
+                                            code->s0,
+                                            Xbyak_aarch64::ptr(
+                                                XReg{
+                                                    direct_address
+                                                        ->host_register},
+                                                direct_address
+                                                    ->displacement));
+                                    } else if (
+                                        vex_memory_zero_merge &&
+                                        is_double) {
+                                        code->ldr(
+                                            DReg{destination_host},
+                                            Xbyak_aarch64::ptr(
+                                                code->x14));
+                                        destination_loaded_directly = true;
+                                    } else if (
+                                        vex_memory_zero_merge) {
+                                        code->ldr(
+                                            SReg{destination_host},
+                                            Xbyak_aarch64::ptr(
+                                                code->x14));
+                                        destination_loaded_directly = true;
+                                    } else if (is_double) {
                                         code->ldr(
                                             code->d0,
                                             Xbyak_aarch64::ptr(code->x14));
@@ -20422,10 +23275,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 const std::uint32_t destination_host =
                                     static_cast<std::uint32_t>(
                                         destination_cache);
-                                if (vex_memory_zero_merge) {
+                                if (!destination_loaded_directly &&
+                                    vex_memory_zero_merge) {
                                     code->movi(
                                         VReg16B{destination_host}, 0);
                                 } else if (
+                                    !destination_loaded_directly &&
                                     destination_cache != merge_cache) {
                                     code->orr(
                                         VReg16B{destination_host},
@@ -20436,11 +23291,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                             static_cast<std::uint32_t>(
                                                 merge_cache)});
                                 }
-                                if (is_double) {
+                                if (!destination_loaded_directly &&
+                                    is_double) {
                                     code->ins(
                                         VReg2D{destination_host}[0],
                                         code->v0.d2[0]);
-                                } else {
+                                } else if (!destination_loaded_directly) {
                                     code->ins(
                                         VReg4S{destination_host}[0],
                                         code->v0.s4[0]);
@@ -20551,10 +23407,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emitted_simd_fast += emitted ? 1u : 0u;
                         continue;
                     }
-                    if (is_native_scalar_float_add_sub_mul(ir)) {
+                    if (is_native_scalar_float_add_sub_mul(ir) ||
+                        is_native_scalar_float_div(ir)) {
                         const bool vex = mnemonic == X86_MNEMONIC_VADDSS ||
                                          mnemonic == X86_MNEMONIC_VSUBSS ||
-                                         mnemonic == X86_MNEMONIC_VMULSS;
+                                         mnemonic == X86_MNEMONIC_VMULSS ||
+                                         mnemonic == X86_MNEMONIC_VDIVSS;
                         const std::uint8_t lhs_index = vex ? 1u : 0u;
                         const std::uint8_t rhs_index = vex ? 2u : 1u;
                         std::uint32_t destination_offset = 0;
@@ -20608,13 +23466,30 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 direct_ready = rhs_memory;
                             }
                             if (direct_ready && rhs_memory) {
-                                direct_ready = emit_memory_address(
-                                    ir, tiered_rhs, code->x14);
-                                if (direct_ready) {
+                                if (const auto direct =
+                                        cached_guest_address(
+                                            tiered_rhs, 4);
+                                    direct.has_value()) {
                                     emit_publish_fault_ir_fast(ir);
                                     code->ldr(
                                         code->s2,
-                                        Xbyak_aarch64::ptr(code->x14));
+                                        Xbyak_aarch64::ptr(
+                                            XReg{
+                                                direct->host_register},
+                                            direct->displacement));
+                                } else {
+                                    direct_ready =
+                                        emit_memory_address(
+                                            ir, tiered_rhs,
+                                            code->x14);
+                                    if (direct_ready) {
+                                        emit_publish_fault_ir_fast(
+                                            ir);
+                                        code->ldr(
+                                            code->s2,
+                                            Xbyak_aarch64::ptr(
+                                                code->x14));
+                                    }
                                 }
                             }
                             if (direct_ready) {
@@ -20645,8 +23520,15 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                                 X86_MNEMONIC_VSUBSS) {
                                             code->fsub(
                                                 destination, lhs, rhs);
-                                        } else {
+                                        } else if (
+                                            mnemonic ==
+                                                X86_MNEMONIC_MULSS ||
+                                            mnemonic ==
+                                                X86_MNEMONIC_VMULSS) {
                                             code->fmul(
+                                                destination, lhs, rhs);
+                                        } else {
+                                            code->fdiv(
                                                 destination, lhs, rhs);
                                         }
                                     };
@@ -20659,11 +23541,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                         VReg16B{lhs_host},
                                         VReg16B{lhs_host});
                                 }
-                                // AArch64 scalar FP writes do not provide
-                                // the x86 scalar-SIMD merge semantics.  Keep
-                                // lanes 1..3 from the VEX merge source (or
-                                // the legacy destination) and replace only
-                                // lane zero.
                                 code->ins(
                                     VReg4S{destination_host}[0],
                                     code->v0.s4[0]);
@@ -20725,8 +23602,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 mnemonic == X86_MNEMONIC_SUBSS ||
                                 mnemonic == X86_MNEMONIC_VSUBSS) {
                                 code->fsub(code->s0, code->s4, code->s2);
-                            } else {
+                            } else if (
+                                mnemonic == X86_MNEMONIC_MULSS ||
+                                mnemonic == X86_MNEMONIC_VMULSS) {
                                 code->fmul(code->s0, code->s4, code->s2);
+                            } else {
+                                code->fdiv(code->s0, code->s4, code->s2);
                             }
                             code->ins(code->v4.s4[0], code->v0.s4[0]);
                             emitted = emit_vector_store_pair(
@@ -20762,18 +23643,18 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             continue;
                         }
 
-                        code->fcvt(code->d0, code->s4);
-                        code->fcvt(code->d1, code->s2);
                         if (mnemonic == X86_MNEMONIC_ADDSS ||
                             mnemonic == X86_MNEMONIC_VADDSS) {
-                            code->fadd(code->d0, code->d0, code->d1);
+                            code->fadd(code->s0, code->s4, code->s2);
                         } else if (mnemonic == X86_MNEMONIC_SUBSS ||
                                    mnemonic == X86_MNEMONIC_VSUBSS) {
-                            code->fsub(code->d0, code->d0, code->d1);
+                            code->fsub(code->s0, code->s4, code->s2);
+                        } else if (mnemonic == X86_MNEMONIC_MULSS ||
+                                   mnemonic == X86_MNEMONIC_VMULSS) {
+                            code->fmul(code->s0, code->s4, code->s2);
                         } else {
-                            code->fmul(code->d0, code->d0, code->d1);
+                            code->fdiv(code->s0, code->s4, code->s2);
                         }
-                        code->fcvt(code->s0, code->d0);
                         code->ins(code->v4.s4[0], code->v0.s4[0]);
                         code->str(code->q4,
                                   Xbyak_aarch64::ptr(code->x19, destination_offset));
@@ -20928,6 +23809,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
 #endif
                     if (is_native_scalar_float_compare_flags(ir)) {
+                        const bool fuse_branch =
+                            i < generic_fused_compare_branch.size() &&
+                            generic_fused_compare_branch[i] == 3;
+                        if (fuse_branch) {
+                            ++emitted_simd_fast;
+                            continue;
+                        }
                         const bool double_lane =
                             mnemonic == X86_MNEMONIC_COMISD ||
                             mnemonic == X86_MNEMONIC_VCOMISD ||
@@ -20941,16 +23829,20 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (!emitted) {
                             continue;
                         }
-                        if (double_lane) {
-                            code->ldr(
-                                code->d0,
-                                Xbyak_aarch64::ptr(code->x19, lhs_offset));
+                        std::uint32_t lhs_host = 0;
+                        const int cached_lhs =
+                            cached_vector_half_host_index(lhs_offset);
+                        if (cached_lhs >= 0) {
+                            lhs_host = static_cast<std::uint32_t>(cached_lhs);
+                        } else if (double_lane) {
+                            code->ldr(code->d0,
+                                      Xbyak_aarch64::ptr(code->x19, lhs_offset));
                         } else {
-                            code->ldr(
-                                code->s0,
-                                Xbyak_aarch64::ptr(code->x19, lhs_offset));
+                            code->ldr(code->s0,
+                                      Xbyak_aarch64::ptr(code->x19, lhs_offset));
                         }
                         const auto& rhs = ir.operands[1];
+                        std::uint32_t rhs_host = 1;
                         if (rhs.type == X86_OPERAND_TYPE_REGISTER) {
                             std::uint32_t rhs_offset = 0;
                             std::uint32_t rhs_width = 0;
@@ -20958,7 +23850,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                           rhs.reg.value, rhs_offset, rhs_width) &&
                                       rhs_width == 16;
                             if (emitted) {
-                                if (double_lane) {
+                                const int cached_rhs =
+                                    cached_vector_half_host_index(rhs_offset);
+                                if (cached_rhs >= 0) {
+                                    rhs_host =
+                                        static_cast<std::uint32_t>(cached_rhs);
+                                } else if (double_lane) {
                                     code->ldr(
                                         code->d1,
                                         Xbyak_aarch64::ptr(
@@ -20976,7 +23873,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                           (double_lane ? 64u : 32u) &&
                                       emit_memory_address(ir, rhs, code->x14);
                             if (emitted) {
-                                emit_publish_fault_ir(ir);
+                                emit_publish_fault_ir_fast(ir);
                                 if (double_lane) {
                                     code->ldr(
                                         code->d1,
@@ -20993,31 +23890,11 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         }
 
                         if (double_lane) {
-                            code->fcmp(code->d0, code->d1);
+                            code->fcmp(DReg{lhs_host}, DReg{rhs_host});
                         } else {
-                            code->fcmp(code->s0, code->s1);
+                            code->fcmp(SReg{lhs_host}, SReg{rhs_host});
                         }
-                        code->cset(code->x10, Xbyak_aarch64::VS);
-                        const auto condition_or_unordered =
-                            [&](const XReg& destination,
-                                const Xbyak_aarch64::Cond condition) {
-                            code->cset(destination, condition);
-                            code->orr(
-                                destination, destination, code->x10);
-                        };
-                        condition_or_unordered(
-                            code->x11, Xbyak_aarch64::CC);
-                        condition_or_unordered(
-                            code->x12, Xbyak_aarch64::EQ);
-                        code->lsl(code->x10, code->x10, kPfBit);
-                        code->lsl(code->x12, code->x12, kZfBit);
-                        code->orr(code->x11, code->x11, code->x10);
-                        code->orr(code->x11, code->x11, code->x12);
-                        load_machine_word(code->x9, kStateRflagsOffset);
-                        code->mov(code->x13, kArithmeticStatusBits);
-                        code->bic(code->x9, code->x9, code->x13);
-                        code->orr(code->x9, code->x9, code->x11);
-                        store_machine_word(code->x9, kStateRflagsOffset);
+                        emit_scalar_float_compare_flags_from_nzcv();
                         ++emitted_simd_fast;
                         continue;
                     }
@@ -21179,6 +24056,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         std::uint32_t destination_width = 0;
                         std::uint32_t merge_offset = 0;
                         std::uint32_t merge_width = 0;
+                        std::uint32_t loaded_merge_width = 0;
                         emitted = vector_register_state_offset(
                                       ir.operands[0].reg.value, destination_offset,
                                       destination_width) &&
@@ -21186,7 +24064,79 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                       ir.operands[merge_index].reg.value, merge_offset,
                                       merge_width) &&
                                   destination_width == 16 && merge_width == 16 &&
-                                  emit_read_operand(ir, ir.operands[source_index], code->x10);
+                                  emit_read_operand(
+                                      ir, ir.operands[source_index], code->x10);
+                        if (!emitted) {
+                            continue;
+                        }
+                        if ((kJitResidentSimdDirectEnabled ||
+                             g_jit_selftest_production_direct_active) &&
+                            tiered_vector_residency) {
+                            const int destination_cache =
+                                cached_vector_half_host_index(
+                                    destination_offset);
+                            const int merge_cache =
+                                cached_vector_half_host_index(
+                                    merge_offset);
+                            if (destination_cache >= 0 &&
+                                merge_cache >= 0) {
+                                if (ir.operands[source_index].size ==
+                                    32) {
+                                    code->sxtw(code->x10, code->w10);
+                                }
+                                if (double_lane) {
+                                    code->scvtf(code->d0, code->x10);
+                                } else {
+                                    code->scvtf(code->s0, code->x10);
+                                }
+                                const std::uint32_t destination_host =
+                                    static_cast<std::uint32_t>(
+                                        destination_cache);
+                                if (destination_cache != merge_cache) {
+                                    code->orr(
+                                        VReg16B{destination_host},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(merge_cache)},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(merge_cache)});
+                                }
+                                if (double_lane) {
+                                    code->ins(
+                                        VReg2D{destination_host}[0],
+                                        code->v0.d2[0]);
+                                } else {
+                                    code->ins(
+                                        VReg4S{destination_host}[0],
+                                        code->v0.s4[0]);
+                                }
+                                generic_vector_half_known_zero[
+                                    (destination_offset -
+                                     kStateYmm0Offset) /
+                                    16u] = false;
+                                if (!cached_vector_half_is_writeback(
+                                        destination_cache)) {
+                                    code->str(
+                                        QReg{destination_host},
+                                        Xbyak_aarch64::ptr(
+                                            code->x19,
+                                            destination_offset));
+                                }
+                                mark_cached_vector_half_written(
+                                    destination_cache);
+                                if (vex) {
+                                    emit_zero_vector_upper_half(
+                                        destination_offset);
+                                }
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+                        }
+                        emitted =
+                                  emit_vector_load_pair(
+                                      ir, ir.operands[merge_index],
+                                      code->q4, code->q5,
+                                      loaded_merge_width) &&
+                                  loaded_merge_width == 16;
                         if (!emitted) {
                             continue;
                         }
@@ -21194,8 +24144,6 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (ir.operands[source_index].size == 32) {
                             code->sxtw(code->x10, code->w10);
                         }
-                        code->ldr(code->q4,
-                                  Xbyak_aarch64::ptr(code->x19, merge_offset));
                         if (double_lane) {
                             code->scvtf(code->d0, code->x10);
                             code->ins(code->v4.d2[0], code->v0.d2[0]);
@@ -21203,8 +24151,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             code->scvtf(code->s0, code->x10);
                             code->ins(code->v4.s4[0], code->v0.s4[0]);
                         }
-                        code->str(code->q4,
-                                  Xbyak_aarch64::ptr(code->x19, destination_offset));
+                        emitted = emit_vector_store_pair(
+                            ir, ir.operands[0],
+                            code->q4, code->q5, 16);
+                        if (!emitted) {
+                            continue;
+                        }
                         if (vex) {
                             emit_zero_vector_upper_half(destination_offset);
                         }
@@ -21297,21 +24249,160 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             continue;
                         }
 
-                        code->ldr(code->q4,
-                                  Xbyak_aarch64::ptr(code->x19, merge_offset));
+                        const bool vex =
+                            mnemonic == X86_MNEMONIC_VINSERTPS;
+                        if ((kJitResidentSimdDirectEnabled ||
+                             g_jit_selftest_production_direct_active) &&
+                            tiered_vector_residency) {
+                            const int destination_cache =
+                                cached_vector_half_host_index(
+                                    destination_offset);
+                            const int merge_cache =
+                                cached_vector_half_host_index(
+                                    merge_offset);
+                            const std::uint8_t control =
+                                ImmediateControlByte(ir, 3);
+                            const std::uint32_t destination_lane =
+                                (control >> 4u) & 3u;
+                            const auto& source = ir.operands[2];
+                            int source_cache = -1;
+                            bool source_memory = false;
+                            bool direct_ready =
+                                destination_cache >= 0 &&
+                                merge_cache >= 0;
+                            if (direct_ready &&
+                                source.type ==
+                                    X86_OPERAND_TYPE_REGISTER) {
+                                std::uint32_t source_offset = 0;
+                                std::uint32_t source_width = 0;
+                                direct_ready =
+                                    vector_register_state_offset(
+                                        source.reg.value,
+                                        source_offset,
+                                        source_width) &&
+                                    source_width == 16;
+                                source_cache =
+                                    direct_ready
+                                        ? cached_vector_half_host_index(
+                                              source_offset)
+                                        : -1;
+                                direct_ready = source_cache >= 0;
+                            } else if (direct_ready) {
+                                source_memory =
+                                    source.type ==
+                                        X86_OPERAND_TYPE_MEMORY &&
+                                    source.size == 32;
+                                direct_ready = source_memory;
+                            }
+                            if (direct_ready && source_memory) {
+                                direct_ready = emit_memory_address(
+                                    ir, source, code->x14);
+                                if (direct_ready) {
+                                    emit_publish_fault_ir_fast(ir);
+                                    code->ldr(
+                                        code->s2,
+                                        Xbyak_aarch64::ptr(
+                                            code->x14));
+                                }
+                            }
+                            if (direct_ready) {
+                                const std::uint32_t destination_host =
+                                    static_cast<std::uint32_t>(
+                                        destination_cache);
+                                const std::uint32_t source_lane =
+                                    source_memory
+                                        ? 0u
+                                        : (control >> 6u) & 3u;
+                                const bool preserve_aliased_source =
+                                    !source_memory &&
+                                    source_cache == destination_cache &&
+                                    destination_cache != merge_cache;
+                                if (preserve_aliased_source) {
+                                    code->ins(
+                                        code->v2.s4[0],
+                                        VReg4S{static_cast<
+                                            std::uint32_t>(source_cache)}
+                                            [source_lane]);
+                                }
+                                if (destination_cache != merge_cache) {
+                                    code->orr(
+                                        VReg16B{destination_host},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(merge_cache)},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(merge_cache)});
+                                }
+                                if (source_memory) {
+                                    code->ins(
+                                        VReg4S{destination_host}
+                                            [destination_lane],
+                                        code->v2.s4[0]);
+                                } else if (preserve_aliased_source) {
+                                    code->ins(
+                                        VReg4S{destination_host}
+                                            [destination_lane],
+                                        code->v2.s4[0]);
+                                } else {
+                                    code->ins(
+                                        VReg4S{destination_host}
+                                            [destination_lane],
+                                        VReg4S{static_cast<
+                                            std::uint32_t>(source_cache)}
+                                            [source_lane]);
+                                }
+                                clear_vector_scratch();
+                                for (std::uint32_t lane = 0;
+                                     lane < 4; ++lane) {
+                                    if ((control &
+                                         (1u << lane)) != 0) {
+                                        code->ins(
+                                            VReg4S{destination_host}
+                                                [lane],
+                                            code->v31.s4[0]);
+                                    }
+                                }
+                                generic_vector_half_known_zero[
+                                    (destination_offset -
+                                     kStateYmm0Offset) /
+                                    16u] = false;
+                                if (!cached_vector_half_is_writeback(
+                                        destination_cache)) {
+                                    code->str(
+                                        QReg{destination_host},
+                                        Xbyak_aarch64::ptr(
+                                            code->x19,
+                                            destination_offset));
+                                }
+                                mark_cached_vector_half_written(
+                                    destination_cache);
+                                if (vex) {
+                                    emit_zero_vector_upper_half(
+                                        destination_offset);
+                                }
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+                        }
+
+                        std::uint32_t loaded_merge_width = 0;
+                        emitted = emit_vector_load_pair(
+                                      ir, ir.operands[1], code->q4, code->q5,
+                                      loaded_merge_width) &&
+                                  loaded_merge_width == 16;
+                        if (!emitted) {
+                            continue;
+                        }
                         const std::uint8_t control =
                             ImmediateControlByte(ir, 3);
                         const std::uint32_t destination_lane = (control >> 4u) & 3u;
                         const auto& source = ir.operands[2];
                         if (source.type == X86_OPERAND_TYPE_REGISTER) {
-                            std::uint32_t source_offset = 0;
                             std::uint32_t source_width = 0;
-                            emitted = vector_register_state_offset(
-                                          source.reg.value, source_offset, source_width) &&
+                            emitted = emit_vector_load_pair(
+                                          ir, source, code->q2, code->q3,
+                                          source_width) &&
                                       source_width == 16;
                             if (emitted) {
-                                code->ldr(code->q2,
-                                          Xbyak_aarch64::ptr(code->x19, source_offset));
                                 const std::uint32_t source_lane = (control >> 6u) & 3u;
                                 code->ins(code->v4.s4[destination_lane],
                                           code->v2.s4[source_lane]);
@@ -21336,12 +24427,9 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 code->ins(code->v4.s4[lane], code->v31.s4[0]);
                             }
                         }
-                        code->str(code->q4,
-                                  Xbyak_aarch64::ptr(code->x19, destination_offset));
-                        if (mnemonic == X86_MNEMONIC_VINSERTPS) {
-                            emit_zero_vector_upper_half(destination_offset);
-                        }
-                        ++emitted_simd_fast;
+                        emitted = emit_vector_store_pair(
+                            ir, ir.operands[0], code->q4, code->q5, 16);
+                        emitted_simd_fast += emitted ? 1u : 0u;
                         continue;
                     }
 #if defined(LSX4_PS5_DESKTOP_PATH)
@@ -21538,14 +24626,13 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 direct_ready && destination_cache >= 0 &&
                                 lhs_cache >= 0;
                             if (direct_ready && rhs_memory) {
-                                direct_ready = emit_memory_address(
-                                    ir, ir.operands[rhs_index], code->x14);
-                                if (direct_ready) {
-                                    emit_publish_fault_ir_fast(ir);
-                                    code->ldr(
-                                        code->q2,
-                                        Xbyak_aarch64::ptr(code->x14));
-                                }
+                                std::uint32_t rhs_width = 0;
+                                direct_ready = emit_vector_load_pair(
+                                                   ir,
+                                                   ir.operands[rhs_index],
+                                                   code->q2, code->q3,
+                                                   rhs_width) &&
+                                               rhs_width == 16;
                             }
                             if (direct_ready) {
                                 const std::uint32_t destination_host =
@@ -21847,6 +24934,258 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (!emitted) {
                             continue;
                         }
+                        if (tiered_vector_residency) {
+                            const int destination_cache =
+                                cached_vector_half_host_index(
+                                    destination_offset);
+                            const int merge_cache =
+                                cached_vector_half_host_index(merge_offset);
+                            const auto& tiered_rhs =
+                                ir.operands[rhs_index];
+                            int rhs_cache = -1;
+                            bool rhs_memory = false;
+                            bool direct_ready =
+                                destination_cache >= 0 && merge_cache >= 0;
+                            if (direct_ready &&
+                                tiered_rhs.type ==
+                                    X86_OPERAND_TYPE_REGISTER) {
+                                std::uint32_t rhs_offset = 0;
+                                std::uint32_t rhs_width = 0;
+                                direct_ready =
+                                    vector_register_state_offset(
+                                        tiered_rhs.reg.value, rhs_offset,
+                                        rhs_width) &&
+                                    rhs_width == 16;
+                                rhs_cache =
+                                    direct_ready
+                                        ? cached_vector_half_host_index(
+                                              rhs_offset)
+                                        : -1;
+                                direct_ready = rhs_cache >= 0;
+                            } else if (direct_ready) {
+                                rhs_memory =
+                                    tiered_rhs.type ==
+                                        X86_OPERAND_TYPE_MEMORY &&
+                                    tiered_rhs.size ==
+                                        (double_lane ? 64u : 32u);
+                                direct_ready = rhs_memory;
+                            }
+                            if (direct_ready && rhs_memory) {
+                                if (const auto direct =
+                                        cached_guest_address(
+                                            tiered_rhs,
+                                            double_lane ? 8u : 4u);
+                                    direct.has_value()) {
+                                    emit_publish_fault_ir_fast(ir);
+                                    if (double_lane) {
+                                        code->ldr(
+                                            code->d2,
+                                            Xbyak_aarch64::ptr(
+                                                XReg{
+                                                    direct->host_register},
+                                                direct->displacement));
+                                    } else {
+                                        code->ldr(
+                                            code->s2,
+                                            Xbyak_aarch64::ptr(
+                                                XReg{
+                                                    direct->host_register},
+                                                direct->displacement));
+                                    }
+                                } else {
+                                    direct_ready =
+                                        emit_memory_address(
+                                            ir, tiered_rhs,
+                                            code->x14);
+                                    if (direct_ready) {
+                                        emit_publish_fault_ir_fast(
+                                            ir);
+                                        if (double_lane) {
+                                            code->ldr(
+                                                code->d2,
+                                                Xbyak_aarch64::ptr(
+                                                    code->x14));
+                                        } else {
+                                            code->ldr(
+                                                code->s2,
+                                                Xbyak_aarch64::ptr(
+                                                    code->x14));
+                                        }
+                                    }
+                                }
+                            }
+                            if (direct_ready) {
+                                const std::uint32_t destination_host =
+                                    static_cast<std::uint32_t>(
+                                        destination_cache);
+                                const std::uint32_t merge_host =
+                                    static_cast<std::uint32_t>(
+                                        merge_cache);
+                                const std::uint32_t rhs_host =
+                                    rhs_cache >= 0
+                                        ? static_cast<std::uint32_t>(
+                                              rhs_cache)
+                                        : 2u;
+                                if (double_lane) {
+                                    const DReg lhs{merge_host};
+                                    const DReg rhs_register{rhs_host};
+                                    if (minimum || maximum) {
+                                        code->fcmp(lhs, rhs_register);
+                                        code->fcsel(
+                                            code->d0, lhs, rhs_register,
+                                            minimum
+                                                ? Xbyak_aarch64::CC
+                                                : Xbyak_aarch64::GT);
+                                    } else if (subtract) {
+                                        code->fsub(
+                                            code->d0, lhs,
+                                            rhs_register);
+                                    } else if (multiply) {
+                                        code->fmul(
+                                            code->d0, lhs,
+                                            rhs_register);
+                                    } else if (divide) {
+                                        code->fdiv(
+                                            code->d0, lhs,
+                                            rhs_register);
+                                    } else {
+                                        code->fadd(
+                                            code->d0, lhs,
+                                            rhs_register);
+                                    }
+                                } else {
+                                    const SReg lhs{merge_host};
+                                    const SReg rhs_register{rhs_host};
+                                    if (minimum || maximum) {
+                                        code->fcmp(lhs, rhs_register);
+                                        code->fcsel(
+                                            code->s0, lhs, rhs_register,
+                                            minimum
+                                                ? Xbyak_aarch64::CC
+                                                : Xbyak_aarch64::GT);
+                                    } else {
+                                        code->fdiv(
+                                            code->s0, lhs,
+                                            rhs_register);
+                                    }
+                                }
+                                if (destination_host != merge_host) {
+                                    code->orr(
+                                        VReg16B{destination_host},
+                                        VReg16B{merge_host},
+                                        VReg16B{merge_host});
+                                }
+                                if (double_lane) {
+                                    code->ins(
+                                        VReg2D{destination_host}[0],
+                                        code->v0.d2[0]);
+                                } else {
+                                    code->ins(
+                                        VReg4S{destination_host}[0],
+                                        code->v0.s4[0]);
+                                }
+                                if (!cached_vector_half_is_writeback(
+                                        destination_cache)) {
+                                    code->str(
+                                        QReg{destination_host},
+                                        Xbyak_aarch64::ptr(
+                                            code->x19,
+                                            destination_offset));
+                                }
+                                mark_cached_vector_half_written(
+                                    destination_cache);
+                                if (vex) {
+                                    emit_zero_vector_upper_half(
+                                        destination_offset);
+                                }
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+
+                            std::uint32_t merge_pair_width = 0;
+                            emitted = emit_vector_load_pair(
+                                          ir,
+                                          ir.operands[merge_index],
+                                          code->q4, code->q5,
+                                          merge_pair_width) &&
+                                      merge_pair_width == 16;
+                            if (emitted &&
+                                tiered_rhs.type ==
+                                    X86_OPERAND_TYPE_REGISTER) {
+                                std::uint32_t rhs_pair_width = 0;
+                                emitted = emit_vector_load_pair(
+                                              ir, tiered_rhs,
+                                              code->q2, code->q3,
+                                              rhs_pair_width) &&
+                                          rhs_pair_width == 16;
+                            } else if (emitted) {
+                                emitted =
+                                    tiered_rhs.type ==
+                                        X86_OPERAND_TYPE_MEMORY &&
+                                    tiered_rhs.size ==
+                                        (double_lane ? 64u : 32u) &&
+                                    emit_memory_address(
+                                        ir, tiered_rhs, code->x14);
+                                if (emitted) {
+                                    emit_publish_fault_ir_fast(ir);
+                                    if (double_lane) {
+                                        code->ldr(
+                                            code->d2,
+                                            Xbyak_aarch64::ptr(
+                                                code->x14));
+                                    } else {
+                                        code->ldr(
+                                            code->s2,
+                                            Xbyak_aarch64::ptr(
+                                                code->x14));
+                                    }
+                                }
+                            }
+                            if (!emitted) {
+                                continue;
+                            }
+                            if (double_lane) {
+                                if (minimum || maximum) {
+                                    code->fcmp(code->d4, code->d2);
+                                    code->fcsel(
+                                        code->d0, code->d4, code->d2,
+                                        minimum ? Xbyak_aarch64::CC
+                                                : Xbyak_aarch64::GT);
+                                } else if (subtract) {
+                                    code->fsub(
+                                        code->d0, code->d4, code->d2);
+                                } else if (multiply) {
+                                    code->fmul(
+                                        code->d0, code->d4, code->d2);
+                                } else if (divide) {
+                                    code->fdiv(
+                                        code->d0, code->d4, code->d2);
+                                } else {
+                                    code->fadd(
+                                        code->d0, code->d4, code->d2);
+                                }
+                                code->ins(
+                                    code->v4.d2[0], code->v0.d2[0]);
+                            } else {
+                                if (minimum || maximum) {
+                                    code->fcmp(code->s4, code->s2);
+                                    code->fcsel(
+                                        code->s0, code->s4, code->s2,
+                                        minimum ? Xbyak_aarch64::CC
+                                                : Xbyak_aarch64::GT);
+                                } else {
+                                    code->fdiv(
+                                        code->s0, code->s4, code->s2);
+                                }
+                                code->ins(
+                                    code->v4.s4[0], code->v0.s4[0]);
+                            }
+                            emitted = emit_vector_store_pair(
+                                ir, ir.operands[0], code->q4, code->q5,
+                                16);
+                            emitted_simd_fast += emitted ? 1u : 0u;
+                            continue;
+                        }
                         code->ldr(code->q4,
                                   Xbyak_aarch64::ptr(code->x19, merge_offset));
                         const auto& rhs = ir.operands[rhs_index];
@@ -21901,17 +25240,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             }
                             code->ins(code->v4.d2[0], code->v0.d2[0]);
                         } else {
-                            code->fcvt(code->d0, code->s4);
-                            code->fcvt(code->d1, code->s2);
                             if (minimum || maximum) {
-                                code->fcmp(code->d0, code->d1);
-                                code->fcsel(code->d0, code->d0, code->d1,
+                                code->fcmp(code->s4, code->s2);
+                                code->fcsel(code->s0, code->s4, code->s2,
                                             minimum ? Xbyak_aarch64::CC
                                                     : Xbyak_aarch64::GT);
                             } else {
-                                code->fdiv(code->d0, code->d0, code->d1);
+                                code->fdiv(code->s0, code->s4, code->s2);
                             }
-                            code->fcvt(code->s0, code->d0);
                             code->ins(code->v4.s4[0], code->v0.s4[0]);
                         }
                         code->str(code->q4,
@@ -22944,6 +26280,158 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         continue;
                     }
                     if (is_native_pshufd(mnemonic)) {
+                        if ((kJitResidentSimdDirectEnabled ||
+                             g_jit_selftest_production_direct_active) &&
+                            tiered_vector_residency &&
+                            ir.operand_count == 3 &&
+                            ir.operands[0].type ==
+                                X86_OPERAND_TYPE_REGISTER &&
+                            ir.operands[1].type ==
+                                X86_OPERAND_TYPE_REGISTER &&
+                            ir.operands[2].type ==
+                                X86_OPERAND_TYPE_IMMEDIATE) {
+                            std::uint32_t destination_offset = 0;
+                            std::uint32_t destination_width = 0;
+                            std::uint32_t source_offset = 0;
+                            std::uint32_t source_width = 0;
+                            bool direct_ready =
+                                vector_register_state_offset(
+                                    ir.operands[0].reg.value,
+                                    destination_offset,
+                                    destination_width) &&
+                                vector_register_state_offset(
+                                    ir.operands[1].reg.value,
+                                    source_offset, source_width) &&
+                                destination_width == source_width &&
+                                (source_width == 16 ||
+                                 source_width == 32);
+                            const int destination_low_cache =
+                                direct_ready
+                                    ? cached_vector_half_host_index(
+                                          destination_offset)
+                                    : -1;
+                            const int source_low_cache =
+                                direct_ready
+                                    ? cached_vector_half_host_index(
+                                          source_offset)
+                                    : -1;
+                            const int destination_high_cache =
+                                direct_ready && source_width == 32
+                                    ? cached_vector_half_host_index(
+                                          destination_offset + 16u)
+                                    : -1;
+                            const int source_high_cache =
+                                direct_ready && source_width == 32
+                                    ? cached_vector_half_host_index(
+                                          source_offset + 16u)
+                                    : -1;
+                            direct_ready =
+                                direct_ready &&
+                                destination_low_cache >= 0 &&
+                                source_low_cache >= 0 &&
+                                (source_width == 16 ||
+                                 (destination_high_cache >= 0 &&
+                                  source_high_cache >= 0));
+                            if (direct_ready) {
+                                const std::uint8_t control =
+                                    ImmediateControlByte(ir, 2);
+                                std::array<std::uint8_t, 16>
+                                    table_indices{};
+                                for (std::uint32_t lane = 0;
+                                     lane < 4; ++lane) {
+                                    const std::uint32_t source_lane =
+                                        (control >> (lane * 2u)) &
+                                        3u;
+                                    for (std::uint32_t byte = 0;
+                                         byte < 4; ++byte) {
+                                        table_indices[
+                                            lane * 4u + byte] =
+                                            static_cast<std::uint8_t>(
+                                                source_lane * 4u +
+                                                byte);
+                                    }
+                                }
+                                std::uint64_t table_low = 0;
+                                std::uint64_t table_high = 0;
+                                std::memcpy(
+                                    &table_low,
+                                    table_indices.data(),
+                                    sizeof(table_low));
+                                std::memcpy(
+                                    &table_high,
+                                    table_indices.data() + 8,
+                                    sizeof(table_high));
+                                code->eor(
+                                    code->v2.b16, code->v2.b16,
+                                    code->v2.b16);
+                                code->mov(code->x10, table_low);
+                                code->ins(
+                                    code->v2.d2[0], code->x10);
+                                code->mov(code->x10, table_high);
+                                code->ins(
+                                    code->v2.d2[1], code->x10);
+                                code->tbl(
+                                    VReg16B{static_cast<
+                                        std::uint32_t>(
+                                        destination_low_cache)},
+                                    VReg16B{static_cast<
+                                        std::uint32_t>(
+                                        source_low_cache)},
+                                    1, code->v2.b16);
+                                if (source_width == 32) {
+                                    code->tbl(
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(
+                                            destination_high_cache)},
+                                        VReg16B{static_cast<
+                                            std::uint32_t>(
+                                            source_high_cache)},
+                                        1, code->v2.b16);
+                                }
+                                generic_vector_half_known_zero[
+                                    (destination_offset -
+                                     kStateYmm0Offset) /
+                                    16u] = false;
+                                if (!cached_vector_half_is_writeback(
+                                        destination_low_cache)) {
+                                    code->str(
+                                        QReg{static_cast<
+                                            std::uint32_t>(
+                                            destination_low_cache)},
+                                        Xbyak_aarch64::ptr(
+                                            code->x19,
+                                            destination_offset));
+                                }
+                                mark_cached_vector_half_written(
+                                    destination_low_cache);
+                                if (source_width == 32) {
+                                    generic_vector_half_known_zero[
+                                        (destination_offset + 16u -
+                                         kStateYmm0Offset) /
+                                        16u] = false;
+                                    if (!cached_vector_half_is_writeback(
+                                            destination_high_cache)) {
+                                        code->str(
+                                            QReg{static_cast<
+                                                std::uint32_t>(
+                                                destination_high_cache)},
+                                            Xbyak_aarch64::ptr(
+                                                code->x19,
+                                                destination_offset +
+                                                    16u));
+                                    }
+                                    mark_cached_vector_half_written(
+                                        destination_high_cache);
+                                } else if (
+                                    mnemonic ==
+                                    X86_MNEMONIC_VPSHUFD) {
+                                    emit_zero_vector_upper_half(
+                                        destination_offset);
+                                }
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+                        }
                         std::uint32_t source_width = 0;
                         emitted = ir.operand_count == 3 &&
                                   ir.operands[2].type == X86_OPERAND_TYPE_IMMEDIATE &&
@@ -23279,6 +26767,105 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         const bool vex = IsVexPshufbMnemonic(mnemonic);
                         const std::uint8_t lhs_index = vex ? 1u : 0u;
                         const std::uint8_t mask_index = vex ? 2u : 1u;
+                        if (JitHostHasSve2() &&
+                            ir.operands[0].type ==
+                                X86_OPERAND_TYPE_REGISTER &&
+                            ir.operands[lhs_index].type ==
+                                X86_OPERAND_TYPE_REGISTER &&
+                            ir.operands[mask_index].type ==
+                                X86_OPERAND_TYPE_REGISTER) {
+                            std::uint32_t destination_offset = 0;
+                            std::uint32_t destination_width = 0;
+                            std::uint32_t lhs_offset = 0;
+                            std::uint32_t lhs_register_width = 0;
+                            std::uint32_t mask_offset = 0;
+                            std::uint32_t mask_register_width = 0;
+                            bool sve2_direct =
+                                vector_register_state_offset(
+                                    ir.operands[0].reg.value,
+                                    destination_offset,
+                                    destination_width) &&
+                                vector_register_state_offset(
+                                    ir.operands[lhs_index].reg.value,
+                                    lhs_offset,
+                                    lhs_register_width) &&
+                                vector_register_state_offset(
+                                    ir.operands[mask_index].reg.value,
+                                    mask_offset,
+                                    mask_register_width) &&
+                                destination_width == 32 &&
+                                lhs_register_width == 32 &&
+                                mask_register_width == 32;
+                            const auto vector_pair_is_uncached =
+                                [&](const std::uint32_t offset) {
+                                    return cached_vector_half_host_index(
+                                               offset) < 0 &&
+                                           cached_vector_half_host_index(
+                                               offset + 16u) < 0;
+                                };
+                            sve2_direct =
+                                sve2_direct &&
+                                vector_pair_is_uncached(
+                                    destination_offset) &&
+                                vector_pair_is_uncached(lhs_offset) &&
+                                vector_pair_is_uncached(mask_offset);
+                            if (sve2_direct) {
+                                code->ptrue(code->p0.b,
+                                            Xbyak_aarch64::VL32);
+                                code->add(code->x14, code->x19,
+                                          lhs_offset);
+                                code->ld1b(
+                                    code->z0.b,
+                                    code->p0 / T_z,
+                                    Xbyak_aarch64::ptr(code->x14));
+                                code->add(code->x14, code->x19,
+                                          mask_offset);
+                                code->ld1b(
+                                    code->z2.b,
+                                    code->p0 / T_z,
+                                    Xbyak_aarch64::ptr(code->x14));
+
+                                code->index(code->z4.b, 0, 1);
+                                code->and_(code->z4.b, 0x10u);
+                                code->orr(code->z6.d, code->z2.d,
+                                          code->z2.d);
+                                code->and_(code->z2.b, 0x0fu);
+                                code->orr(code->z2.d, code->z2.d,
+                                          code->z4.d);
+                                code->lsr(code->z6.b, code->z6.b, 7);
+                                code->lsl(code->z6.b, code->z6.b, 5);
+                                code->orr(code->z2.d, code->z2.d,
+                                          code->z6.d);
+                                code->tbl(code->z0.b, code->z0.b,
+                                          code->z2.b);
+
+                                code->add(code->x14, code->x19,
+                                          destination_offset);
+                                code->st1b(
+                                    code->z0.b, code->p0,
+                                    Xbyak_aarch64::ptr(code->x14));
+                                generic_vector_half_known_zero[
+                                    (destination_offset -
+                                     kStateYmm0Offset) /
+                                    16u] = false;
+                                generic_vector_half_known_zero[
+                                    (destination_offset + 16u -
+                                     kStateYmm0Offset) /
+                                    16u] = false;
+                                if (g_host_sve2_pshufb_emissions.fetch_add(
+                                        1,
+                                        std::memory_order_relaxed) == 0) {
+                                    JitLog(
+                                        "[EXECUTOR_HOST_ISA_LOWERING] "
+                                        "feature=sve2 operation=vpshufb256 "
+                                        "active=1 vectorBytes=%u",
+                                        GetHostIsaProfile()
+                                            .sve_vector_bytes);
+                                }
+                                ++emitted_simd_fast;
+                                continue;
+                            }
+                        }
                         std::uint32_t lhs_width = 0;
                         std::uint32_t mask_width = 0;
                         emitted = emit_vector_load_pair(ir, ir.operands[lhs_index],
@@ -24534,6 +28121,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (generic_has_faultable_memory_access) {
                             emit_publish_fault_ir(ir);
                         } else {
+                            emit_flush_register_caches();
                             code->mov(code->x9, ir.guest_rip);
                             code->str(code->x9,
                                       Xbyak_aarch64::ptr(code->x19, kStateRipOffset));
@@ -24550,6 +28138,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emit_sync_native_edge_phase();
                         code->blr(code->x16);
                         emit_reload_native_edge_phase();
+                        emit_reload_register_caches();
                         Xbyak_aarch64::Label simd_semantic_continue;
                         code->cbz(code->x0, simd_semantic_continue);
                         code->mov(code->x20, code->x0);
@@ -24689,6 +28278,98 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             code->L(increment_done);
                             return true;
                         }
+                        const bool deferred_fault_incdec =
+                            deferred_fault_recipe ==
+                                DeferredFlagKind::Decrement ||
+                            deferred_fault_recipe ==
+                                DeferredFlagKind::Increment;
+                        const bool deferred_guard_incdec =
+                            i < generic_fused_compare_branch.size() &&
+                            generic_fused_compare_branch[i] == 5;
+                        if (mnemonic != X86_MNEMONIC_NEG &&
+                            destination.type ==
+                                X86_OPERAND_TYPE_REGISTER &&
+                            (destination.size == 32 ||
+                             destination.size == 64) &&
+                            ((generic_deferred_loop_flags &&
+                              i == generic_deferred_loop_dec_index) ||
+                             deferred_fault_incdec ||
+                             deferred_guard_incdec ||
+                             (i < generic_elide_status_flags.size() &&
+                              generic_elide_status_flags[i] != 0))) {
+                            const auto location =
+                                resolve_register_location(
+                                    destination.reg.value);
+                            const std::uint32_t state_offset =
+                                location ? location->offset : 0;
+                            const int cached_host_index =
+                                location &&
+                                        location->width ==
+                                            destination.size
+                                    ? cached_gpr_host_index(state_offset)
+                                    : -1;
+                            if (cached_host_index >= 0) {
+                                const XReg cached{
+                                    static_cast<std::uint32_t>(
+                                        cached_host_index)};
+                                const bool deferred_loop_decrement =
+                                    generic_deferred_loop_flags &&
+                                    i == generic_deferred_loop_dec_index;
+                                const bool deferred_incdec =
+                                    deferred_loop_decrement ||
+                                    deferred_fault_incdec ||
+                                    deferred_guard_incdec;
+                                const bool decrement =
+                                    mnemonic == X86_MNEMONIC_DEC;
+                                if (deferred_incdec) {
+                                    if (destination.size == 32) {
+                                        code->mov(
+                                            code->w10,
+                                            WReg(cached.getIdx()));
+                                    } else {
+                                        code->mov(code->x10, cached);
+                                    }
+                                }
+                                if (destination.size == 32) {
+                                    const WReg word{cached.getIdx()};
+                                    if (decrement) {
+                                        code->sub(word, word, 1);
+                                    } else {
+                                        code->add(word, word, 1);
+                                    }
+                                } else if (decrement) {
+                                    code->sub(cached, cached, 1);
+                                } else {
+                                    code->add(cached, cached, 1);
+                                }
+                                commit_cached_gpr_direct_write(
+                                    state_offset, cached);
+                                if (deferred_incdec) {
+                                    store_machine_word(
+                                        code->x10,
+                                        kStateDeferredFlagsLhsOffset);
+                                    code->mov(
+                                        code->x13,
+                                        PackDeferredFlagMeta(
+                                            decrement
+                                                ? DeferredFlagKind::Decrement
+                                                : DeferredFlagKind::Increment,
+                                            destination.size));
+                                    store_machine_word(
+                                        code->x13,
+                                        kStateDeferredFlagsMetaOffset);
+                                } else {
+                                    ++emitted_scalar_dead_flag_elisions;
+                                    if (generic_has_deferred_status_flags) {
+                                        code->mov(code->x17, 0);
+                                        store_machine_word(
+                                            code->x17,
+                                            kStateDeferredFlagsMetaOffset);
+                                    }
+                                }
+                                return true;
+                            }
+                        }
                         const bool negate = mnemonic == X86_MNEMONIC_NEG;
                         const auto source = negate ? code->x11 : code->x10;
                         if (!emit_read_operand(ir, destination, source)) {
@@ -24714,14 +28395,18 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         const bool written = emit_write_operand(
                             ir, destination, code->x12);
                         if (written) {
-                            if (generic_deferred_loop_flags &&
-                                i == generic_deferred_loop_dec_index) {
+                            if ((generic_deferred_loop_flags &&
+                                 i == generic_deferred_loop_dec_index) ||
+                                deferred_fault_incdec ||
+                                deferred_guard_incdec) {
                                 store_machine_word(
                                     source, kStateDeferredFlagsLhsOffset);
                                 code->mov(
                                     code->x13,
                                     PackDeferredFlagMeta(
-                                        DeferredFlagKind::Decrement,
+                                        mnemonic == X86_MNEMONIC_DEC
+                                            ? DeferredFlagKind::Decrement
+                                            : DeferredFlagKind::Increment,
                                         destination.size));
                                 store_machine_word(
                                     code->x13,
@@ -24845,8 +28530,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             code->bic(code->x12, code->x11, code->x10);
                             emitted = publish_x12_to_first_operand(ir);
                             if (emitted) {
+                                const bool fused_logical_guard =
+                                    i <
+                                            generic_fused_compare_branch
+                                                .size() &&
+                                    generic_fused_compare_branch[i] == 6;
                                 if (deferred_fault_recipe ==
-                                    DeferredFlagKind::Logical) {
+                                        DeferredFlagKind::Logical ||
+                                    fused_logical_guard) {
                                     emit_deferred_fault_logic_flags(
                                         ir.operands[0].size);
                                 } else {
@@ -24865,6 +28556,124 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     case X86_MNEMONIC_AND:
                     case X86_MNEMONIC_OR:
                     case X86_MNEMONIC_XOR: {
+                        const std::uint8_t deferred_addsub =
+                            i <
+                                    generic_deferred_addsub_immediate_flags
+                                        .size()
+                                ? generic_deferred_addsub_immediate_flags[i]
+                                : 0;
+                        const bool dead_status =
+                            i < generic_elide_status_flags.size() &&
+                            generic_elide_status_flags[i] != 0;
+                        if ((mnemonic == X86_MNEMONIC_ADD ||
+                             mnemonic == X86_MNEMONIC_SUB) &&
+                            ir.operand_count == 2 &&
+                            ir.operands[0].type ==
+                                X86_OPERAND_TYPE_REGISTER &&
+                            ir.operands[1].type ==
+                                X86_OPERAND_TYPE_IMMEDIATE &&
+                            (ir.operands[0].size == 32 ||
+                             ir.operands[0].size == 64) &&
+                            (dead_status || deferred_addsub >= 3)) {
+                            const auto location =
+                                resolve_register_location(
+                                    ir.operands[0].reg.value);
+                            const std::uint32_t state_offset =
+                                location ? location->offset : 0;
+                            const int cached_host_index =
+                                location &&
+                                        location->width ==
+                                            ir.operands[0].size
+                                    ? cached_gpr_host_index(state_offset)
+                                    : -1;
+                            const std::uint64_t immediate =
+                                DecodeImmediateBits(ir.operands[1]);
+                            if (cached_host_index >= 0 &&
+                                immediate <= 4095u) {
+                                const XReg cached{
+                                    static_cast<std::uint32_t>(
+                                        cached_host_index)};
+                                const bool subtract =
+                                    mnemonic == X86_MNEMONIC_SUB;
+                                const bool carry_only =
+                                    deferred_addsub >= 3;
+                                if (ir.operands[0].size == 32) {
+                                    const WReg word{cached.getIdx()};
+                                    if (subtract && carry_only) {
+                                        code->subs(
+                                            word, word,
+                                            static_cast<std::uint32_t>(
+                                                immediate));
+                                    } else if (subtract) {
+                                        code->sub(
+                                            word, word,
+                                            static_cast<std::uint32_t>(
+                                                immediate));
+                                    } else if (carry_only) {
+                                        code->adds(
+                                            word, word,
+                                            static_cast<std::uint32_t>(
+                                                immediate));
+                                    } else {
+                                        code->add(
+                                            word, word,
+                                            static_cast<std::uint32_t>(
+                                                immediate));
+                                    }
+                                } else if (subtract &&
+                                           carry_only) {
+                                    code->subs(
+                                        cached, cached,
+                                        static_cast<std::uint32_t>(
+                                            immediate));
+                                } else if (subtract) {
+                                    code->sub(
+                                        cached, cached,
+                                        static_cast<std::uint32_t>(
+                                            immediate));
+                                } else if (carry_only) {
+                                    code->adds(
+                                        cached, cached,
+                                        static_cast<std::uint32_t>(
+                                            immediate));
+                                } else {
+                                    code->add(
+                                        cached, cached,
+                                        static_cast<std::uint32_t>(
+                                            immediate));
+                                }
+                                commit_cached_gpr_direct_write(
+                                    state_offset, cached);
+                                if (carry_only) {
+                                    code->cset(
+                                        code->x13,
+                                        subtract
+                                            ? Xbyak_aarch64::CC
+                                            : Xbyak_aarch64::CS);
+                                    load_machine_word(
+                                        code->x14,
+                                        kStateRflagsOffset);
+                                    code->bfi(
+                                        code->x14, code->x13,
+                                        kCfBit, 1);
+                                    store_machine_word(
+                                        code->x14,
+                                        kStateRflagsOffset);
+                                    generic_rflags_live_in_x9 =
+                                        false;
+                                } else {
+                                    ++emitted_scalar_dead_flag_elisions;
+                                    if (generic_has_deferred_status_flags) {
+                                        code->mov(code->x17, 0);
+                                        store_machine_word(
+                                            code->x17,
+                                            kStateDeferredFlagsMetaOffset);
+                                    }
+                                }
+                                emitted = true;
+                                break;
+                            }
+                        }
                         const bool left_ready =
                             emit_read_operand(ir, ir.operands[0], code->x10);
                         const bool right_ready = left_ready &&
@@ -24881,27 +28690,92 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                                      code->x19,
                                                      kStateRflagsOffset));
                             code->ubfx(code->x13, code->x13, kCfBit, 1);
-                            code->add(code->x12, code->x11, code->x13);
-                            if (subtract_with_borrow) {
-                                code->sub(code->x20, code->x10, code->x12);
+                            if (JitHostHasFlagM()) {
+                                code->rmif(code->x13, 63, 0x2);
+                                if (subtract_with_borrow) {
+                                    code->cfinv();
+                                }
+                                const std::uint32_t width =
+                                    ir.operands[0].size;
+                                if (width == 32) {
+                                    if (subtract_with_borrow) {
+                                        code->sbc(code->w20, code->w10,
+                                                  code->w11);
+                                        code->sbcs(code->wzr, code->w10,
+                                                   code->w11);
+                                    } else {
+                                        code->adc(code->w20, code->w10,
+                                                  code->w11);
+                                        code->adcs(code->wzr, code->w10,
+                                                   code->w11);
+                                    }
+                                } else if (width == 8 || width == 16) {
+                                    if (subtract_with_borrow) {
+                                        code->sbc(code->x20, code->x10,
+                                                  code->x11);
+                                    } else {
+                                        code->adc(code->x20, code->x10,
+                                                  code->x11);
+                                    }
+                                    const std::uint32_t shift = 32u - width;
+                                    code->lsl(code->w13, code->w10, shift);
+                                    code->lsl(code->w14, code->w11, shift);
+                                    if (subtract_with_borrow) {
+                                        code->sbcs(code->wzr, code->w13,
+                                                   code->w14);
+                                    } else {
+                                        code->adcs(code->wzr, code->w13,
+                                                   code->w14);
+                                    }
+                                } else if (subtract_with_borrow) {
+                                    code->sbc(code->x20, code->x10,
+                                              code->x11);
+                                    code->sbcs(code->xzr, code->x10,
+                                               code->x11);
+                                } else {
+                                    code->adc(code->x20, code->x10,
+                                              code->x11);
+                                    code->adcs(code->xzr, code->x10,
+                                               code->x11);
+                                }
+                                code->mov(code->x12, code->x20);
+                                emit_inline_flags_addsub_from_nzcv(
+                                    subtract_with_borrow);
+                                if (g_host_flagm_carry_chain_emissions.fetch_add(
+                                        1, std::memory_order_relaxed) == 0) {
+                                    JitLog(
+                                        "[EXECUTOR_HOST_ISA_LOWERING] "
+                                        "feature=flagm operation=adc_sbb "
+                                        "active=1");
+                                }
                             } else {
-                                code->add(code->x20, code->x10, code->x12);
+                                code->add(code->x12, code->x11, code->x13);
+                                if (subtract_with_borrow) {
+                                    code->sub(
+                                        code->x20, code->x10, code->x12);
+                                } else {
+                                    code->add(
+                                        code->x20, code->x10, code->x12);
+                                }
+                                EmitCallArgument(
+                                    *code, 5, ir.operands[0].size);
+                                EmitCallArgument(*code, 4, code->x20);
+                                EmitCallArgument(*code, 3, code->x13);
+                                EmitCallArgument(*code, 2, code->x11);
+                                EmitCallArgument(*code, 1, code->x10);
+                                EmitCallArgument(*code, 0, code->x19);
+                                const auto status_helper =
+                                    subtract_with_borrow
+                                    ? &RecordBorrowingSubtractionFlags
+                                    : &RecordCarryingAdditionFlags;
+                                EmitJitRelocatablePointer(
+                                    *code, code->x16,
+                                    reinterpret_cast<std::uint64_t>(
+                                        status_helper));
+                                emit_sync_native_edge_phase();
+                                code->blr(code->x16);
+                                emit_reload_native_edge_phase();
                             }
-                            EmitCallArgument(*code, 5, ir.operands[0].size);
-                            EmitCallArgument(*code, 4, code->x20);
-                            EmitCallArgument(*code, 3, code->x13);
-                            EmitCallArgument(*code, 2, code->x11);
-                            EmitCallArgument(*code, 1, code->x10);
-                            EmitCallArgument(*code, 0, code->x19);
-                            const auto status_helper = subtract_with_borrow
-                                ? &RecordBorrowingSubtractionFlags
-                                : &RecordCarryingAdditionFlags;
-                            EmitJitRelocatablePointer(
-                                *code, code->x16,
-                                reinterpret_cast<std::uint64_t>(status_helper));
-                            emit_sync_native_edge_phase();
-                            code->blr(code->x16);
-                            emit_reload_native_edge_phase();
                             emitted = emit_write_operand(
                                 ir, ir.operands[0], code->x20);
                         } else {
@@ -24928,16 +28802,17 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             }
                             emitted = emit_write_operand(ir, ir.operands[0], code->x12);
                             if (emitted) {
-                                const std::uint8_t deferred_addsub =
+                                const bool fused_logical_guard =
                                     i <
-                                            generic_deferred_addsub_immediate_flags
-                                                .size()
-                                        ? generic_deferred_addsub_immediate_flags[
-                                              i]
-                                        : 0;
+                                            generic_fused_compare_branch
+                                                .size() &&
+                                    generic_fused_compare_branch[i] == 6;
                                 if (deferred_addsub != 0) {
                                     emit_deferred_addsub_immediate_flags(
-                                        ir, deferred_addsub == 2);
+                                        ir,
+                                        deferred_addsub == 2 ||
+                                            deferred_addsub == 4,
+                                        deferred_addsub >= 3);
                                 } else if (
                                     deferred_fault_recipe ==
                                         DeferredFlagKind::Addition ||
@@ -24949,14 +28824,24 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                         ir.operands[0].size);
                                 } else if (
                                     deferred_fault_recipe ==
-                                    DeferredFlagKind::Logical) {
+                                        DeferredFlagKind::Logical ||
+                                    fused_logical_guard) {
                                     emit_deferred_fault_logic_flags(
                                         ir.operands[0].size);
                                 } else {
                                     emit_required_status([&] {
+                                    const auto native_span_kind =
+                                        static_cast<NativeFlagSpanKind>(
+                                            generic_native_flag_span_producer[i]);
                                     const bool memory_result =
                                         ir.operands[0].type == X86_OPERAND_TYPE_MEMORY;
-                                    if (status_kind == StatusKind::Logical) {
+                                    if (native_span_kind !=
+                                        NativeFlagSpanKind::None) {
+                                        emit_native_flag_span_status(
+                                            native_span_kind,
+                                            ir.operands[0].size);
+                                    } else if (
+                                        status_kind == StatusKind::Logical) {
                                         emit_inline_flags_logic(
                                             ir.operands[0].size, memory_result);
                                     } else {
@@ -24972,6 +28857,14 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     }
                     case X86_MNEMONIC_CMP:
                     case X86_MNEMONIC_TEST: {
+                        const std::uint8_t fused_compare_kind =
+                            i < generic_fused_compare_branch.size()
+                                ? generic_fused_compare_branch[i]
+                                : 0;
+                        if (fused_compare_kind == 4) {
+                            emitted = true;
+                            break;
+                        }
                         const bool left_ready =
                             emit_read_operand(ir, ir.operands[0], code->x10);
                         const bool right_ready = left_ready &&
@@ -24980,8 +28873,7 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (emitted) {
                             const bool compare = mnemonic == X86_MNEMONIC_CMP;
                             const bool fuse_branch =
-                                i < generic_fused_compare_branch.size() &&
-                                generic_fused_compare_branch[i] != 0;
+                                fused_compare_kind != 0;
                             if (compare) {
                                 if (!fuse_branch) {
                                     code->sub(
@@ -25272,18 +29164,19 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         if (!emitted) {
                             break;
                         }
-                        if (generic_has_faultable_memory_access) {
-                            emit_publish_fault_ir(ir);
-                        } else {
-                            emit_flush_register_caches();
-                            code->mov(code->x9, ir.guest_rip);
-                            code->str(code->x9,
-                                      Xbyak_aarch64::ptr(code->x19,
-                                                        kStateRipOffset));
-                        }
                         const bool signed_divide =
                             mnemonic == X86_MNEMONIC_IDIV;
                         if (ir.operands[0].size != 32) {
+                            if (generic_has_faultable_memory_access) {
+                                emit_publish_fault_ir(ir);
+                            } else {
+                                emit_flush_register_caches();
+                                code->mov(code->x9, ir.guest_rip);
+                                code->str(
+                                    code->x9,
+                                    Xbyak_aarch64::ptr(
+                                        code->x19, kStateRipOffset));
+                            }
                             invoke_machine_helper(code->x12, ir.operands[0].size,
                                                   signed_divide ? 1u : 0u,
                                                   &DivideAccumulatorPair);
@@ -25299,8 +29192,57 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             code->mov(code->w12, code->w12);
                         }
                         code->cbz(code->x12, divide_slow);
-                        load_machine_dword(code->w10, kStateRaxOffset);
-                        load_machine_dword(code->w11, kStateRdxOffset);
+                        const auto load_implicit_dword =
+                            [&](const WReg& destination,
+                                const std::uint32_t state_offset) {
+                            const int cached_host =
+                                cached_gpr_host_index(state_offset);
+                            if (cached_host >= 0) {
+                                code->mov(
+                                    destination,
+                                    WReg(static_cast<std::uint32_t>(
+                                        cached_host)));
+                            } else {
+                                load_machine_dword(
+                                    destination, state_offset);
+                            }
+                        };
+                        const auto store_implicit_dword =
+                            [&](const XReg& source,
+                                const std::uint32_t state_offset) {
+                            const int cached_host =
+                                cached_gpr_host_index(state_offset);
+                            if (cached_host < 0) {
+                                store_machine_word(source, state_offset);
+                                return;
+                            }
+                            const auto host =
+                                static_cast<std::uint32_t>(cached_host);
+                            code->mov(WReg(host), WReg(source.getIdx()));
+                            const int cache_index =
+                                cached_gpr_cache_index(state_offset);
+                            const bool writeback =
+                                cache_index >= 0 &&
+                                generic_cached_gpr_dirty[
+                                    static_cast<std::size_t>(
+                                        cache_index)] &&
+                                !generic_fault_gpr_write_through;
+                            if (writeback) {
+                                generic_gpr_cache_written_mask |=
+                                    std::uint32_t{1} <<
+                                    static_cast<std::uint32_t>(
+                                        cache_index);
+                            } else {
+                                code->str(
+                                    XReg(host),
+                                    Xbyak_aarch64::ptr(
+                                        code->x19, state_offset));
+                            }
+                        };
+                        load_implicit_dword(
+                            code->w10, kStateRaxOffset);
+                        load_implicit_dword(
+                            code->w11, kStateRdxOffset);
                         code->orr(code->x10, code->x10, code->x11,
                                   Xbyak_aarch64::LSL, 32);
                         if (signed_divide) {
@@ -25317,16 +29259,28 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                    code->x10);
                         code->mov(code->w11, code->w11);
                         code->mov(code->w13, code->w13);
-                        store_machine_word(code->x11, kStateRaxOffset);
-                        store_machine_word(code->x13, kStateRdxOffset);
+                        store_implicit_dword(
+                            code->x11, kStateRaxOffset);
+                        store_implicit_dword(
+                            code->x13, kStateRdxOffset);
                         code->b(divide_done);
 
                         code->L(divide_slow);
+                        if (generic_has_faultable_memory_access) {
+                            emit_publish_fault_ir(ir);
+                        } else {
+                            emit_flush_register_caches();
+                            code->mov(code->x9, ir.guest_rip);
+                            code->str(
+                                code->x9,
+                                Xbyak_aarch64::ptr(
+                                    code->x19, kStateRipOffset));
+                        }
                         invoke_machine_helper(code->x12, 32,
                                               signed_divide ? 1u : 0u,
                                               &DivideAccumulatorPair);
-                        code->L(divide_done);
                         emit_reload_register_caches();
+                        code->L(divide_done);
                         break;
                     }
                     case X86_MNEMONIC_IMUL:
@@ -25522,39 +29476,65 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         break;
                     }
                     case X86_MNEMONIC_CBW:
-                        load_machine_word(code->x10, kStateRaxOffset);
+                        emitted = emit_gpr_load(
+                            X86_REGISTER_RAX, 8, code->x10);
+                        if (!emitted) {
+                            break;
+                        }
                         code->sxtb(code->w11, code->w10);
-                        code->mov(code->x12, ~std::uint64_t{0xffffu});
-                        code->and_(code->x10, code->x10, code->x12);
-                        code->ubfx(code->x11, code->x11, 0, 16);
-                        code->orr(code->x10, code->x10, code->x11);
-                        store_machine_word(code->x10, kStateRaxOffset);
+                        emitted = emit_write_implicit_gpr(
+                            kStateRaxOffset, 16, code->x11);
                         break;
                     case X86_MNEMONIC_CWDE:
-                        load_machine_dword(code->w10, kStateRaxOffset);
+                        emitted = emit_gpr_load(
+                            X86_REGISTER_RAX, 16, code->x10);
+                        if (!emitted) {
+                            break;
+                        }
                         code->sxth(code->w10, code->w10);
-                        store_machine_word(code->x10, kStateRaxOffset);
+                        emitted = emit_write_implicit_gpr(
+                            kStateRaxOffset, 32, code->x10);
                         break;
                     case X86_MNEMONIC_CDQE:
-                        load_machine_dword(code->w10, kStateRaxOffset);
+                        emitted = emit_gpr_load(
+                            X86_REGISTER_RAX, 32, code->x10);
+                        if (!emitted) {
+                            break;
+                        }
                         code->sxtw(code->x10, code->w10);
-                        store_machine_word(code->x10, kStateRaxOffset);
+                        emitted = emit_write_implicit_gpr(
+                            kStateRaxOffset, 64, code->x10);
                         break;
                     case X86_MNEMONIC_CWD:
-                        load_machine_word(code->x10, kStateRaxOffset);
+                        emitted = emit_gpr_load(
+                            X86_REGISTER_RAX, 16, code->x10);
+                        if (!emitted) {
+                            break;
+                        }
                         code->lsl(code->x11, code->x10, 48);
                         code->asr(code->x11, code->x11, 63);
-                        store_machine_half(code->w11, kStateRdxOffset);
+                        emitted = emit_write_implicit_gpr(
+                            kStateRdxOffset, 16, code->x11);
                         break;
                     case X86_MNEMONIC_CDQ:
-                        load_machine_dword(code->w10, kStateRaxOffset);
+                        emitted = emit_gpr_load(
+                            X86_REGISTER_RAX, 32, code->x10);
+                        if (!emitted) {
+                            break;
+                        }
                         code->asr(code->w11, code->w10, 31);
-                        store_machine_word(code->x11, kStateRdxOffset);
+                        emitted = emit_write_implicit_gpr(
+                            kStateRdxOffset, 32, code->x11);
                         break;
                     case X86_MNEMONIC_CQO:
-                        load_machine_word(code->x10, kStateRaxOffset);
+                        emitted = emit_gpr_load(
+                            X86_REGISTER_RAX, 64, code->x10);
+                        if (!emitted) {
+                            break;
+                        }
                         code->asr(code->x11, code->x10, 63);
-                        store_machine_word(code->x11, kStateRdxOffset);
+                        emitted = emit_write_implicit_gpr(
+                            kStateRdxOffset, 64, code->x11);
                         break;
                     case X86_MNEMONIC_PUSH:
                         emitted = emit_read_operand(ir, ir.operands[0], code->x12);
@@ -25928,7 +29908,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             Xbyak_aarch64::EQ;
                         emitted = emit_fused_compare_condition(
                             generic_last_mnemonic,
-                            block.instructions[compare_index], condition);
+                            block.instructions[compare_index], condition,
+                            false);
                         if (emitted) {
                             code->b(condition, take);
                         }
@@ -26295,7 +30276,15 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         code->L(take);
                         if (generic_has_local_backedge) {
                             code->subs(code->x22, code->x22, 1);
-                            code->cbnz(code->x22, local_loop_body);
+                            if (generic_vector_deferred_zero_mask != 0) {
+                                Xbyak_aarch64::Label leave_local_loop;
+                                code->cbz(code->x22, leave_local_loop);
+                                emit_materialize_deferred_vector_zeros();
+                                code->b(local_loop_body);
+                                code->L(leave_local_loop);
+                            } else {
+                                code->cbnz(code->x22, local_loop_body);
+                            }
                         }
                         if (!deferred_compare_exit) {
                             emit_materialize_deferred_flags();
@@ -26322,7 +30311,10 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                     } else if (generic_has_jump_terminator ||
                                generic_has_call_terminator) {
                         if (generic_has_call_terminator) {
-                            emit_epilogue_return_reg(code->x10);
+                            if (generic_has_dynamic_control_terminator ||
+                                !emit_static_edge_tail(branch_target)) {
+                                emit_epilogue_return_reg(code->x10);
+                            }
                         } else if (generic_has_dynamic_control_terminator &&
                             generic_has_jump_terminator &&
                             emit_computed_edge_tail(code->x10)) {
@@ -26344,6 +30336,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                         emit_epilogue_return_reg(code->x20);
                     }
                     auto* entry = seal_code_draft(std::move(code));
+                    if (generic_signal_fault_sidecar_enabled &&
+                        !generic_signal_fault_sites.empty()) {
+                        PublishSignalFaultSidecar(
+                            entry, generic_signal_fault_region_slot,
+                            std::move(generic_signal_fault_sites));
+                    }
                     if (generic_deferred_loop_flags) {
                         g_jit_native_deferred_loop_flag_blocks.fetch_add(
                             1, std::memory_order_relaxed);
@@ -26365,6 +30363,30 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 1, std::memory_order_relaxed);
                         }
                     }
+                    if (emitted_relaxed_fma != 0) {
+                        const std::uint64_t total =
+                            g_jit_native_relaxed_fma_fusions.fetch_add(
+                                emitted_relaxed_fma,
+                                std::memory_order_relaxed) +
+                            emitted_relaxed_fma;
+                        if ((total & (total - 1u)) == 0) {
+                            JitLog(
+                                "[EXECUTOR_JIT_RELAXED_FMA] fusions=%llu",
+                                static_cast<unsigned long long>(total));
+                        }
+                    }
+                    if (emitted_relaxed_neon_reductions != 0) {
+                        const std::uint64_t total =
+                            g_jit_native_relaxed_neon_reductions.fetch_add(
+                                emitted_relaxed_neon_reductions,
+                                std::memory_order_relaxed) +
+                            emitted_relaxed_neon_reductions;
+                        if ((total & (total - 1u)) == 0) {
+                            JitLog(
+                                "[EXECUTOR_JIT_RELAXED_NEON_REDUCTION] reductions=%llu",
+                                static_cast<unsigned long long>(total));
+                        }
+                    }
                     if (emitted_simd_fast != 0 && emitted_simd_semantic == 0 &&
                         emitted_scalar_semantic == 0) {
                         g_jit_native_fully_direct_blocks.fetch_add(
@@ -26380,6 +30402,12 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                             emitted_scalar_direct, std::memory_order_relaxed);
                         g_jit_native_scalar_semantic_instructions.fetch_add(
                             emitted_scalar_semantic, std::memory_order_relaxed);
+                    }
+                    if (generic_fault_gpr_loop_writeback_safe &&
+                        generic_has_faultable_memory_access &&
+                        generic_any_gpr_cache) {
+                        g_jit_native_scalar_gpr_faultable_loop_writeback_blocks.fetch_add(
+                            1, std::memory_order_relaxed);
                     }
                     g_jit_native_scalar_shift_inline_instructions.fetch_add(
                         emitted_scalar_shift_inline, std::memory_order_relaxed);
@@ -26401,6 +30429,17 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
                                 reinterpret_cast<Arm64BlockEntry>(
                                     reinterpret_cast<std::uintptr_t>(entry) +
                                     generic_static_gpr_entry_offset);
+                        }
+                        if (full_gpr_entry_out != nullptr &&
+                            generic_full_gpr_entry_offset != 0) {
+                            *full_gpr_entry_out =
+                                reinterpret_cast<Arm64BlockEntry>(
+                                    reinterpret_cast<std::uintptr_t>(entry) +
+                                    generic_full_gpr_entry_offset);
+                        }
+                        if (gpr_layout_signature_out != nullptr) {
+                            *gpr_layout_signature_out =
+                                generic_gpr_layout_signature;
                         }
                         auto normal_entry_code = open_code_draft();
                         normal_entry_code->stp(
@@ -26551,7 +30590,8 @@ Arm64BlockEntry NativeSegmentDepot::EmitNativeControlFlowBlock(
         EmitJitRelocatablePointer(
             code, code.x9,
             reinterpret_cast<std::uint64_t>(&primary_outbound_edge->target));
-        code.ldar(code.x15, Xbyak_aarch64::ptr(code.x9));
+        EmitHostMetadataAcquire(
+            code, code.x15, Xbyak_aarch64::ptr(code.x9));
         code.cbz(code.x15, fallback);
         code.mov(code.x16, code.x15);
 
@@ -37323,6 +41363,12 @@ std::uint64_t ExchangeAtomicLane(void* const target,
     return __atomic_exchange_n(lane, static_cast<Lane>(replacement), __ATOMIC_SEQ_CST);
 }
 
+#if defined(__aarch64__)
+extern "C" __attribute__((visibility("hidden")))
+std::uint32_t Lsx4AtomicExchangeByteLse(
+    void* target, std::uint32_t replacement) noexcept;
+#endif
+
 inline std::uint64_t ExchangeAlignedLane(void* const target,
                                          const std::uint64_t replacement,
                                          const std::uint32_t size_bits) {
@@ -37330,14 +41376,8 @@ inline std::uint64_t ExchangeAlignedLane(void* const target,
     case 8:
 #if defined(__aarch64__)
         if (JitHostHasLseAtomics()) {
-            std::uint32_t previous = 0;
             const std::uint32_t next = static_cast<std::uint8_t>(replacement);
-            asm volatile(".arch_extension lse\n\t"
-                         "swpalb %w[next], %w[previous], [%[address]]"
-                         : [previous] "=&r"(previous)
-                         : [next] "r"(next), [address] "r"(target)
-                         : "memory");
-            return previous;
+            return Lsx4AtomicExchangeByteLse(target, next);
         }
 #endif
         return ExchangeAtomicLane<std::uint8_t>(target, replacement);
@@ -39327,6 +43367,10 @@ std::string DescribeTranslationEngineJson() {
             {"fastInstructions", relaxed(g_jit_native_simd_fast_instructions)},
             {"semanticInstructions", relaxed(g_jit_native_simd_semantic_instructions)},
             {"faultableWritebackBlocks", relaxed(g_jit_native_simd_faultable_writeback_blocks)},
+            {"relaxedFmaFusions",
+             relaxed(g_jit_native_relaxed_fma_fusions)},
+            {"relaxedNeonReductions",
+             relaxed(g_jit_native_relaxed_neon_reductions)},
             {"registerCache", {
                 {"blocks", relaxed(g_jit_native_simd_cached_blocks)},
                 {"halves", relaxed(g_jit_native_simd_cached_halves)},
@@ -39355,6 +43399,14 @@ std::string DescribeTranslationEngineJson() {
                 {"stosBytes", relaxed(g_jit_rep_stos_bulk_bytes)},
             }},
             {"controlSemanticTerminators", relaxed(g_jit_native_control_semantic_terminators)},
+            {"deferredFlagAbi", {
+                {"directBodySites",
+                 relaxed(g_jit_deferred_flag_direct_body_sites)},
+                {"staticGprSites",
+                 relaxed(g_jit_deferred_flag_static_gpr_sites)},
+                {"fullGprSites",
+                 relaxed(g_jit_deferred_flag_full_gpr_sites)},
+            }},
         }},
         {"leafHleFusion", {
             {"compiledBlocks", relaxed(g_jit_leaf_hle_fused_blocks)},
@@ -39775,6 +43827,13 @@ std::uint64_t InvokeGeneratedCode(const Arm64BlockEntry entry,
     return entry == nullptr ? 0 : std::invoke(entry, &machine);
 }
 
+#if defined(__aarch64__)
+extern "C" __attribute__((visibility("hidden")))
+std::uint32_t Lsx4InvokeGeneratedCodeWithAbiCanaries(
+    Arm64BlockEntry entry, LsxMachineImage* machine,
+    std::uint64_t* value) noexcept;
+#endif
+
 [[gnu::noinline]] bool InvokeGeneratedCodeWithAbiCanaries(
     const Arm64BlockEntry entry, LsxMachineImage& machine,
     std::uint64_t& value) {
@@ -39783,57 +43842,8 @@ std::uint64_t InvokeGeneratedCode(const Arm64BlockEntry entry,
         return false;
     }
 #if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
-    constexpr std::uint64_t kX19 = UINT64_C(0x1919191919191919);
-    constexpr std::uint64_t kX20 = UINT64_C(0x2020202020202020);
-    constexpr std::uint64_t kX21 = UINT64_C(0x2121212121212121);
-    constexpr std::uint64_t kX22 = UINT64_C(0x2222222222222222);
-    constexpr std::uint64_t kX23 = UINT64_C(0x2323232323232323);
-    constexpr std::uint64_t kX24 = UINT64_C(0x2424242424242424);
-    constexpr std::uint64_t kX25 = UINT64_C(0x2525252525252525);
-    constexpr std::uint64_t kX26 = UINT64_C(0x2626262626262626);
-    constexpr std::uint64_t kX27 = UINT64_C(0x2727272727272727);
-    constexpr std::uint64_t kX28 = UINT64_C(0x2828282828282828);
-    register std::uint64_t x19_canary __asm__("x19") = kX19;
-    register std::uint64_t x20_canary __asm__("x20") = kX20;
-    register std::uint64_t x21_canary __asm__("x21") = kX21;
-    register std::uint64_t x22_canary __asm__("x22") = kX22;
-    register std::uint64_t x23_canary __asm__("x23") = kX23;
-    register std::uint64_t x24_canary __asm__("x24") = kX24;
-    register std::uint64_t x25_canary __asm__("x25") = kX25;
-    register std::uint64_t x26_canary __asm__("x26") = kX26;
-    register std::uint64_t x27_canary __asm__("x27") = kX27;
-    register std::uint64_t x28_canary __asm__("x28") = kX28;
-    __asm__ volatile(
-        ""
-        : "+r"(x19_canary), "+r"(x20_canary), "+r"(x21_canary),
-          "+r"(x22_canary), "+r"(x23_canary), "+r"(x24_canary),
-          "+r"(x25_canary), "+r"(x26_canary), "+r"(x27_canary),
-          "+r"(x28_canary)
-        :
-        : "memory");
-    std::uintptr_t sp_before = 0;
-    std::uintptr_t x29_before = 0;
-    __asm__ volatile("mov %0, sp" : "=r"(sp_before));
-    __asm__ volatile("mov %0, x29" : "=r"(x29_before));
-    value = std::invoke(entry, &machine);
-    __asm__ volatile(
-        ""
-        : "+r"(x19_canary), "+r"(x20_canary), "+r"(x21_canary),
-          "+r"(x22_canary), "+r"(x23_canary), "+r"(x24_canary),
-          "+r"(x25_canary), "+r"(x26_canary), "+r"(x27_canary),
-          "+r"(x28_canary)
-        :
-        : "memory");
-    std::uintptr_t sp_after = 0;
-    std::uintptr_t x29_after = 0;
-    __asm__ volatile("mov %0, sp" : "=r"(sp_after));
-    __asm__ volatile("mov %0, x29" : "=r"(x29_after));
-    return sp_after == sp_before && x29_after == x29_before &&
-           x19_canary == kX19 && x20_canary == kX20 &&
-           x21_canary == kX21 && x22_canary == kX22 &&
-           x23_canary == kX23 && x24_canary == kX24 &&
-           x25_canary == kX25 && x26_canary == kX26 &&
-           x27_canary == kX27 && x28_canary == kX28;
+    return Lsx4InvokeGeneratedCodeWithAbiCanaries(
+               entry, &machine, &value) != 0;
 #else
     value = std::invoke(entry, &machine);
     return true;
@@ -44891,15 +48901,22 @@ std::string ExerciseTranslationEngineJson() {
                              generic_byte_compare_value.data()));
             });
 
+        std::uint32_t generic_vcvtsi_failure_mask = 0;
+        std::uint32_t generic_vinsertps_failure_mask = 0;
+        std::uint32_t generic_vpshufd_failure_mask = 0;
+        std::uint32_t generic_whole_transfer_failure_mask = 0;
         const auto run_generic_simd_case = [&]<typename Bytes, typename Init, typename Validate>(
             const Bytes& bytes,
             const std::size_t expected_instructions,
-            const std::size_t final_store_instruction, Init init, Validate validate) {
+            const std::size_t final_store_instruction, Init init, Validate validate,
+            const LocalJitTier compilation_tier = LocalJitTier::Tier0,
+            const char* const diagnostic_name = nullptr) {
             LsxDecodedRegion decoded = DecodeGuestBasicRegion(
                 reinterpret_cast<std::uint64_t>(bytes.data()), 16);
             Arm64BlockEntry native_direct = nullptr;
-            Arm64BlockEntry native_entry =
-                arena.EmitNativeControlFlowBlock(decoded, nullptr, &native_direct);
+            Arm64BlockEntry native_entry = arena.EmitNativeControlFlowBlock(
+                decoded, nullptr, &native_direct, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr, false, compilation_tier, nullptr);
             alignas(32) std::array<std::uint8_t, 128> interpreter_memory{};
             alignas(32) std::array<std::uint8_t, 128> native_memory{};
             LsxMachineImage interpreter_state{};
@@ -44928,17 +48945,117 @@ std::string ExerciseTranslationEngineJson() {
             WriteGuestGpr64(canonical_native, LsxGpr::R14, 0);
             canonical_interpreter.rip_or_exit = 0;
             canonical_native.rip_or_exit = 0;
-            return !decoded.HasDecodeFailure() && decoded.SupportsInitialNativeTier() &&
+            const bool matches =
+                   !decoded.HasDecodeFailure() && decoded.SupportsInitialNativeTier() &&
                    decoded.instructions.size() == expected_instructions &&
                    final_store_instruction < decoded.instructions.size() &&
                    native_entry != nullptr && native_direct != nullptr &&
-                   native_entry != native_direct &&
                    interpreter_result == native_result &&
                    native_result == decoded.end_rip &&
                    std::memcmp(&canonical_interpreter, &canonical_native,
                                sizeof(LsxMachineImage)) == 0 &&
                    interpreter_memory == native_memory &&
                    fault_slot_retired && validate(native_state, native_memory);
+            if (!matches && diagnostic_name != nullptr) {
+                std::size_t state_diff = sizeof(LsxMachineImage);
+                const auto* const expected_bytes =
+                    reinterpret_cast<const std::uint8_t*>(
+                        &canonical_interpreter);
+                const auto* const actual_bytes =
+                    reinterpret_cast<const std::uint8_t*>(
+                        &canonical_native);
+                for (std::size_t byte = 0;
+                     byte < sizeof(LsxMachineImage); ++byte) {
+                    if (expected_bytes[byte] != actual_bytes[byte]) {
+                        state_diff = byte;
+                        break;
+                    }
+                }
+                std::size_t memory_diff = interpreter_memory.size();
+                for (std::size_t byte = 0;
+                     byte < interpreter_memory.size(); ++byte) {
+                    if (interpreter_memory[byte] != native_memory[byte]) {
+                        memory_diff = byte;
+                        break;
+                    }
+                }
+                std::uint32_t failure_mask = 0;
+                failure_mask |= decoded.HasDecodeFailure() ? 1u << 0u : 0;
+                failure_mask |= !decoded.SupportsInitialNativeTier()
+                                    ? 1u << 1u
+                                    : 0;
+                failure_mask |= decoded.instructions.size() !=
+                                        expected_instructions
+                                    ? 1u << 2u
+                                    : 0;
+                failure_mask |= final_store_instruction >=
+                                        decoded.instructions.size()
+                                    ? 1u << 3u
+                                    : 0;
+                failure_mask |= native_entry == nullptr ? 1u << 4u : 0;
+                failure_mask |= native_direct == nullptr ? 1u << 5u : 0;
+                failure_mask |= interpreter_result != native_result
+                                    ? 1u << 7u
+                                    : 0;
+                failure_mask |= state_diff != sizeof(LsxMachineImage)
+                                    ? 1u << 8u
+                                    : 0;
+                failure_mask |= memory_diff != interpreter_memory.size()
+                                    ? 1u << 9u
+                                    : 0;
+                failure_mask |= !fault_slot_retired ? 1u << 10u : 0;
+                failure_mask |= !validate(native_state, native_memory)
+                                    ? 1u << 11u
+                                    : 0;
+                if (std::strcmp(diagnostic_name, "vcvtsi") == 0) {
+                    generic_vcvtsi_failure_mask |= failure_mask;
+                } else if (
+                    std::strcmp(diagnostic_name, "vinsertps") == 0) {
+                    generic_vinsertps_failure_mask |= failure_mask;
+                } else if (
+                    std::strcmp(diagnostic_name, "vpshufd") == 0) {
+                    generic_vpshufd_failure_mask |= failure_mask;
+                } else if (
+                    std::strcmp(diagnostic_name, "whole_transfer") == 0) {
+                    generic_whole_transfer_failure_mask |= failure_mask;
+                }
+                JitLog("[EXECUTOR_JIT_TIER1_SIMD_DIFF] name=%s decoded=%zu "
+                       "expected=%zu stateDiff=%zu expectedState=0x%x "
+                       "actualState=0x%x memoryDiff=%zu expectedMemory=0x%x "
+                       "actualMemory=0x%x interpreterResult=0x%llx "
+                       "nativeResult=0x%llx decodeFailure=%d supports=%d "
+                       "entry=%d direct=%d distinct=%d resultEqual=%d "
+                       "stateEqual=%d memoryEqual=%d faultRetired=%d "
+                       "validate=%d",
+                       diagnostic_name, decoded.instructions.size(),
+                       expected_instructions, state_diff,
+                       state_diff < sizeof(LsxMachineImage)
+                           ? expected_bytes[state_diff]
+                           : 0,
+                       state_diff < sizeof(LsxMachineImage)
+                           ? actual_bytes[state_diff]
+                           : 0,
+                       memory_diff,
+                       memory_diff < interpreter_memory.size()
+                           ? interpreter_memory[memory_diff]
+                           : 0,
+                       memory_diff < native_memory.size()
+                           ? native_memory[memory_diff]
+                           : 0,
+                       static_cast<unsigned long long>(interpreter_result),
+                       static_cast<unsigned long long>(native_result),
+                       decoded.HasDecodeFailure() ? 1 : 0,
+                       decoded.SupportsInitialNativeTier() ? 1 : 0,
+                       native_entry != nullptr ? 1 : 0,
+                       native_direct != nullptr ? 1 : 0,
+                       native_entry != native_direct ? 1 : 0,
+                       interpreter_result == native_result ? 1 : 0,
+                       state_diff == sizeof(LsxMachineImage) ? 1 : 0,
+                       memory_diff == interpreter_memory.size() ? 1 : 0,
+                       fault_slot_retired ? 1 : 0,
+                       validate(native_state, native_memory) ? 1 : 0);
+            }
+            return matches;
         };
 
         const std::uint64_t simd_fast_before =
@@ -44975,7 +49092,8 @@ std::string ExerciseTranslationEngineJson() {
                 },
                 [](const LsxMachineImage&, const std::array<std::uint8_t, 128>& memory) {
                     return memory[0] != 3u;
-                });
+                },
+                LocalJitTier::Tier1);
             generic_faultable_simd_writeback_ok =
                 generic_simd_ymm_native_ok &&
                 g_jit_native_simd_faultable_writeback_blocks.load(
@@ -45343,17 +49461,19 @@ std::string ExerciseTranslationEngineJson() {
             g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed);
         const std::uint64_t lddqu_semantic_before =
             g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
-        const std::array<std::uint8_t, 31> generic_lddqu_vlddqu = {
+        const std::array<std::uint8_t, 39> generic_lddqu_vlddqu = {
             0xc5, 0xfb, 0xf0, 0x0e,
             0xc5, 0xfa, 0x7f, 0x0b,
             0xc5, 0xff, 0xf0, 0x54, 0x8e, 0x01,
             0xc5, 0xfe, 0x7f, 0x53, 0x10,
             0xf2, 0x0f, 0xf0, 0x5e, 0x11,
             0xf3, 0x0f, 0x7f, 0x5b, 0x30,
+            0xc5, 0xfe, 0x6f, 0xe2,
+            0xf3, 0x0f, 0x6f, 0xeb,
             0xeb, 0x00,
         };
         const bool generic_lddqu_vlddqu_result_ok = run_generic_simd_case(
-            generic_lddqu_vlddqu, 7, 5,
+            generic_lddqu_vlddqu, 9, 5,
             [](LsxMachineImage& state, std::array<std::uint8_t, 128>& memory) {
                 alignas(32) static const std::array<std::uint8_t, 64> source = [] {
                     std::array<std::uint8_t, 64> bytes{};
@@ -45405,10 +49525,11 @@ std::string ExerciseTranslationEngineJson() {
                     }
                 }
                 return state.rflags == 0xad7u && state.mxcsr == 0x5f80u;
-            });
+            },
+            LocalJitTier::Tier1, "whole_transfer");
         const bool generic_lddqu_vlddqu_counter_ok =
             g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
-                lddqu_fast_before + 6u &&
+                lddqu_fast_before + 8u &&
             g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed) ==
                 lddqu_semantic_before;
         const bool generic_lddqu_vlddqu_native_ok =
@@ -45886,7 +50007,8 @@ std::string ExerciseTranslationEngineJson() {
             },
             [](const LsxMachineImage&, const std::array<std::uint8_t, 128>&) {
                 return true;
-            });
+            },
+            LocalJitTier::Tier1);
         const bool generic_wide_hot_v5_simd_counter_ok =
             g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) ==
                 wide_hot_v5_fast_before + 15u &&
@@ -45933,7 +50055,8 @@ std::string ExerciseTranslationEngineJson() {
             },
             [](const LsxMachineImage&, const std::array<std::uint8_t, 128>&) {
                 return true;
-            });
+            },
+            LocalJitTier::Tier1);
         const std::array<std::uint8_t, 60> generic_post_load_v6_convert = {
             0xc4, 0xe2, 0x7d, 0x24, 0xc2,
             0xc4, 0xe2, 0x7d, 0x25, 0xcb,
@@ -45966,7 +50089,8 @@ std::string ExerciseTranslationEngineJson() {
             },
             [](const LsxMachineImage&, const std::array<std::uint8_t, 128>&) {
                 return true;
-            });
+            },
+            LocalJitTier::Tier1);
         const std::uint64_t post_load_v6_fast_delta =
             g_jit_native_simd_fast_instructions.load(std::memory_order_relaxed) -
             post_load_v6_fast_before;
@@ -46186,12 +50310,114 @@ std::string ExerciseTranslationEngineJson() {
         const std::uint64_t codec_simd_semantic_before =
             g_jit_native_simd_semantic_instructions.load(std::memory_order_relaxed);
 
+        const std::array<std::array<std::uint8_t, 11>, 3>
+            generic_vcvtsi_aliases = {{
+                {0xc4, 0xc1, 0x6a, 0x2a, 0xc1,
+                 0xc5, 0xfa, 0x7f, 0x03, 0xeb, 0x00},
+                {0xc4, 0xc1, 0x7a, 0x2a, 0xc1,
+                 0xc5, 0xfa, 0x7f, 0x03, 0xeb, 0x00},
+                {0xc4, 0xc1, 0xeb, 0x2a, 0xc1,
+                 0xc5, 0xfa, 0x7f, 0x03, 0xeb, 0x00},
+            }};
+        bool generic_vcvtsi_alias_native_ok = true;
+        {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            for (std::size_t alias = 0;
+                 alias < generic_vcvtsi_aliases.size(); ++alias) {
+                generic_vcvtsi_alias_native_ok &=
+                    run_generic_simd_case(
+                        generic_vcvtsi_aliases[alias], 3, 1,
+                        [alias](LsxMachineImage& state,
+                                std::array<std::uint8_t, 128>& memory) {
+                            state.rflags = 0x246u;
+                            state.mxcsr = 0x1f80u;
+                            WriteGuestGpr64(
+                                state, LsxGpr::R9,
+                                alias == 2
+                                    ? UINT64_C(0x8000000123456789)
+                                    : UINT64_C(0x81234567));
+                            WriteGuestGpr64(
+                                state, LsxGpr::Rbx,
+                                reinterpret_cast<std::uint64_t>(
+                                    memory.data() + 64));
+                            for (std::size_t byte = 0; byte < 16; ++byte) {
+                                state.ymm[0][byte] =
+                                    static_cast<std::uint8_t>(
+                                        0x21u + alias * 13u + byte);
+                                state.ymm[2][byte] =
+                                    static_cast<std::uint8_t>(
+                                        0x91u + alias * 11u + byte);
+                            }
+                        },
+                        [](const LsxMachineImage&,
+                           const std::array<std::uint8_t, 128>&) {
+                            return true;
+                        },
+                        LocalJitTier::Tier1, "vcvtsi");
+            }
+        }
+
+        const std::array<std::array<std::uint8_t, 12>, 4>
+            generic_vinsertps_aliases = {{
+                {0xc4, 0xe3, 0x69, 0x21, 0xc1, 0x14,
+                 0xc5, 0xfa, 0x7f, 0x03, 0xeb, 0x00},
+                {0xc4, 0xe3, 0x69, 0x21, 0xc0, 0x14,
+                 0xc5, 0xfa, 0x7f, 0x03, 0xeb, 0x00},
+                {0xc4, 0xe3, 0x79, 0x21, 0xc1, 0x14,
+                 0xc5, 0xfa, 0x7f, 0x03, 0xeb, 0x00},
+                {0xc4, 0xe3, 0x69, 0x21, 0x00, 0x14,
+                 0xc5, 0xfa, 0x7f, 0x03, 0xeb, 0x00},
+            }};
+        bool generic_vinsertps_alias_native_ok = true;
+        {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            for (std::size_t alias = 0;
+                 alias < generic_vinsertps_aliases.size(); ++alias) {
+                generic_vinsertps_alias_native_ok &=
+                    run_generic_simd_case(
+                        generic_vinsertps_aliases[alias], 3, 1,
+                        [alias](LsxMachineImage& state,
+                                std::array<std::uint8_t, 128>& memory) {
+                            state.rflags = 0x246u;
+                            state.mxcsr = 0x1f80u;
+                            WriteGuestGpr64(
+                                state, LsxGpr::Rax,
+                                reinterpret_cast<std::uint64_t>(
+                                    memory.data()));
+                            WriteGuestGpr64(
+                                state, LsxGpr::Rbx,
+                                reinterpret_cast<std::uint64_t>(
+                                    memory.data() + 64));
+                            for (std::size_t byte = 0; byte < 16; ++byte) {
+                                memory[byte] = static_cast<std::uint8_t>(
+                                    0x11u + alias * 17u + byte);
+                                state.ymm[0][byte] =
+                                    static_cast<std::uint8_t>(
+                                        0x31u + alias * 13u + byte);
+                                state.ymm[1][byte] =
+                                    static_cast<std::uint8_t>(
+                                        0x71u + alias * 11u + byte);
+                                state.ymm[2][byte] =
+                                    static_cast<std::uint8_t>(
+                                        0xb1u + alias * 7u + byte);
+                            }
+                        },
+                        [](const LsxMachineImage&,
+                           const std::array<std::uint8_t, 128>&) {
+                            return true;
+                        },
+                        LocalJitTier::Tier1, "vinsertps");
+            }
+        }
+
         const std::array<std::uint8_t, 11> generic_vpshufd_ymm = {
             0xc5, 0xfd, 0x70, 0xc1, 0x1b,
             0xc5, 0xfe, 0x7f, 0x00,
             0xeb, 0x00,
         };
-        const bool generic_vpshufd_ymm_native_ok = run_generic_simd_case(
+        const bool generic_vpshufd_ymm_native_ok = [&] {
+            const ScopedJitSelfTestProductionDirect production_direct_scope;
+            return run_generic_simd_case(
             generic_vpshufd_ymm, 3, 1,
             [](LsxMachineImage& state, std::array<std::uint8_t, 128>& memory) {
                 state.rflags = 0xad7u;
@@ -46215,7 +50441,9 @@ std::string ExerciseTranslationEngineJson() {
                     }
                 }
                 return state.rflags == 0xad7u && state.mxcsr == 0x5f80u;
-            });
+            },
+            LocalJitTier::Tier1, "vpshufd");
+        }();
 
         const std::array<std::uint8_t, 11> generic_pshufd_memory = {
             0x66, 0x0f, 0x70, 0x00, 0x1b,
@@ -46257,6 +50485,16 @@ std::string ExerciseTranslationEngineJson() {
                 }
                 return state.rflags == 0x246u && state.mxcsr == 0x1f80u;
             });
+        JitLog("[EXECUTOR_JIT_TIER1_SIMD_SELFTEST] whole=%d wide=%d "
+               "convert=%d vcvtsi=%d vinsertps=%d vpshufd=%d "
+               "pshufdMemory=%d",
+               generic_simd_ymm_native_ok ? 1 : 0,
+               generic_wide_hot_v5_simd_result_ok ? 1 : 0,
+               generic_post_load_v6_convert_result_ok ? 1 : 0,
+               generic_vcvtsi_alias_native_ok ? 1 : 0,
+               generic_vinsertps_alias_native_ok ? 1 : 0,
+               generic_vpshufd_ymm_native_ok ? 1 : 0,
+               generic_pshufd_memory_native_ok ? 1 : 0);
 
         const std::array<std::uint8_t, 39> generic_packed_q_shifts = {
             0xc5, 0xfd, 0x73, 0xf1, 0x08,
@@ -48471,6 +52709,8 @@ std::string ExerciseTranslationEngineJson() {
         emit_number("genericVectorKernelNativeNs", vector_kernel_native_ns);
         emit_number("genericVectorKernelSpeedupMilli", vector_kernel_speedup_milli);
         emit_flag("genericLddquVlddquNativeOk", generic_lddqu_vlddqu_native_ok);
+        emit_number("genericWholeTransferFailureMask",
+                    generic_whole_transfer_failure_mask);
         emit_flag("genericLddquVlddquResultOk", generic_lddqu_vlddqu_result_ok);
         emit_flag("genericLddquVlddquCounterOk", generic_lddqu_vlddqu_counter_ok);
         emit_flag("genericMaskmovdquNativeOk", generic_maskmovdqu_native_ok);
@@ -48511,7 +52751,12 @@ std::string ExerciseTranslationEngineJson() {
         emit_flag("genericTheoraIdctSimdNativeOk", generic_theora_idct_simd_native_ok);
         emit_flag("genericTheoraIdctSimdResultOk", generic_theora_idct_simd_result_ok);
         emit_flag("genericTheoraIdctSimdCounterOk", generic_theora_idct_simd_counter_ok);
+        emit_flag("genericVcvtsiAliasNativeOk", generic_vcvtsi_alias_native_ok);
+        emit_number("genericVcvtsiFailureMask", generic_vcvtsi_failure_mask);
+        emit_flag("genericVinsertpsAliasNativeOk", generic_vinsertps_alias_native_ok);
+        emit_number("genericVinsertpsFailureMask", generic_vinsertps_failure_mask);
         emit_flag("genericVpshufdYmmNativeOk", generic_vpshufd_ymm_native_ok);
+        emit_number("genericVpshufdFailureMask", generic_vpshufd_failure_mask);
         emit_flag("genericPshufdMemoryNativeOk", generic_pshufd_memory_native_ok);
         emit_flag("genericPackedQShiftNativeOk", generic_packed_q_shift_native_ok);
         emit_flag("genericMovqTransferNativeOk", generic_movq_transfer_native_ok);
@@ -48718,6 +52963,34 @@ void ConfigureTieredJit(const bool enabled,
 
 void ConfigureFastGuestMemory(const bool enabled) noexcept {
     g_fast_guest_memory_enabled.store(enabled, std::memory_order_release);
+}
+
+void ConfigureRelaxedFpFusion(const bool enabled) noexcept {
+    g_relaxed_fp_fusion_enabled.store(enabled, std::memory_order_release);
+}
+
+void ConfigureHostFlagM(const bool enabled) noexcept {
+    g_host_flagm_enabled.store(enabled, std::memory_order_release);
+}
+
+bool HostFlagMEnabled() noexcept {
+    return JitHostHasFlagM();
+}
+
+void ConfigureHostSve2(const bool enabled) noexcept {
+    g_host_sve2_enabled.store(enabled, std::memory_order_release);
+}
+
+bool HostSve2Enabled() noexcept {
+    return JitHostHasSve2();
+}
+
+void ConfigureHostRcpc(const bool enabled) noexcept {
+    g_host_rcpc_enabled.store(enabled, std::memory_order_release);
+}
+
+bool HostRcpcEnabled() noexcept {
+    return JitHostHasRcpc();
 }
 
 }

@@ -95,6 +95,8 @@ struct JitIrCacheRecord {
     std::vector<JitNativeSegment> native_segments{};
     std::uint32_t entry_segment_index = kJitNativeNoSegment;
     std::uint32_t direct_segment_index = kJitNativeNoSegment;
+    std::uint32_t static_gpr_segment_index = kJitNativeNoSegment;
+    std::uint32_t static_gpr_entry_offset = 0;
     std::uint32_t native_flags = 0;
     bool loaded_ir_validated = false;
     std::uint64_t loaded_order = 0;

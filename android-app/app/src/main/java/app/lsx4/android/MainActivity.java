@@ -4221,10 +4221,20 @@ public class MainActivity extends Activity {
                 SettingsActivity.K_AUDIO_SIMD, true);
         boolean fastGuestMemory = preferences.getBoolean(
                 SettingsActivity.K_FAST_GUEST_MEMORY, false);
+        boolean relaxedFpFusion = preferences.getBoolean(
+                SettingsActivity.K_RELAXED_FP_FUSION, false);
+        boolean androidPerformanceHint = preferences.getBoolean(
+                SettingsActivity.K_ANDROID_PERFORMANCE_HINT, true);
+        boolean hostFlagM = preferences.getBoolean(
+                SettingsActivity.K_HOST_FLAGM, true);
+        boolean hostSve2 = preferences.getBoolean(
+                SettingsActivity.K_HOST_SVE2, true);
+        boolean hostRcpc = preferences.getBoolean(
+                SettingsActivity.K_HOST_RCPC, true);
         if (jitTraceCompilation) {
             tieredJit = true;
         }
-        boolean[] requested = new boolean[14];
+        boolean[] requested = new boolean[19];
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH] = armGpuFastPath;
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2] =
                 coarseFragment2x2;
@@ -4247,6 +4257,13 @@ public class MainActivity extends Activity {
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_AUDIO_SIMD] = audioSimd;
         requested[RuntimeBridge.MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY] =
                 fastGuestMemory;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_RELAXED_FP_FUSION] =
+                relaxedFpFusion;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_ANDROID_PERFORMANCE_HINT] =
+                androidPerformanceHint;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_HOST_FLAGM] = hostFlagM;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_HOST_SVE2] = hostSve2;
+        requested[RuntimeBridge.MANAGED_OPTIMIZATION_HOST_RCPC] = hostRcpc;
 
         // Establish a deterministic A/B baseline before enabling the requested
         // set. Trace must be disabled before Tiered JIT; the final enable phase
@@ -4265,10 +4282,15 @@ public class MainActivity extends Activity {
                 RuntimeBridge.MANAGED_OPTIMIZATION_DISABLE_VK_ROBUSTNESS,
                 RuntimeBridge.MANAGED_OPTIMIZATION_COARSE_FRAGMENT_2X2,
                 RuntimeBridge.MANAGED_OPTIMIZATION_ARM_GPU_FAST_PATH,
-                RuntimeBridge.MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY
+                RuntimeBridge.MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY,
+                RuntimeBridge.MANAGED_OPTIMIZATION_RELAXED_FP_FUSION,
+                RuntimeBridge.MANAGED_OPTIMIZATION_ANDROID_PERFORMANCE_HINT,
+                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_SVE2,
+                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_FLAGM,
+                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_RCPC
         };
-        int[] resetResults = new int[14];
-        int[] finalResults = new int[14];
+        int[] resetResults = new int[19];
+        int[] finalResults = new int[19];
         for (int option : resetOrder) {
             int result = RuntimeBridge.setManagedOptimization(option, false);
             resetResults[option] = result;
@@ -4287,7 +4309,12 @@ public class MainActivity extends Activity {
                 RuntimeBridge.MANAGED_OPTIMIZATION_TIERED_JIT,
                 RuntimeBridge.MANAGED_OPTIMIZATION_JIT_TRACE_COMPILATION,
                 RuntimeBridge.MANAGED_OPTIMIZATION_AUDIO_SIMD,
-                RuntimeBridge.MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY
+                RuntimeBridge.MANAGED_OPTIMIZATION_FAST_GUEST_MEMORY,
+                RuntimeBridge.MANAGED_OPTIMIZATION_RELAXED_FP_FUSION,
+                RuntimeBridge.MANAGED_OPTIMIZATION_ANDROID_PERFORMANCE_HINT,
+                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_FLAGM,
+                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_RCPC,
+                RuntimeBridge.MANAGED_OPTIMIZATION_HOST_SVE2
         };
         for (int option : enableOrder) {
             if (requested[option]) {
@@ -4307,16 +4334,27 @@ public class MainActivity extends Activity {
                 + " adaptiveMobileGpu=" + adaptiveMobileGpu
                 + " audioSimd=" + audioSimd
                 + " fastGuestMemory=" + fastGuestMemory
+                + " relaxedFpFusion=" + relaxedFpFusion
+                + " androidPerformanceHint=" + androidPerformanceHint
+                + " hostFlagM=" + hostFlagM
+                + " hostSve2=" + hostSve2
+                + " hostRcpc=" + hostRcpc
                 + " resetResults=" + resetResults[1] + "/" + resetResults[2] + "/"
                 + resetResults[3] + "/" + resetResults[4] + "/" + resetResults[5] + "/"
                 + resetResults[6] + "/" + resetResults[7] + "/" + resetResults[8] + "/"
                 + resetResults[9] + "/" + resetResults[10] + "/" + resetResults[11]
-                + "/" + resetResults[12] + "/" + resetResults[13]
+                + "/" + resetResults[12] + "/" + resetResults[13] + "/"
+                + resetResults[14] + "/" + resetResults[15] + "/"
+                + resetResults[16] + "/" + resetResults[17] + "/"
+                + resetResults[18]
                 + " finalResults=" + finalResults[1] + "/" + finalResults[2] + "/"
                 + finalResults[3] + "/" + finalResults[4] + "/" + finalResults[5] + "/"
                 + finalResults[6] + "/" + finalResults[7] + "/" + finalResults[8] + "/"
                 + finalResults[9] + "/" + finalResults[10] + "/" + finalResults[11]
-                + "/" + finalResults[12] + "/" + finalResults[13]);
+                + "/" + finalResults[12] + "/" + finalResults[13] + "/"
+                + finalResults[14] + "/" + finalResults[15] + "/"
+                + finalResults[16] + "/" + finalResults[17] + "/"
+                + finalResults[18]);
     }
 
     private void initializeRuntime() {

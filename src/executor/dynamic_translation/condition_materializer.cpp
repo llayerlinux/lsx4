@@ -183,6 +183,12 @@ void EmitSharedFrameReturn(Xbyak_aarch64::CodeGenerator& code,
         SavedPair{19, 20, 16},
     };
     code.mov(code.x0, result);
+    if (frame_bytes >= 160) {
+        code.ldp(code.d9, code.d10, Xbyak_aarch64::ptr(code.sp, 96));
+        code.ldp(code.d11, code.d12, Xbyak_aarch64::ptr(code.sp, 112));
+        code.ldp(code.d13, code.d14, Xbyak_aarch64::ptr(code.sp, 128));
+        code.ldr(code.d15, Xbyak_aarch64::ptr(code.sp, 144));
+    }
     for (const auto& pair : saved) {
         code.ldp(XReg(pair.first), XReg(pair.second),
                  Xbyak_aarch64::ptr(code.sp, pair.offset));
