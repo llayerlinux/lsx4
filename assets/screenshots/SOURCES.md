@@ -1,25 +1,23 @@
-# Playable gallery image provenance
+# Playable gallery preview provenance
 
-The additions below were matched by the same CUSA/PPSA title ID used by the Vivo playable classification. PlayStation Store links are the official product pages from which the first image marked `SCREENSHOT` was selected. Package images are the title's own `sce_sys/pic1.png` from the installed package.
+Only screenshots captured from LSX4 running on a physical Android device may be used as game previews. Store media, package artwork, covers, and screenshots from unrelated sources are intentionally excluded. An explicit shared placeholder is used when no archived device capture could be verified.
 
-| File | Title ID | Source |
+| Game | Title ID | Preview |
 | --- | --- | --- |
-| `another-world.jpg` | CUSA00602 | Installed package artwork |
-| `axiom-verge-2.jpg` | CUSA29346 | Installed package artwork |
-| `cyber-shadow.jpg` | CUSA24216 | Installed package artwork |
-| `dark-devotion.jpg` | CUSA14657 | [PlayStation Store](https://store.playstation.com/en-us/product/UP5358-CUSA14657_00-DARKDEVOTION0000) |
-| `dead-cells.jpg` | CUSA10484 | Installed package artwork |
-| `dreaming-sarah.jpg` | PPSA02929 | [PlayStation Store](https://store.playstation.com/en-us/product/UP0891-PPSA02929_00-RAGDREAMINGSARAH) |
-| `fight-n-rage.jpg` | CUSA17844 | Installed package artwork |
-| `hillbilly-doomsday.jpg` | CUSA32036 | [PlayStation Store](https://store.playstation.com/en-gb/product/EP1661-CUSA32036_00-SYPS4HILLBILLYDO) |
-| `inside.jpg` | CUSA02754 | [PlayStation Store](https://store.playstation.com/en-gb/product/EP2054-CUSA02754_00-INSIDE0000000000) |
-| `lucy-dreaming.jpg` | CUSA46929 | [PlayStation Store](https://store.playstation.com/en-gb/product/EP8709-CUSA46929_00-0776220275080038) |
-| `medievil.jpg` | CUSA42759 | Installed PS1 Classic package artwork |
-| `not-a-hero.jpg` | CUSA02996 | [PlayStation Store](https://store.playstation.com/en-us/product/UP3643-CUSA02996_00-NOTAHEROUS000001) |
-| `nuclear-throne.jpg` | CUSA03902 | [PlayStation Store](https://store.playstation.com/en-us/product/UP1491-CUSA03902_00-PS4NUCLEARTHRONE) |
-| `replay-vhs-is-not-dead.jpg` | CUSA02765 | [PlayStation Store](https://store.playstation.com/en-us/product/UP4115-CUSA02765_00-SCEAREPLAYVHSISN) |
-| `spider-rite-of-the-shrouded-moon.jpg` | CUSA02473 | Installed package artwork |
-| `toto-temple-deluxe.jpg` | CUSA01775 | [PlayStation Store](https://store.playstation.com/en-us/product/UP0384-CUSA01775_00-TOTOTEMPLEDELUXE) |
-| `void-terrarium-plus-plus.jpg` | PPSA03061 | [PlayStation Store](https://store.playstation.com/en-us/product/UP1063-PPSA03061_00-VOIDTERRARIUMPS5) |
-
-The images remain the property of their respective publishers and are used here only to identify tested compatibility entries.
+| Another World | CUSA00602 | Placeholder |
+| Axiom Verge 2 | CUSA29346 | Placeholder |
+| Cyber Shadow | CUSA24216 | LSX4 device capture |
+| Dark Devotion | CUSA14657 | Placeholder |
+| Dead Cells | CUSA10484 | LSX4 Vivo device capture |
+| Dreaming Sarah | PPSA02929 | LSX4 device capture |
+| Fight'N Rage | CUSA17844 | Placeholder |
+| Hillbilly Doomsday | CUSA32036 | Placeholder |
+| INSIDE | CUSA02754 | LSX4 device capture |
+| Lucy Dreaming | CUSA46929 | Placeholder |
+| MediEvil | CUSA42759 | LSX4 device capture |
+| NOT A HERO | CUSA02996 | Placeholder |
+| Nuclear Throne | CUSA03902 | Placeholder |
+| REPLAY: VHS is not dead | CUSA02765 | Placeholder |
+| Spider: Rite of the Shrouded Moon | CUSA02473 | Placeholder |
+| Toto Temple Deluxe | CUSA01775 | Placeholder |
+| void tRrLM();++ //Void Terrarium++ | PPSA03061 | LSX4 device capture |
