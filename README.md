@@ -61,28 +61,82 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/minit.jpg" alt="Minit running in LSX4"><br><sub><b>Minit</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/the-binding-of-isaac-rebirth.jpg" alt="The Binding of Isaac: Rebirth running in LSX4"><br><sub><b>The Binding of Isaac: Rebirth</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/another-world.jpg" alt="Another World"><br><sub><b>Another World</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/axiom-verge-2.jpg" alt="Axiom Verge 2"><br><sub><b>Axiom Verge 2</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/cyber-shadow.jpg" alt="Cyber Shadow"><br><sub><b>Cyber Shadow</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dark-devotion.jpg" alt="Dark Devotion"><br><sub><b>Dark Devotion</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/dead-cells.jpg" alt="Dead Cells"><br><sub><b>Dead Cells</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dreaming-sarah.jpg" alt="Dreaming Sarah"><br><sub><b>Dreaming Sarah</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/fight-n-rage.jpg" alt="Fight'N Rage"><br><sub><b>Fight'N Rage</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/hillbilly-doomsday.jpg" alt="Hillbilly Doomsday"><br><sub><b>Hillbilly Doomsday</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/inside.jpg" alt="INSIDE"><br><sub><b>INSIDE</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/lucy-dreaming.jpg" alt="Lucy Dreaming"><br><sub><b>Lucy Dreaming</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/medievil.jpg" alt="MediEvil"><br><sub><b>MediEvil</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/not-a-hero.jpg" alt="NOT A HERO"><br><sub><b>NOT A HERO</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/nuclear-throne.jpg" alt="Nuclear Throne"><br><sub><b>Nuclear Throne</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/replay-vhs-is-not-dead.jpg" alt="REPLAY: VHS is not dead"><br><sub><b>REPLAY: VHS is not dead</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/spider-rite-of-the-shrouded-moon.jpg" alt="Spider: Rite of the Shrouded Moon"><br><sub><b>Spider: Rite of the Shrouded Moon</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/toto-temple-deluxe.jpg" alt="Toto Temple Deluxe"><br><sub><b>Toto Temple Deluxe</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2"><img src="assets/screenshots/void-terrarium-plus-plus.jpg" width="50%" alt="void tRrLM();++ //Void Terrarium++"><br><sub><b>void tRrLM();++ //Void Terrarium++</b></sub></td>
+  </tr>
 </table>
+
+The table mirrors the games marked **Playable** in the Vivo test-device library on September 1, 2026. Each added gallery image was matched against the same CUSA/PPSA title ID; where an official PlayStation Store gameplay screenshot was unavailable, artwork from that exact installed title package was used. [Image provenance](assets/screenshots/SOURCES.md) records the mapping.
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
-| Game | Playable | Notes |
-| --- | :---: | --- |
-| Bloodborne | ✅ | Gameplay is temporarily limited to 7 FPS. |
-| Deltarune Chapters 1 & 2 | ✅ | |
-| Downwell | ✅ | |
-| Hotline Miami 2: Wrong Number | ✅ | |
-| Hyper Light Drifter | ✅ | |
-| Just Shapes & Beats | ✅ | |
-| Limbo | ✅ | |
-| Minit | ✅ | |
-| Nidhogg | ✅ | |
-| Nidhogg 2 | ✅ | |
-| Owlboy | ✅ | |
-| Rain World | ✅ | |
-| Shovel Knight | ✅ | |
-| Sonic Mania | ✅ | |
-| The Binding of Isaac: Rebirth | ✅ | |
-| Undertale | ✅ | |
+| Game | Title ID | Playable | Notes |
+| --- | --- | :---: | --- |
+| Another World | CUSA00602 | ✅ | |
+| Axiom Verge 2 | CUSA29346 | ✅ | |
+| Bloodborne | CUSA03173 | ✅ | Performance varies by device, scene, and configuration. |
+| Cyber Shadow | CUSA24216 | ✅ | |
+| Dark Devotion | CUSA14657 | ✅ | |
+| Dead Cells | CUSA10484 | ✅ | |
+| Deltarune Chapters 1 & 2 | CUSA15250 | ✅ | |
+| Downwell | CUSA04550 | ✅ | |
+| Dreaming Sarah | PPSA02929 | ✅ | PS5 title. |
+| Fight'N Rage | CUSA17844 | ✅ | |
+| Hillbilly Doomsday | CUSA32036 | ✅ | |
+| Hotline Miami 2: Wrong Number | CUSA00368 | ✅ | |
+| Hyper Light Drifter | CUSA04570 | ✅ | |
+| INSIDE | CUSA02754 | ✅ | |
+| Just Shapes & Beats | CUSA10349 | ✅ | |
+| Limbo | CUSA01664 | ✅ | |
+| Lucy Dreaming | CUSA46929 | ✅ | |
+| MediEvil | CUSA42759 | ✅ | 1998 PS1 Classic packaged for PS4. |
+| Minit | CUSA09747 | ✅ | |
+| Nidhogg | CUSA00920 | ✅ | |
+| Nidhogg 2 | CUSA07640 | ✅ | |
+| NOT A HERO | CUSA02996 | ✅ | |
+| Nuclear Throne | CUSA03902 | ✅ | |
+| Owlboy | CUSA09920 | ✅ | |
+| Rain World | CUSA05667 | ✅ | |
+| REPLAY: VHS is not dead | CUSA02765 | ✅ | |
+| Shovel Knight | CUSA01867 | ✅ | |
+| Sonic Mania | CUSA07010 | ✅ | |
+| Spider: Rite of the Shrouded Moon | CUSA02473 | ✅ | |
+| The Binding of Isaac: Rebirth | CUSA00792 | ✅ | |
+| Toto Temple Deluxe | CUSA01775 | ✅ | |
+| Undertale | CUSA09415 | ✅ | |
+| void tRrLM();++ //Void Terrarium++ | PPSA03061 | ✅ | PS5 title. |
 
 ## Contributing
 
