@@ -62,43 +62,43 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/the-binding-of-isaac-rebirth.jpg" alt="The Binding of Isaac: Rebirth running in LSX4"><br><sub><b>The Binding of Isaac: Rebirth</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Another World"><br><sub><b>Another World</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Axiom Verge 2"><br><sub><b>Axiom Verge 2</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/another-world.jpg" alt="Another World running in LSX4 on Vivo"><br><sub><b>Another World</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/axiom-verge-2.jpg" alt="Axiom Verge 2 running in LSX4 on Vivo"><br><sub><b>Axiom Verge 2</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/cyber-shadow.jpg" alt="Cyber Shadow"><br><sub><b>Cyber Shadow</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Dark Devotion"><br><sub><b>Dark Devotion</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dark-devotion.jpg" alt="Dark Devotion running in LSX4 on Vivo"><br><sub><b>Dark Devotion</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/dead-cells.jpg" alt="Dead Cells"><br><sub><b>Dead Cells</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/dreaming-sarah.jpg" alt="Dreaming Sarah"><br><sub><b>Dreaming Sarah</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Fight'N Rage"><br><sub><b>Fight'N Rage</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Hillbilly Doomsday"><br><sub><b>Hillbilly Doomsday</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/fight-n-rage.jpg" alt="Fight'N Rage running in LSX4 on Vivo"><br><sub><b>Fight'N Rage</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/hillbilly-doomsday.jpg" alt="Hillbilly Doomsday running in LSX4 on Vivo"><br><sub><b>Hillbilly Doomsday</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/inside.jpg" alt="INSIDE"><br><sub><b>INSIDE</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Lucy Dreaming"><br><sub><b>Lucy Dreaming</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/lucy-dreaming.jpg" alt="Lucy Dreaming running in LSX4 on Vivo"><br><sub><b>Lucy Dreaming</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/medievil.jpg" alt="MediEvil"><br><sub><b>MediEvil</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for NOT A HERO"><br><sub><b>NOT A HERO</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/not-a-hero.jpg" alt="NOT A HERO running in LSX4 on Vivo"><br><sub><b>NOT A HERO</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Nuclear Throne"><br><sub><b>Nuclear Throne</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for REPLAY: VHS is not dead"><br><sub><b>REPLAY: VHS is not dead</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/nuclear-throne.jpg" alt="Nuclear Throne running in LSX4 on Vivo"><br><sub><b>Nuclear Throne</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/replay-vhs-is-not-dead.jpg" alt="REPLAY: VHS is not dead running in LSX4 on Vivo"><br><sub><b>REPLAY: VHS is not dead</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Spider: Rite of the Shrouded Moon"><br><sub><b>Spider: Rite of the Shrouded Moon</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/device-preview-unavailable.svg" alt="Device preview unavailable for Toto Temple Deluxe"><br><sub><b>Toto Temple Deluxe</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/spider-rite-of-the-shrouded-moon.jpg" alt="Spider: Rite of the Shrouded Moon running in LSX4 on Vivo"><br><sub><b>Spider: Rite of the Shrouded Moon</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/toto-temple-deluxe.jpg" alt="Toto Temple Deluxe running in LSX4 on Vivo"><br><sub><b>Toto Temple Deluxe</b></sub></td>
   </tr>
   <tr>
     <td align="center" colspan="2"><img src="assets/screenshots/void-terrarium-plus-plus.jpg" width="50%" alt="void tRrLM();++ //Void Terrarium++"><br><sub><b>void tRrLM();++ //Void Terrarium++</b></sub></td>
   </tr>
 </table>
 
-The table mirrors the games marked **Playable** in the Vivo test-device library on September 1, 2026. Gallery previews are limited to screenshots captured from LSX4 on a physical Android device; entries without an archived device capture use an explicit placeholder. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
+The table mirrors the games marked **Playable** in the Vivo test-device library on September 1, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
