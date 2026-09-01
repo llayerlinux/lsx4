@@ -14,6 +14,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Fight'N Rage | LSX4 Vivo device capture |
 | Hillbilly Doomsday | LSX4 Vivo device capture |
 | INSIDE | LSX4 device capture |
+| Jazzpunk: Director's Cut | LSX4 Vivo device capture |
 | Lucy Dreaming | LSX4 Vivo device capture |
 | MediEvil | LSX4 Vivo device capture |
 | NOT A HERO | LSX4 Vivo device capture |
