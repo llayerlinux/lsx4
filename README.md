@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (37 playable games)
+### Device previews (38 playable games)
 
 <table>
   <tr>
@@ -105,13 +105,13 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/jazzpunk-directors-cut.jpg" alt="Jazzpunk: Director's Cut running in LSX4 on Vivo"><br><sub><b>Jazzpunk: Director's Cut</b></sub></td>
-    <td width="50%"></td>
+    <td align="center" width="50%"><img src="assets/screenshots/might-and-magic-clash-of-heroes.jpg" alt="Might &amp; Magic: Clash of Heroes running in LSX4 on Vivo"><br><sub><b>Might &amp; Magic: Clash of Heroes</b></sub></td>
   </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library on September 1, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (37 games)
+### Playable compatibility list (38 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -137,6 +137,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Limbo | ✅ | |
 | Lucy Dreaming | ✅ | |
 | MediEvil | ✅ | 1998 PS1 Classic packaged for PS4. |
+| Might & Magic: Clash of Heroes | ✅ | |
 | Minit | ✅ | |
 | Nidhogg | ✅ | |
 | Nidhogg 2 | ✅ | |

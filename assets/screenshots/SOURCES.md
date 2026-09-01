@@ -17,6 +17,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Jazzpunk: Director's Cut | LSX4 Vivo device capture |
 | Lucy Dreaming | LSX4 Vivo device capture |
 | MediEvil | LSX4 Vivo device capture |
+| Might & Magic: Clash of Heroes | LSX4 Vivo device capture |
 | NOT A HERO | LSX4 Vivo device capture |
 | Nubla | LSX4 Vivo device capture |
 | Nuclear Throne | LSX4 Vivo device capture |
