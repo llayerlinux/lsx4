@@ -4,6 +4,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 
 | Game | Preview |
 | --- | --- |
+| A Short Hike | LSX4 Vivo device capture |
 | Another World | LSX4 Vivo device capture |
 | Axiom Verge 2 | LSX4 Vivo device capture |
 | Cosmophony | LSX4 Vivo device capture |

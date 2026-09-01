@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (39 playable games)
+### Device previews (40 playable games)
 
 <table>
   <tr>
@@ -108,18 +108,20 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/might-and-magic-clash-of-heroes.jpg" alt="Might &amp; Magic: Clash of Heroes running in LSX4 on Vivo"><br><sub><b>Might &amp; Magic: Clash of Heroes</b></sub></td>
   </tr>
   <tr>
-    <td align="center" colspan="2"><img src="assets/screenshots/old-mans-journey.png" width="50%" alt="Old Man's Journey running in LSX4 on Vivo"><br><sub><b>Old Man's Journey</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/old-mans-journey.png" alt="Old Man's Journey running in LSX4 on Vivo"><br><sub><b>Old Man's Journey</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/a-short-hike.jpg" alt="A Short Hike running in LSX4 on Vivo"><br><sub><b>A Short Hike</b></sub></td>
   </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library on September 1, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (39 games)
+### Playable compatibility list (40 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
 | Game | Playable | Notes |
 | --- | :---: | --- |
+| A Short Hike | ✅ | Vivo; title-specific Safe FEX blocks, exact multiblock, and full Unity worker cohort. |
 | Another World | ✅ | |
 | Axiom Verge 2 | ✅ | |
 | Bloodborne | ✅ | Performance varies by device, scene, and configuration. |
