@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (34 playable games)
+### Device previews (36 playable games)
 
 <table>
   <tr>
@@ -99,11 +99,15 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/toto-temple-deluxe.jpg" alt="Toto Temple Deluxe running in LSX4 on Vivo"><br><sub><b>Toto Temple Deluxe</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/void-terrarium-plus-plus.jpg" alt="void tRrLM();++ //Void Terrarium++ running in LSX4 on Vivo"><br><sub><b>void tRrLM();++ //Void Terrarium++</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/cosmophony.jpg" alt="Cosmophony running in LSX4 on Vivo"><br><sub><b>Cosmophony</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/nubla.jpg" alt="Nubla running in LSX4 on Vivo"><br><sub><b>Nubla</b></sub></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library on September 1, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (34 games)
+### Playable compatibility list (36 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -112,6 +116,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Another World | ✅ | |
 | Axiom Verge 2 | ✅ | |
 | Bloodborne | ✅ | Performance varies by device, scene, and configuration. |
+| Cosmophony | ✅ | |
 | Cyber Shadow | ✅ | |
 | Dark Devotion | ✅ | |
 | Dead Cells | ✅ | |
@@ -131,6 +136,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Nidhogg | ✅ | |
 | Nidhogg 2 | ✅ | |
 | NOT A HERO | ✅ | |
+| Nubla | ✅ | |
 | Nuclear Throne | ✅ | |
 | Owlboy | ✅ | |
 | Perfect Universe | ✅ | |

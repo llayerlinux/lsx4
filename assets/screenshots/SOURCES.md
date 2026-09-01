@@ -6,6 +6,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | --- | --- |
 | Another World | LSX4 Vivo device capture |
 | Axiom Verge 2 | LSX4 Vivo device capture |
+| Cosmophony | LSX4 Vivo device capture |
 | Cyber Shadow | LSX4 Vivo device capture |
 | Dark Devotion | LSX4 Vivo device capture |
 | Dead Cells | LSX4 Vivo device capture |
@@ -16,6 +17,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Lucy Dreaming | LSX4 Vivo device capture |
 | MediEvil | LSX4 Vivo device capture |
 | NOT A HERO | LSX4 Vivo device capture |
+| Nubla | LSX4 Vivo device capture |
 | Nuclear Throne | LSX4 Vivo device capture |
 | Perfect Universe | LSX4 Vivo device capture |
 | REPLAY: VHS is not dead | LSX4 Vivo device capture |
