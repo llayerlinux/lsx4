@@ -28,6 +28,8 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
+### Device previews (34 playable games)
+
 <table>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/bloodborne.jpg" alt="Bloodborne running in LSX4"><br><sub><b>Bloodborne</b></sub></td>
@@ -66,12 +68,12 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/axiom-verge-2.jpg" alt="Axiom Verge 2 running in LSX4 on Vivo"><br><sub><b>Axiom Verge 2</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/cyber-shadow.jpg" alt="Cyber Shadow"><br><sub><b>Cyber Shadow</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/cyber-shadow.jpg" alt="Cyber Shadow running in LSX4 on Vivo"><br><sub><b>Cyber Shadow</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/dark-devotion.jpg" alt="Dark Devotion running in LSX4 on Vivo"><br><sub><b>Dark Devotion</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/dead-cells.jpg" alt="Dead Cells"><br><sub><b>Dead Cells</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/dreaming-sarah.jpg" alt="Dreaming Sarah"><br><sub><b>Dreaming Sarah</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dreaming-sarah.jpg" alt="Dreaming Sarah running in LSX4 on Vivo"><br><sub><b>Dreaming Sarah</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/fight-n-rage.jpg" alt="Fight'N Rage running in LSX4 on Vivo"><br><sub><b>Fight'N Rage</b></sub></td>
@@ -82,61 +84,65 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/lucy-dreaming.jpg" alt="Lucy Dreaming running in LSX4 on Vivo"><br><sub><b>Lucy Dreaming</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/medievil.jpg" alt="MediEvil"><br><sub><b>MediEvil</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/medievil.jpg" alt="MediEvil running in LSX4 on Vivo"><br><sub><b>MediEvil</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/not-a-hero.jpg" alt="NOT A HERO running in LSX4 on Vivo"><br><sub><b>NOT A HERO</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/nuclear-throne.jpg" alt="Nuclear Throne running in LSX4 on Vivo"><br><sub><b>Nuclear Throne</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/perfect-universe.jpg" alt="Perfect Universe running in LSX4 on Vivo"><br><sub><b>Perfect Universe</b></sub></td>
+  </tr>
+  <tr>
     <td align="center" width="50%"><img src="assets/screenshots/replay-vhs-is-not-dead.jpg" alt="REPLAY: VHS is not dead running in LSX4 on Vivo"><br><sub><b>REPLAY: VHS is not dead</b></sub></td>
-  </tr>
-  <tr>
     <td align="center" width="50%"><img src="assets/screenshots/spider-rite-of-the-shrouded-moon.jpg" alt="Spider: Rite of the Shrouded Moon running in LSX4 on Vivo"><br><sub><b>Spider: Rite of the Shrouded Moon</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/toto-temple-deluxe.jpg" alt="Toto Temple Deluxe running in LSX4 on Vivo"><br><sub><b>Toto Temple Deluxe</b></sub></td>
   </tr>
   <tr>
-    <td align="center" colspan="2"><img src="assets/screenshots/void-terrarium-plus-plus.jpg" width="50%" alt="void tRrLM();++ //Void Terrarium++"><br><sub><b>void tRrLM();++ //Void Terrarium++</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/toto-temple-deluxe.jpg" alt="Toto Temple Deluxe running in LSX4 on Vivo"><br><sub><b>Toto Temple Deluxe</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/void-terrarium-plus-plus.jpg" alt="void tRrLM();++ //Void Terrarium++ running in LSX4 on Vivo"><br><sub><b>void tRrLM();++ //Void Terrarium++</b></sub></td>
   </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library on September 1, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
+### Playable compatibility list (34 games)
+
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
-| Game | Title ID | Playable | Notes |
-| --- | --- | :---: | --- |
-| Another World | CUSA00602 | ✅ | |
-| Axiom Verge 2 | CUSA29346 | ✅ | |
-| Bloodborne | CUSA03173 | ✅ | Performance varies by device, scene, and configuration. |
-| Cyber Shadow | CUSA24216 | ✅ | |
-| Dark Devotion | CUSA14657 | ✅ | |
-| Dead Cells | CUSA10484 | ✅ | |
-| Deltarune Chapters 1 & 2 | CUSA15250 | ✅ | |
-| Downwell | CUSA04550 | ✅ | |
-| Dreaming Sarah | PPSA02929 | ✅ | PS5 title. |
-| Fight'N Rage | CUSA17844 | ✅ | |
-| Hillbilly Doomsday | CUSA32036 | ✅ | |
-| Hotline Miami 2: Wrong Number | CUSA00368 | ✅ | |
-| Hyper Light Drifter | CUSA04570 | ✅ | |
-| INSIDE | CUSA02754 | ✅ | |
-| Just Shapes & Beats | CUSA10349 | ✅ | |
-| Limbo | CUSA01664 | ✅ | |
-| Lucy Dreaming | CUSA46929 | ✅ | |
-| MediEvil | CUSA42759 | ✅ | 1998 PS1 Classic packaged for PS4. |
-| Minit | CUSA09747 | ✅ | |
-| Nidhogg | CUSA00920 | ✅ | |
-| Nidhogg 2 | CUSA07640 | ✅ | |
-| NOT A HERO | CUSA02996 | ✅ | |
-| Nuclear Throne | CUSA03902 | ✅ | |
-| Owlboy | CUSA09920 | ✅ | |
-| Rain World | CUSA05667 | ✅ | |
-| REPLAY: VHS is not dead | CUSA02765 | ✅ | |
-| Shovel Knight | CUSA01867 | ✅ | |
-| Sonic Mania | CUSA07010 | ✅ | |
-| Spider: Rite of the Shrouded Moon | CUSA02473 | ✅ | |
-| The Binding of Isaac: Rebirth | CUSA00792 | ✅ | |
-| Toto Temple Deluxe | CUSA01775 | ✅ | |
-| Undertale | CUSA09415 | ✅ | |
-| void tRrLM();++ //Void Terrarium++ | PPSA03061 | ✅ | PS5 title. |
+| Game | Playable | Notes |
+| --- | :---: | --- |
+| Another World | ✅ | |
+| Axiom Verge 2 | ✅ | |
+| Bloodborne | ✅ | Performance varies by device, scene, and configuration. |
+| Cyber Shadow | ✅ | |
+| Dark Devotion | ✅ | |
+| Dead Cells | ✅ | |
+| Deltarune Chapters 1 & 2 | ✅ | |
+| Downwell | ✅ | |
+| Dreaming Sarah | ✅ | PS5 title. |
+| Fight'N Rage | ✅ | |
+| Hillbilly Doomsday | ✅ | |
+| Hotline Miami 2: Wrong Number | ✅ | |
+| Hyper Light Drifter | ✅ | |
+| INSIDE | ✅ | |
+| Just Shapes & Beats | ✅ | |
+| Limbo | ✅ | |
+| Lucy Dreaming | ✅ | |
+| MediEvil | ✅ | 1998 PS1 Classic packaged for PS4. |
+| Minit | ✅ | |
+| Nidhogg | ✅ | |
+| Nidhogg 2 | ✅ | |
+| NOT A HERO | ✅ | |
+| Nuclear Throne | ✅ | |
+| Owlboy | ✅ | |
+| Perfect Universe | ✅ | |
+| Rain World | ✅ | |
+| REPLAY: VHS is not dead | ✅ | |
+| Shovel Knight | ✅ | |
+| Sonic Mania | ✅ | |
+| Spider: Rite of the Shrouded Moon | ✅ | |
+| The Binding of Isaac: Rebirth | ✅ | |
+| Toto Temple Deluxe | ✅ | |
+| Undertale | ✅ | |
+| void tRrLM();++ //Void Terrarium++ | ✅ | PS5 title. |
 
 ## Contributing
 
