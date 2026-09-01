@@ -21,6 +21,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | NOT A HERO | LSX4 Vivo device capture |
 | Nubla | LSX4 Vivo device capture |
 | Nuclear Throne | LSX4 Vivo device capture |
+| Old Man's Journey | LSX4 Vivo device capture |
 | Perfect Universe | LSX4 Vivo device capture |
 | REPLAY: VHS is not dead | LSX4 Vivo device capture |
 | Spider: Rite of the Shrouded Moon | LSX4 Vivo device capture |
