@@ -21,6 +21,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | INSIDE | LSX4 device capture |
 | Islets | LSX4 Vivo device capture |
 | Jazzpunk: Director's Cut | LSX4 Vivo device capture |
+| Lethal League Blaze | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Lucy Dreaming | LSX4 Vivo device capture |
 | Mega Shoot | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | MEGALAN 11 | LSX4 Vivo live gameplay capture, September 3, 2026 |
