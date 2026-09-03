@@ -13,6 +13,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Dead Cells | LSX4 Vivo device capture |
 | Dreaming Sarah | LSX4 Vivo device capture |
 | Fight'N Rage | LSX4 Vivo device capture |
+| GONNER | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Hillbilly Doomsday | LSX4 Vivo device capture |
 | INSIDE | LSX4 device capture |
 | Islets | LSX4 Vivo device capture |
