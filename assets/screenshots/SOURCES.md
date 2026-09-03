@@ -11,6 +11,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Chained Echoes | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Cosmophony | LSX4 Vivo device capture |
 | Cyber Shadow | LSX4 Vivo device capture |
+| Dandara | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Dark Devotion | LSX4 Vivo device capture |
 | Dead Cells | LSX4 Vivo device capture |
 | Dreaming Sarah | LSX4 Vivo device capture |
