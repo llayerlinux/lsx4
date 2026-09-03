@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (48 playable games)
+### Device previews (49 playable games)
 
 <table>
   <tr>
@@ -127,11 +127,15 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/mega-shoot.png" alt="Mega Shoot running in LSX4 on Vivo"><br><sub><b>Mega Shoot</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/retrace-memories-of-death.png" alt="Retrace: Memories of Death running in LSX4 on Vivo"><br><sub><b>Retrace: Memories of Death</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/farlands-journey.png" alt="Farlands Journey running in LSX4 on Vivo"><br><sub><b>Farlands Journey</b></sub></td>
+    <td width="50%"></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 3, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (48 games)
+### Playable compatibility list (49 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -148,6 +152,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Deltarune Chapters 1 & 2 | ✅ | |
 | Downwell | ✅ | |
 | Dreaming Sarah | ✅ | PS5 title. |
+| Farlands Journey | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Fight'N Rage | ✅ | |
 | GONNER | ✅ | Responsive gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Grand Prix RockN Racing | ✅ | Live race gameplay, responsive input, and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
