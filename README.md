@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (50 playable games)
+### Device previews (51 playable games)
 
 <table>
   <tr>
@@ -131,11 +131,15 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/farlands-journey.png" alt="Farlands Journey running in LSX4 on Vivo"><br><sub><b>Farlands Journey</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/megalan-11.png" alt="MEGALAN 11 running in LSX4 on Vivo"><br><sub><b>MEGALAN 11</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/chained-echoes.png" alt="Chained Echoes running in LSX4 on Vivo"><br><sub><b>Chained Echoes</b></sub></td>
+    <td width="50%"></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 3, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (50 games)
+### Playable compatibility list (51 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -145,6 +149,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Another World | ✅ | |
 | Axiom Verge 2 | ✅ | |
 | Bloodborne | ✅ | Performance varies by device, scene, and configuration. |
+| Chained Echoes | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Cosmophony | ✅ | |
 | Cyber Shadow | ✅ | |
 | Dark Devotion | ✅ | |
