@@ -26,6 +26,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | MEGALAN 11 | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | MediEvil | LSX4 Vivo device capture |
 | Might & Magic: Clash of Heroes | LSX4 Vivo device capture |
+| Ninja JaJaMaru Collection | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | NOT A HERO | LSX4 Vivo device capture |
 | Nubla | LSX4 Vivo device capture |
 | Nuclear Throne | LSX4 Vivo device capture |
