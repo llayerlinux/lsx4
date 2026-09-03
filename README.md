@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (54 playable games)
+### Device previews (55 playable games)
 
 <table>
   <tr>
@@ -139,11 +139,14 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/ninja-jajamaru-collection.png" alt="Ninja JaJaMaru Collection running in LSX4 on Vivo"><br><sub><b>Ninja JaJaMaru Collection</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/lethal-league-blaze.png" alt="Lethal League Blaze running in LSX4 on Vivo"><br><sub><b>Lethal League Blaze</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/turnip-boy-commits-tax-evasion.png" alt="Turnip Boy Commits Tax Evasion running in LSX4 on Vivo"><br><sub><b>Turnip Boy Commits Tax Evasion</b></sub></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 3, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (54 games)
+### Playable compatibility list (55 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -201,6 +204,7 @@ This list includes only games that have been tested. The broader set of supporte
 | The Messenger | ✅ | Responsive gameplay and input reconfirmed on Vivo Snapdragon 8 Gen 5 after Unity/IL2CPP initialization, savedata mount, and nested-HLE callback stack recovery. |
 | The Pedestrian | ✅ | Live 2.5D puzzle gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | Toto Temple Deluxe | ✅ | |
+| Turnip Boy Commits Tax Evasion | ✅ | Responsive live gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | Undertale | ✅ | |
 | void tRrLM();++ //Void Terrarium++ | ✅ | PS5 title. |
 

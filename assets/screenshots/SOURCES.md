@@ -42,4 +42,5 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | The Messenger | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | The Pedestrian | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Toto Temple Deluxe | LSX4 Vivo device capture |
+| Turnip Boy Commits Tax Evasion | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | void tRrLM();++ //Void Terrarium++ | LSX4 Vivo device capture |
