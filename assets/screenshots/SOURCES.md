@@ -53,4 +53,5 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Toto Temple Deluxe | LSX4 Vivo device capture |
 | Trine | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Turnip Boy Commits Tax Evasion | LSX4 Vivo live gameplay capture, September 3, 2026 |
+| Ultimate Chicken Horse | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | void tRrLM();++ //Void Terrarium++ | LSX4 Vivo device capture |
