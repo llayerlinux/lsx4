@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (64 playable games)
+### Device previews (65 playable games)
 
 <table>
   <tr>
@@ -159,11 +159,15 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/the-gardens-between.png" alt="The Gardens Between running in LSX4 on Vivo"><br><sub><b>The Gardens Between</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/carto.png" alt="Carto running in LSX4 on Vivo"><br><sub><b>Carto</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/far-lone-sails.png" alt="FAR: Lone Sails running in LSX4 on Vivo"><br><sub><b>FAR: Lone Sails</b></sub></td>
+    <td width="50%"></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 3, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (64 games)
+### Playable compatibility list (65 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -186,6 +190,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Downwell | ✅ | |
 | Dreaming Sarah | ✅ | PS5 title. |
 | DREDGE | ✅ | Responsive live 3D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
+| FAR: Lone Sails | ✅ | Responsive live 2.5D vehicle-adventure gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | Farlands Journey | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Fight'N Rage | ✅ | |
 | FINAL FANTASY | ✅ | Responsive live gameplay and stable 60 FPS presentation confirmed on Vivo Snapdragon 8 Gen 5. |
