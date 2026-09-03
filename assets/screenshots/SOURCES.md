@@ -27,5 +27,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Perfect Universe | LSX4 Vivo device capture |
 | REPLAY: VHS is not dead | LSX4 Vivo device capture |
 | Spider: Rite of the Shrouded Moon | LSX4 Vivo device capture |
+| The Binding of Isaac: Rebirth | LSX4 Vivo cold `Continue` gameplay capture, September 3, 2026 |
+| The Messenger | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Toto Temple Deluxe | LSX4 Vivo device capture |
 | void tRrLM();++ //Void Terrarium++ | LSX4 Vivo device capture |
