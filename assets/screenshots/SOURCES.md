@@ -20,6 +20,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Islets | LSX4 Vivo device capture |
 | Jazzpunk: Director's Cut | LSX4 Vivo device capture |
 | Lucy Dreaming | LSX4 Vivo device capture |
+| Mega Shoot | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | MediEvil | LSX4 Vivo device capture |
 | Might & Magic: Clash of Heroes | LSX4 Vivo device capture |
 | NOT A HERO | LSX4 Vivo device capture |

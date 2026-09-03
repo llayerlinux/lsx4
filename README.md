@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (46 playable games)
+### Device previews (47 playable games)
 
 <table>
   <tr>
@@ -123,11 +123,15 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/rock-n-racing-off-road-dx.png" alt="Rock 'N Racing Off Road DX running in LSX4 on Vivo"><br><sub><b>Rock 'N Racing Off Road DX</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/the-pedestrian.png" alt="The Pedestrian running in LSX4 on Vivo"><br><sub><b>The Pedestrian</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/mega-shoot.png" alt="Mega Shoot running in LSX4 on Vivo"><br><sub><b>Mega Shoot</b></sub></td>
+    <td align="center" width="50%"></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 3, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (46 games)
+### Playable compatibility list (47 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -156,6 +160,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Just Shapes & Beats | ✅ | |
 | Limbo | ✅ | |
 | Lucy Dreaming | ✅ | |
+| Mega Shoot | ✅ | Responsive live gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | MediEvil | ✅ | 1998 PS1 Classic packaged for PS4. |
 | Might & Magic: Clash of Heroes | ✅ | |
 | Minit | ✅ | |
