@@ -15,6 +15,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Dreaming Sarah | LSX4 Vivo device capture |
 | Farlands Journey | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Fight'N Rage | LSX4 Vivo device capture |
+| FINAL FANTASY | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | GONNER | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Grand Prix RockN Racing | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Hillbilly Doomsday | LSX4 Vivo device capture |
