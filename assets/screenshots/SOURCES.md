@@ -14,6 +14,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Dark Devotion | LSX4 Vivo device capture |
 | Dead Cells | LSX4 Vivo device capture |
 | Dreaming Sarah | LSX4 Vivo device capture |
+| DREDGE | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Farlands Journey | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Fight'N Rage | LSX4 Vivo device capture |
 | FINAL FANTASY | LSX4 Vivo live gameplay capture, September 3, 2026 |
