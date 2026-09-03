@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (66 playable games)
+### Device previews (67 playable games)
 
 <table>
   <tr>
@@ -163,11 +163,15 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/far-lone-sails.png" alt="FAR: Lone Sails running in LSX4 on Vivo"><br><sub><b>FAR: Lone Sails</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/ultimate-chicken-horse.png" alt="Ultimate Chicken Horse running in LSX4 on Vivo"><br><sub><b>Ultimate Chicken Horse</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/going-under.png" alt="Going Under running in LSX4 on Vivo"><br><sub><b>Going Under</b></sub></td>
+    <td width="50%"></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 3, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (66 games)
+### Playable compatibility list (67 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -195,6 +199,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Fight'N Rage | ✅ | |
 | FINAL FANTASY | ✅ | Responsive live gameplay and stable 60 FPS presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | GONNER | ✅ | Responsive gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
+| Going Under | ✅ | Responsive live 3D gameplay, objective state, and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | Grand Prix RockN Racing | ✅ | Live race gameplay, responsive input, and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | Hillbilly Doomsday | ✅ | |
 | Hotline Miami 2: Wrong Number | ✅ | |

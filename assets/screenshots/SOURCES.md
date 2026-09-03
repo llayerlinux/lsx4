@@ -23,6 +23,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Fight'N Rage | LSX4 Vivo device capture |
 | FINAL FANTASY | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | GONNER | LSX4 Vivo live gameplay capture, September 3, 2026 |
+| Going Under | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Grand Prix RockN Racing | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Hillbilly Doomsday | LSX4 Vivo device capture |
 | INSIDE | LSX4 device capture |
