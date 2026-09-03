@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (56 playable games)
+### Device previews (57 playable games)
 
 <table>
   <tr>
@@ -143,11 +143,14 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/turnip-boy-commits-tax-evasion.png" alt="Turnip Boy Commits Tax Evasion running in LSX4 on Vivo"><br><sub><b>Turnip Boy Commits Tax Evasion</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/final-fantasy.png" alt="FINAL FANTASY running in LSX4 on Vivo"><br><sub><b>FINAL FANTASY</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/bonfire-peaks.png" alt="Bonfire Peaks running in LSX4 on Vivo"><br><sub><b>Bonfire Peaks</b></sub></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 3, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (56 games)
+### Playable compatibility list (57 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -156,6 +159,7 @@ This list includes only games that have been tested. The broader set of supporte
 | A Short Hike | ✅ | Vivo; title-specific Safe FEX blocks, exact multiblock, and full Unity worker cohort. |
 | Another World | ✅ | |
 | Axiom Verge 2 | ✅ | |
+| Bonfire Peaks | ✅ | Responsive live puzzle gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | Bloodborne | ✅ | Performance varies by device, scene, and configuration. |
 | Chained Echoes | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Cosmophony | ✅ | |

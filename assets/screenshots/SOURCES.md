@@ -7,6 +7,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | A Short Hike | LSX4 Vivo device capture |
 | Another World | LSX4 Vivo device capture |
 | Axiom Verge 2 | LSX4 Vivo device capture |
+| Bonfire Peaks | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Chained Echoes | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Cosmophony | LSX4 Vivo device capture |
 | Cyber Shadow | LSX4 Vivo device capture |
