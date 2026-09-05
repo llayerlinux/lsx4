@@ -54,6 +54,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | The Gardens Between | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | The Messenger | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | The Pedestrian | LSX4 Vivo live gameplay capture, September 3, 2026 |
+| Thomas Was Alone | LSX4 Vivo live gameplay capture, September 5, 2026; CUSA00909; tester-requested frame with player character, platforms, and level exit |
 | Toto Temple Deluxe | LSX4 Vivo device capture |
 | Trine | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Turnip Boy Commits Tax Evasion | LSX4 Vivo live gameplay capture, September 3, 2026 |

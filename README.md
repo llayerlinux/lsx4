@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (70 playable games)
+### Device previews (71 playable games)
 
 <table>
   <tr>
@@ -171,11 +171,15 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/i-ai.jpg" alt="I, AI gameplay running in LSX4 on Vivo"><br><sub><b>I, AI</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/deaths-door.png" alt="Death's Door gameplay running in LSX4 on Vivo"><br><sub><b>Death's Door</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/thomas-was-alone.png" alt="Thomas Was Alone gameplay running in LSX4 on Vivo"><br><sub><b>Thomas Was Alone</b></sub></td>
+    <td width="50%"></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (70 games)
+### Playable compatibility list (71 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -245,6 +249,7 @@ This list includes only games that have been tested. The broader set of supporte
 | The Gardens Between | ✅ | Responsive live 3D puzzle gameplay and input confirmed on Vivo Snapdragon 8 Gen 5. |
 | The Messenger | ✅ | Responsive gameplay and input reconfirmed on Vivo Snapdragon 8 Gen 5 after Unity/IL2CPP initialization, savedata mount, and nested-HLE callback stack recovery. |
 | The Pedestrian | ✅ | Live 2.5D puzzle gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
+| Thomas Was Alone | ✅ | Live puzzle-platformer gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5. |
 | Toto Temple Deluxe | ✅ | |
 | Trine | ✅ | Responsive live 2.5D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Turnip Boy Commits Tax Evasion | ✅ | Responsive live gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
