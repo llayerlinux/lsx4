@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (67 playable games)
+### Device previews (68 playable games)
 
 <table>
   <tr>
@@ -165,13 +165,13 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/going-under.png" alt="Going Under running in LSX4 on Vivo"><br><sub><b>Going Under</b></sub></td>
-    <td width="50%"></td>
+    <td align="center" width="50%"><img src="assets/screenshots/risk-of-rain-2.png" alt="Risk of Rain 2 gameplay running in LSX4 on Vivo"><br><sub><b>Risk of Rain 2</b></sub></td>
   </tr>
 </table>
 
-The table mirrors the games marked **Playable** in the Vivo test-device library through September 3, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
+The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (67 games)
+### Playable compatibility list (68 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -229,6 +229,7 @@ This list includes only games that have been tested. The broader set of supporte
 | REPLAY: VHS is not dead | ✅ | |
 | RESOGUN | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Retrace: Memories of Death | ✅ | Responsive live gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
+| Risk of Rain 2 | ✅ | Live 3D gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5. |
 | Rock 'N Racing Off Road DX | ✅ | Live race gameplay and presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | Rogue Legacy 2 | ✅ | Responsive live 2.5D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Shovel Knight | ✅ | |
