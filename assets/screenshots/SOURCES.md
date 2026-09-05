@@ -26,6 +26,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Going Under | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Grand Prix RockN Racing | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Hillbilly Doomsday | LSX4 Vivo device capture |
+| I, AI | LSX4 Vivo live gameplay capture, September 5, 2026; CUSA23515; latest tester-requested frame with player ship and expanded metrics hidden |
 | INSIDE | LSX4 device capture |
 | Islets | LSX4 Vivo device capture |
 | Jazzpunk: Director's Cut | LSX4 Vivo device capture |
