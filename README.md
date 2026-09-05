@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (69 playable games)
+### Device previews (70 playable games)
 
 <table>
   <tr>
@@ -169,13 +169,13 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/i-ai.jpg" alt="I, AI gameplay running in LSX4 on Vivo"><br><sub><b>I, AI</b></sub></td>
-    <td width="50%"></td>
+    <td align="center" width="50%"><img src="assets/screenshots/deaths-door.png" alt="Death's Door gameplay running in LSX4 on Vivo"><br><sub><b>Death's Door</b></sub></td>
   </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (69 games)
+### Playable compatibility list (70 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -193,6 +193,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Dandara | ✅ | Responsive live 2D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Dark Devotion | ✅ | |
 | Dead Cells | ✅ | |
+| Death's Door | ✅ | Live in-world 3D gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5. |
 | Despot's Game | ✅ | Responsive live strategy gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Deltarune Chapters 1 & 2 | ✅ | |
 | Downwell | ✅ | |
