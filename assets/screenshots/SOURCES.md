@@ -49,6 +49,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Risk of Rain 2 | LSX4 Vivo live gameplay capture, September 5, 2026; CUSA16209; latest tester-requested frame (stage timer 00:31) |
 | Rock 'N Racing Off Road DX | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Rogue Legacy 2 | LSX4 Vivo live gameplay capture, September 3, 2026 |
+| Rollerdrome | LSX4 Vivo live gameplay capture, September 5, 2026; CUSA34254; latest tester-requested frame with moving character and Collect Diamonds objective at 2/5 |
 | Spider: Rite of the Shrouded Moon | LSX4 Vivo device capture |
 | The Binding of Isaac: Rebirth | LSX4 Vivo cold `Continue` gameplay capture, September 3, 2026 |
 | The Gardens Between | LSX4 Vivo live gameplay capture, September 3, 2026 |
