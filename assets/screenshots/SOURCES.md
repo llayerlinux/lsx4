@@ -61,3 +61,7 @@ Only screenshots captured from LSX4 running on a physical Android device may be 
 | Turnip Boy Commits Tax Evasion | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | Ultimate Chicken Horse | LSX4 Vivo live gameplay capture, September 3, 2026 |
 | void tRrLM();++ //Void Terrarium++ | LSX4 Vivo device capture |
+| Don't Bite Me Bro! | LSX4 Vivo Snapdragon 8 Gen 5 live gameplay capture, September 5, 2026; CUSA08921; original device capture `CUSA08921-065458-865.png; metrics collapsed; gameplay subsequently confirmed by the tester. |
+| Broforce | LSX4 Vivo Snapdragon 8 Gen 5 live gameplay capture, September 5, 2026; CUSA03887; original device capture `CUSA03887-071647-633.png; metrics collapsed; gameplay subsequently confirmed by the tester. |
+| Can't Drive This | LSX4 Vivo Snapdragon 8 Gen 5 live gameplay capture, September 5, 2026; CUSA26423; original device capture `CUSA26423-072756-693.png; metrics collapsed; gameplay subsequently confirmed by the tester. |
+| Super Monkey Ball: Banana Blitz | LSX4 Vivo Snapdragon 8 Gen 5 live gameplay capture, September 5, 2026; CUSA16178; original device capture `CUSA16178-073404-409.png; metrics collapsed; gameplay subsequently confirmed by the tester. |

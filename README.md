@@ -28,7 +28,7 @@ Development also makes use of current-generation large language models (LLMs).
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
-### Device previews (72 playable games)
+### Device previews (76 playable games)
 
 <table>
   <tr>
@@ -175,11 +175,19 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/thomas-was-alone.png" alt="Thomas Was Alone gameplay running in LSX4 on Vivo"><br><sub><b>Thomas Was Alone</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/rollerdrome.png" alt="Rollerdrome training arena running in LSX4 on Vivo"><br><sub><b>Rollerdrome</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/dont-bite-me-bro.png" alt="Don&#39;t Bite Me Bro! gameplay running in LSX4 on Vivo"><br><sub><b>Don&#39;t Bite Me Bro!</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/broforce.png" alt="Broforce gameplay running in LSX4 on Vivo"><br><sub><b>Broforce</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/cant-drive-this.png" alt="Can&#39;t Drive This gameplay running in LSX4 on Vivo"><br><sub><b>Can&#39;t Drive This</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/super-monkey-ball-banana-blitz.png" alt="Super Monkey Ball: Banana Blitz gameplay running in LSX4 on Vivo"><br><sub><b>Super Monkey Ball: Banana Blitz</b></sub></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
 
-### Playable compatibility list (72 games)
+### Playable compatibility list (76 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -190,6 +198,8 @@ This list includes only games that have been tested. The broader set of supporte
 | Axiom Verge 2 | ✅ | |
 | Bonfire Peaks | ✅ | Responsive live puzzle gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
 | Bloodborne | ✅ | Performance varies by device, scene, and configuration. |
+| Broforce | ✅ | PS4; offline campaign combat, movement and firing confirmed on Vivo Snapdragon 8 Gen 5. |
+| Can't Drive This | ✅ | PS4; Lone Racer 3D driving and Build/Drive switching confirmed on Vivo Snapdragon 8 Gen 5. Requires correct PS4 platform detection. |
 | Carto | ✅ | Responsive live 2.5D puzzle-adventure gameplay and input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Chained Echoes | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Cosmophony | ✅ | |
@@ -200,6 +210,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Death's Door | ✅ | Live in-world 3D gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5. |
 | Despot's Game | ✅ | Responsive live strategy gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
 | Deltarune Chapters 1 & 2 | ✅ | |
+| Don't Bite Me Bro! | ✅ | PS4; town exploration and movement confirmed on Vivo Snapdragon 8 Gen 5; slow introductory sequence. |
 | Downwell | ✅ | |
 | Dreaming Sarah | ✅ | PS5 title. |
 | DREDGE | ✅ | Responsive live 3D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
@@ -246,6 +257,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Shovel Knight | ✅ | |
 | Sonic Mania | ✅ | |
 | Spider: Rite of the Shrouded Moon | ✅ | |
+| Super Monkey Ball: Banana Blitz | ✅ | PS4; Monkey Island Stage 1, analog movement and banana collection confirmed on Vivo Snapdragon 8 Gen 5. |
 | The Binding of Isaac: Rebirth | ✅ | Cold `Continue` and `New Run` reached responsive 30 FPS gameplay with working input on Vivo Snapdragon 8 Gen 5, without pre-existing JIT or Vulkan caches. |
 | The Gardens Between | ✅ | Responsive live 3D puzzle gameplay and input confirmed on Vivo Snapdragon 8 Gen 5. |
 | The Messenger | ✅ | Responsive gameplay and input reconfirmed on Vivo Snapdragon 8 Gen 5 after Unity/IL2CPP initialization, savedata mount, and nested-HLE callback stack recovery. |
