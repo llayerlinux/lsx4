@@ -185,7 +185,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
 </table>
 
-The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026. Every gallery preview is a screenshot captured from LSX4 on a physical Android device; store media and unrelated images are not used. [Preview provenance](assets/screenshots/SOURCES.md) records the mapping.
+The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
 ### Playable compatibility list (76 games)
 
@@ -193,53 +193,53 @@ This list includes only games that have been tested. The broader set of supporte
 
 | Game | Playable | Notes |
 | --- | :---: | --- |
-| A Short Hike | ✅ | Vivo; title-specific Safe FEX blocks, exact multiblock, and full Unity worker cohort. |
+| A Short Hike | ✅ | |
 | Another World | ✅ | |
 | Axiom Verge 2 | ✅ | |
-| Bonfire Peaks | ✅ | Responsive live puzzle gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| Bloodborne | ✅ | Performance varies by device, scene, and configuration. |
-| Broforce | ✅ | PS4; offline campaign combat, movement and firing confirmed on Vivo Snapdragon 8 Gen 5. |
-| Can't Drive This | ✅ | PS4; Lone Racer 3D driving and Build/Drive switching confirmed on Vivo Snapdragon 8 Gen 5. Requires correct PS4 platform detection. |
-| Carto | ✅ | Responsive live 2.5D puzzle-adventure gameplay and input confirmed on Vivo Snapdragon 8 Gen 5. |
-| Chained Echoes | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
+| Bonfire Peaks | ✅ | |
+| Bloodborne | ✅ | |
+| Broforce | ✅ | |
+| Can't Drive This | ✅ | |
+| Carto | ✅ | |
+| Chained Echoes | ✅ | |
 | Cosmophony | ✅ | |
 | Cyber Shadow | ✅ | |
-| Dandara | ✅ | Responsive live 2D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
+| Dandara | ✅ | |
 | Dark Devotion | ✅ | |
 | Dead Cells | ✅ | |
-| Death's Door | ✅ | Live in-world 3D gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5. |
-| Despot's Game | ✅ | Responsive live strategy gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
+| Death's Door | ✅ | |
+| Despot's Game | ✅ | |
 | Deltarune Chapters 1 & 2 | ✅ | |
-| Don't Bite Me Bro! | ✅ | PS4; town exploration and movement confirmed on Vivo Snapdragon 8 Gen 5; slow introductory sequence. |
+| Don't Bite Me Bro! | ✅ | |
 | Downwell | ✅ | |
-| Dreaming Sarah | ✅ | PS5 title. |
-| DREDGE | ✅ | Responsive live 3D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
-| FAR: Lone Sails | ✅ | Responsive live 2.5D vehicle-adventure gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| Farlands Journey | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
+| Dreaming Sarah | ✅ | |
+| DREDGE | ✅ | |
+| FAR: Lone Sails | ✅ | |
+| Farlands Journey | ✅ | |
 | Fight'N Rage | ✅ | |
-| FINAL FANTASY | ✅ | Responsive live gameplay and stable 60 FPS presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| GONNER | ✅ | Responsive gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
-| Going Under | ✅ | Responsive live 3D gameplay, objective state, and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| Grand Prix RockN Racing | ✅ | Live race gameplay, responsive input, and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
+| FINAL FANTASY | ✅ | |
+| GONNER | ✅ | |
+| Going Under | ✅ | |
+| Grand Prix RockN Racing | ✅ | |
 | Hillbilly Doomsday | ✅ | |
 | Hotline Miami 2: Wrong Number | ✅ | |
 | Hyper Light Drifter | ✅ | |
-| I, AI | ✅ | Live shoot-em-up gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5. |
+| I, AI | ✅ | |
 | INSIDE | ✅ | |
-| Islets | ✅ | Vivo; title-scoped Balanced IR and CPU-visible EOP completion. |
+| Islets | ✅ | |
 | Jazzpunk: Director's Cut | ✅ | |
 | Just Shapes & Beats | ✅ | |
-| Lethal League Blaze | ✅ | Responsive live match gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
+| Lethal League Blaze | ✅ | |
 | Limbo | ✅ | |
 | Lucy Dreaming | ✅ | |
-| Mega Shoot | ✅ | Responsive live gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| MEGALAN 11 | ✅ | Responsive live 3D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
-| MediEvil | ✅ | 1998 PS1 Classic packaged for PS4. |
+| Mega Shoot | ✅ | |
+| MEGALAN 11 | ✅ | |
+| MediEvil | ✅ | |
 | Might & Magic: Clash of Heroes | ✅ | |
 | Minit | ✅ | |
 | Nidhogg | ✅ | |
 | Nidhogg 2 | ✅ | |
-| Ninja JaJaMaru Collection | ✅ | Responsive live scene 1-1 gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
+| Ninja JaJaMaru Collection | ✅ | |
 | NOT A HERO | ✅ | |
 | Nubla | ✅ | |
 | Nuclear Throne | ✅ | |
@@ -248,27 +248,27 @@ This list includes only games that have been tested. The broader set of supporte
 | Perfect Universe | ✅ | |
 | Rain World | ✅ | |
 | REPLAY: VHS is not dead | ✅ | |
-| RESOGUN | ✅ | Responsive live gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
-| Retrace: Memories of Death | ✅ | Responsive live gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| Risk of Rain 2 | ✅ | Live 3D gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5. |
-| Rock 'N Racing Off Road DX | ✅ | Live race gameplay and presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| Rogue Legacy 2 | ✅ | Responsive live 2.5D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
-| Rollerdrome | ✅ | Live 3D gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5; training-arena capture. |
+| RESOGUN | ✅ | |
+| Retrace: Memories of Death | ✅ | |
+| Risk of Rain 2 | ✅ | |
+| Rock 'N Racing Off Road DX | ✅ | |
+| Rogue Legacy 2 | ✅ | |
+| Rollerdrome | ✅ | |
 | Shovel Knight | ✅ | |
 | Sonic Mania | ✅ | |
 | Spider: Rite of the Shrouded Moon | ✅ | |
-| Super Monkey Ball: Banana Blitz | ✅ | PS4; Monkey Island Stage 1, analog movement and banana collection confirmed on Vivo Snapdragon 8 Gen 5. |
-| The Binding of Isaac: Rebirth | ✅ | Cold `Continue` and `New Run` reached responsive 30 FPS gameplay with working input on Vivo Snapdragon 8 Gen 5, without pre-existing JIT or Vulkan caches. |
-| The Gardens Between | ✅ | Responsive live 3D puzzle gameplay and input confirmed on Vivo Snapdragon 8 Gen 5. |
-| The Messenger | ✅ | Responsive gameplay and input reconfirmed on Vivo Snapdragon 8 Gen 5 after Unity/IL2CPP initialization, savedata mount, and nested-HLE callback stack recovery. |
-| The Pedestrian | ✅ | Live 2.5D puzzle gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| Thomas Was Alone | ✅ | Live puzzle-platformer gameplay confirmed by the tester on Vivo Snapdragon 8 Gen 5. |
+| Super Monkey Ball: Banana Blitz | ✅ | |
+| The Binding of Isaac: Rebirth | ✅ | |
+| The Gardens Between | ✅ | |
+| The Messenger | ✅ | |
+| The Pedestrian | ✅ | |
+| Thomas Was Alone | ✅ | |
 | Toto Temple Deluxe | ✅ | |
-| Trine | ✅ | Responsive live 2.5D gameplay and touch input confirmed on Vivo Snapdragon 8 Gen 5. |
-| Turnip Boy Commits Tax Evasion | ✅ | Responsive live gameplay and stable presentation confirmed on Vivo Snapdragon 8 Gen 5. |
-| Ultimate Chicken Horse | ✅ | Responsive in-world level-selection gameplay and input confirmed on Vivo Snapdragon 8 Gen 5. |
+| Trine | ✅ | |
+| Turnip Boy Commits Tax Evasion | ✅ | |
+| Ultimate Chicken Horse | ✅ | |
 | Undertale | ✅ | |
-| void tRrLM();++ //Void Terrarium++ | ✅ | PS5 title. |
+| void tRrLM();++ //Void Terrarium++ | ✅ | |
 
 ## Contributing
 
