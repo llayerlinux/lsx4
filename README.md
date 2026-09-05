@@ -168,7 +168,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/risk-of-rain-2.png" alt="Risk of Rain 2 gameplay running in LSX4 on Vivo"><br><sub><b>Risk of Rain 2</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/i-ai.png" alt="I, AI gameplay running in LSX4 on Vivo"><br><sub><b>I, AI</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/i-ai.jpg" alt="I, AI gameplay running in LSX4 on Vivo"><br><sub><b>I, AI</b></sub></td>
     <td width="50%"></td>
   </tr>
 </table>
