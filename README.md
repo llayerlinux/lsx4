@@ -17,6 +17,28 @@ LSX4 does not include games, firmware, or other copyrighted system content.
 
 Development also makes use of current-generation large language models (LLMs).
 
+## Implementation architecture
+
+The primary PS4 execution path uses a project-owned, in-process dynamic binary
+translator for x86-64 guest code on AArch64 Android devices. Guest instructions
+are decoded through the iced-x86 FFI, converted to LSX4 instruction and operation
+IR, compiled into native AArch64 blocks, and connected to HLE services through an
+LSX4-owned invocation ABI.
+
+The translator owns its native code cache, block linking, hot-code promotion,
+guarded trace compilation, self-modifying-code detection, invalidation, and
+rollback. The primary path does not delegate guest CPU execution to an external
+whole-process translator. Compatibility and diagnostic paths for other translators
+remain in the source tree, but they do not define the primary runtime architecture.
+
+The kernel HLE, system-library, shader, and GPU layers are derived from shadPS4 and
+maintained through the Funnel ARM integration layer. LSX4 therefore documents its
+shared HLE and GPU lineage separately from its project-owned guest CPU runtime.
+
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the implementation boundary and source
+evidence. A machine-readable description is available in
+[`docs/architecture.yaml`](docs/architecture.yaml).
+
 ## Current development priorities
 
 - Improving performance in playable games.

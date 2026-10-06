@@ -1,0 +1,96 @@
+schema: lsx4.architecture.v1
+scope: primary_ps4_runtime
+human_readable_authority: ARCHITECTURE.md
+
+lineage:
+  hle_gpu: shadps4_derived
+  additional_foundation: orbis
+  integration_layer: funnel_arm
+  clean_room_hle_gpu_claim: false
+
+guest_cpu:
+  guest_isa: x86_64
+  host_isa: aarch64
+  execution_model: in_process_dynamic_binary_translation
+  primary_backend: lsx4_dbt
+  external_whole_process_translator_on_primary_path: false
+  decoder: iced_x86_ffi
+  instruction_model: lsx4_instruction_model
+  ir: lsx4_operation_ir
+  native_emitter: lsx4_aarch64
+  tiers:
+    - tier_0_baseline_block
+    - tier_1_hot_block
+    - tier_2_guarded_trace
+
+code_lifecycle:
+  executable_memory_owner: lsx4
+  cache: persistent_ir_and_relocatable_native_artifacts
+  identity:
+    - title
+    - executable_fingerprint
+    - guest_bytes
+    - jit_abi
+  self_modifying_code: page_revision_and_byte_witness
+  invalidation: atomic_translation_retirement
+  hot_entry: on_stack_replacement
+  rollback: retained_lower_tier_entry
+
+hle:
+  model: high_level_emulation
+  guest_cpu_boundary: lsx4_hle_invocation_frame
+  service_implementation: funnel_arm
+
+graphics:
+  implementation: funnel_arm
+  lineage: shadps4_derived
+  guest_command_stream: gnm_pm4
+  guest_gpu_family: amd_gcn
+  shader_pipeline:
+    - guest_shader_decode
+    - shader_ir
+    - spirv_emission
+  host_api: vulkan
+
+android:
+  frontend: android_app
+  native_runtime: liblsx4_executor_android.so
+  runtime_loading: jni_dlopen
+  normal_launch_entry: executor_lsx4_runtime_launch_game_jit
+
+alternate_translator_paths:
+  classification: compatibility_or_diagnostic
+  part_of_primary_architecture: false
+
+evidence:
+  guest_cpu_decode:
+    - src/executor/dynamic_translation/decode_frontend.cpp
+    - src/executor/dynamic_translation/instruction_model.h
+  guest_cpu_ir:
+    - src/executor/dynamic_translation/operation_ir.h
+    - src/executor/dynamic_translation/scalar_ir_builder.cpp
+  native_codegen:
+    - src/executor/dynamic_translation/native_compiler.cpp
+    - src/executor/dynamic_translation/native_encoder.cpp
+    - src/executor/dynamic_translation/jit_aarch64_stubs.S
+  tiering_and_traces:
+    - src/executor/dynamic_translation/retiring_execution_core.cpp
+    - docs/tiered_jit_trace_strategy.md
+  code_identity:
+    - src/executor/dynamic_translation/code_witness.cpp
+    - src/executor/dynamic_translation/artifact_repository.cpp
+  hle_boundary:
+    - src/executor/dynamic_translation/hle_invocation_frame.cpp
+    - src/executor/dynamic_translation/runtime_gateway.h
+  primary_entry:
+    - src/executor/native_runtime_api.cpp
+    - android-app/app/src/main/java/app/lsx4/android/MainActivity.java
+  funnel_integration:
+    - funnel-arm/cmake/lsx4_arm_desktop_layer.cmake
+    - docs/arm_desktop_client_layer_architecture.md
+  hle_services:
+    - funnel-arm/src/core
+  shader_translation:
+    - funnel-arm/src/shader_recompiler
+  gpu_emulation:
+    - funnel-arm/src/video_core
