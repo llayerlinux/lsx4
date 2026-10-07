@@ -17,14 +17,11 @@ LSX4 does not include games, firmware, or other copyrighted system content.
 
 Development also makes use of current-generation large language models (LLMs).
 
-## Download and videos
+## Download
 
 <p align="center">
   <a href="https://play.google.com/store/apps/details?id=com.jetcalls.lsx4"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="80" alt="Get it on Google Play"></a>
 </p>
-
-- [LSX4 video demonstration 1](https://www.youtube.com/watch?v=CQpTIQlKarM)
-- [LSX4 video demonstration 2](https://www.youtube.com/watch?v=4UmC0u8DJmY)
 
 ## Implementation architecture
 
@@ -78,6 +75,13 @@ contains the same information in a machine-readable format.
 ## Playable games
 
 Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
+
+### Video demonstrations
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=CQpTIQlKarM"><img src="https://img.youtube.com/vi/CQpTIQlKarM/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 1 on YouTube"></a>
+  <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
+</p>
 
 ### Device previews (76 playable games)
 
