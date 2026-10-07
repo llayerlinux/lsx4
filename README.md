@@ -17,6 +17,15 @@ LSX4 does not include games, firmware, or other copyrighted system content.
 
 Development also makes use of current-generation large language models (LLMs).
 
+## Download and videos
+
+<p align="center">
+  <a href="https://play.google.com/store/apps/details?id=com.jetcalls.lsx4"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="80" alt="Get it on Google Play"></a>
+</p>
+
+- [LSX4 video demonstration 1](https://www.youtube.com/watch?v=CQpTIQlKarM)
+- [LSX4 video demonstration 2](https://www.youtube.com/watch?v=4UmC0u8DJmY)
+
 ## Implementation architecture
 
 LSX4 is split into three main parts:
