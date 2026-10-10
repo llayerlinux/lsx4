@@ -83,7 +83,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
 </p>
 
-### Device previews (103 playable games)
+### Device previews (104 playable games)
 
 <table>
   <tr>
@@ -285,20 +285,20 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/undertale.jpg" alt="Undertale running in LSX4"><br><sub><b>Undertale</b></sub></td>
   </tr>
   <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/medievil-ii-poco.png" alt="MediEvil II gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>MediEvil II</b> · Poco Snapdragon 8 Gen 3</sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/final-fantasy-ii-poco.png" alt="FINAL FANTASY II gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>FINAL FANTASY II</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
     <td align="center" width="50%"><img src="assets/screenshots/final-fantasy.png" alt="FINAL FANTASY running in LSX4 on Vivo"><br><sub><b>FINAL FANTASY</b></sub></td>
-  </tr>
-  <tr>
     <td align="center" width="50%"><img src="assets/screenshots/another-world.jpg" alt="Another World running in LSX4 on Vivo"><br><sub><b>Another World</b></sub></td>
+  </tr>
+  <tr>
     <td align="center" width="50%"><img src="assets/screenshots/ninja-jajamaru-collection.png" alt="Ninja JaJaMaru Collection running in LSX4 on Vivo"><br><sub><b>Ninja JaJaMaru Collection</b></sub></td>
-  </tr>
-  <tr>
     <td align="center" width="50%"><img src="assets/screenshots/downwell.jpg" alt="Downwell running in LSX4"><br><sub><b>Downwell</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/nidhogg.jpg" alt="Nidhogg running in LSX4"><br><sub><b>Nidhogg</b></sub></td>
   </tr>
   <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/nidhogg.jpg" alt="Nidhogg running in LSX4"><br><sub><b>Nidhogg</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/minit.jpg" alt="Minit running in LSX4"><br><sub><b>Minit</b></sub></td>
-    <td align="center" width="50%"></td>
   </tr>
 </table>
 
@@ -306,7 +306,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
-### Playable compatibility list (103 games)
+### Playable compatibility list (104 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -411,6 +411,7 @@ This list includes only games that have been tested. The broader set of supporte
 | NEEDY GIRL OVERDOSE | ✅ | |
 | Deltarune Chapters 1 & 2 | ✅ | |
 | Undertale | ✅ | |
+| MediEvil II | ✅ | |
 | FINAL FANTASY II | ✅ |  |
 | FINAL FANTASY | ✅ | |
 | Another World | ✅ | |
