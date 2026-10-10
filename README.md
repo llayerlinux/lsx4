@@ -83,7 +83,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
 </p>
 
-### Device previews (76 playable games)
+### Device previews (89 playable games)
 
 <table>
   <tr>
@@ -238,17 +238,47 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/cant-drive-this.png" alt="Can&#39;t Drive This gameplay running in LSX4 on Vivo"><br><sub><b>Can&#39;t Drive This</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/super-monkey-ball-banana-blitz.png" alt="Super Monkey Ball: Banana Blitz gameplay running in LSX4 on Vivo"><br><sub><b>Super Monkey Ball: Banana Blitz</b></sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/super-meat-boy-poco.png" alt="Super Meat Boy! gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Super Meat Boy!</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/the-last-of-us-remastered.png" alt="The Last of Us Remastered gameplay running in LSX4, verified by the user"><br><sub><b>The Last of Us Remastered</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/fluster-cluck-poco.png" alt="Fluster Cluck gameplay running in LSX4"><br><sub><b>Fluster Cluck</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/coffee-talk-poco.png" alt="Coffee Talk gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Coffee Talk</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/marble-it-up-ultra-poco.png" alt="Marble It Up! Ultra gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Marble It Up! Ultra</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/level-22-poco.png" alt="LEVEL 22 gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>LEVEL 22</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/super-rude-bear-resurrection-poco.png" alt="Super Rude Bear Resurrection gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Super Rude Bear Resurrection</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/orc-slayer-poco.png" alt="Orc Slayer gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Orc Slayer</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/what-the-golf-poco.png" alt="WHAT THE GOLF? gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>WHAT THE GOLF?</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/absolute-drift-poco.png" alt="Absolute Drift gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Absolute Drift</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/thornkin-poco.png" alt="Thornkin gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Thornkin</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/hollow-knight-poco.png" alt="Hollow Knight gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Hollow Knight</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/a-monsters-expedition-poco.png" alt="A Monster&#x27;s Expedition gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>A Monster&#x27;s Expedition</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
-### Playable compatibility list (76 games)
+### Playable compatibility list (89 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
 | Game | Playable | Notes |
 | --- | :---: | --- |
+| A Monster's Expedition | ✅ | |
 | A Short Hike | ✅ | |
+| Absolute Drift | ✅ | |
 | Another World | ✅ | |
 | Axiom Verge 2 | ✅ | |
 | Bonfire Peaks | ✅ | |
@@ -257,6 +287,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Can't Drive This | ✅ | |
 | Carto | ✅ | |
 | Chained Echoes | ✅ | |
+| Coffee Talk | ✅ | |
 | Cosmophony | ✅ | |
 | Cyber Shadow | ✅ | |
 | Dandara | ✅ | |
@@ -273,10 +304,12 @@ This list includes only games that have been tested. The broader set of supporte
 | Farlands Journey | ✅ | |
 | Fight'N Rage | ✅ | |
 | FINAL FANTASY | ✅ | |
+| Fluster Cluck | ✅ | |
 | GONNER | ✅ | |
 | Going Under | ✅ | |
 | Grand Prix RockN Racing | ✅ | |
 | Hillbilly Doomsday | ✅ | |
+| Hollow Knight | ✅ | |
 | Hotline Miami 2: Wrong Number | ✅ | |
 | Hyper Light Drifter | ✅ | |
 | I, AI | ✅ | |
@@ -285,8 +318,10 @@ This list includes only games that have been tested. The broader set of supporte
 | Jazzpunk: Director's Cut | ✅ | |
 | Just Shapes & Beats | ✅ | |
 | Lethal League Blaze | ✅ | |
+| LEVEL 22 | ✅ | |
 | Limbo | ✅ | |
 | Lucy Dreaming | ✅ | |
+| Marble It Up! Ultra | ✅ | |
 | Mega Shoot | ✅ | |
 | MEGALAN 11 | ✅ | |
 | MediEvil | ✅ | |
@@ -299,6 +334,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Nubla | ✅ | |
 | Nuclear Throne | ✅ | |
 | Old Man's Journey | ✅ | |
+| Orc Slayer | ✅ | |
 | Owlboy | ✅ | |
 | Perfect Universe | ✅ | |
 | Rain World | ✅ | |
@@ -312,18 +348,23 @@ This list includes only games that have been tested. The broader set of supporte
 | Shovel Knight | ✅ | |
 | Sonic Mania | ✅ | |
 | Spider: Rite of the Shrouded Moon | ✅ | |
+| Super Meat Boy! | ✅ | |
 | Super Monkey Ball: Banana Blitz | ✅ | |
+| Super Rude Bear Resurrection | ✅ | |
 | The Binding of Isaac: Rebirth | ✅ | |
 | The Gardens Between | ✅ | |
+| The Last of Us Remastered | ✅ | |
 | The Messenger | ✅ | |
 | The Pedestrian | ✅ | |
 | Thomas Was Alone | ✅ | |
+| Thornkin | ✅ | |
 | Toto Temple Deluxe | ✅ | |
 | Trine | ✅ | |
 | Turnip Boy Commits Tax Evasion | ✅ | |
 | Ultimate Chicken Horse | ✅ | |
 | Undertale | ✅ | |
 | void tRrLM();++ //Void Terrarium++ | ✅ | |
+| WHAT THE GOLF? | ✅ | |
 
 ## Contributing
 
