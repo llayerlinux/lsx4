@@ -146,6 +146,12 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/nuclear-throne.jpg" alt="Nuclear Throne running in LSX4 on Vivo"><br><sub><b>Nuclear Throne</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/perfect-universe.jpg" alt="Perfect Universe running in LSX4 on Vivo"><br><sub><b>Perfect Universe</b></sub></td>
   </tr>
+</table>
+
+<details>
+<summary>Show more gameplay screenshots</summary>
+
+<table>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/replay-vhs-is-not-dead.jpg" alt="REPLAY: VHS is not dead running in LSX4 on Vivo"><br><sub><b>REPLAY: VHS is not dead</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/spider-rite-of-the-shrouded-moon.jpg" alt="Spider: Rite of the Shrouded Moon running in LSX4 on Vivo"><br><sub><b>Spider: Rite of the Shrouded Moon</b></sub></td>
@@ -292,11 +298,16 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
 </table>
 
+</details>
+
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
 ### Playable compatibility list (101 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
+
+<details>
+<summary>Show complete compatibility list</summary>
 
 | Game | Playable | Notes |
 | --- | :---: | --- |
@@ -401,6 +412,8 @@ This list includes only games that have been tested. The broader set of supporte
 | void tRrLM();++ //Void Terrarium++ | ✅ | |
 | WHAT THE GOLF? | ✅ | |
 | Wizordum | ✅ | |
+
+</details>
 
 ## Contributing
 
