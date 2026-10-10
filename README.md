@@ -83,7 +83,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
 </p>
 
-### Device previews (91 playable games)
+### Device previews (92 playable games)
 
 <table>
   <tr>
@@ -268,13 +268,13 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/wizordum-poco.png" alt="Wizordum gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Wizordum</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"></td>
+    <td align="center" width="50%"><img src="assets/screenshots/needy-girl-overdose-poco.png" alt="NEEDY GIRL OVERDOSE gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>NEEDY GIRL OVERDOSE</b> · Poco Snapdragon 8 Gen 3</sub></td>
   </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
-### Playable compatibility list (91 games)
+### Playable compatibility list (92 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -332,6 +332,7 @@ This list includes only games that have been tested. The broader set of supporte
 | MediEvil | ✅ | |
 | Might & Magic: Clash of Heroes | ✅ | |
 | Minit | ✅ | |
+| NEEDY GIRL OVERDOSE | ✅ | |
 | Nidhogg | ✅ | |
 | Nidhogg 2 | ✅ | |
 | Ninja JaJaMaru Collection | ✅ | |
