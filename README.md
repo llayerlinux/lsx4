@@ -88,63 +88,63 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 <table>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/bloodborne.jpg" alt="Bloodborne running in LSX4"><br><sub><b>Bloodborne</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/limbo.jpg" alt="Limbo running in LSX4"><br><sub><b>Limbo</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/the-last-of-us-remastered.png" alt="The Last of Us Remastered gameplay running in LSX4, verified by the user"><br><sub><b>The Last of Us Remastered</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/sonic-mania.jpg" alt="Sonic Mania running in LSX4"><br><sub><b>Sonic Mania</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/hyper-light-drifter.jpg" alt="Hyper Light Drifter running in LSX4"><br><sub><b>Hyper Light Drifter</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/hotline-miami-2.jpg" alt="Hotline Miami 2: Wrong Number running in LSX4"><br><sub><b>Hotline Miami 2: Wrong Number</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/owlboy.jpg" alt="Owlboy running in LSX4"><br><sub><b>Owlboy</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/shovel-knight.jpg" alt="Shovel Knight running in LSX4"><br><sub><b>Shovel Knight</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/rain-world.jpg" alt="Rain World running in LSX4"><br><sub><b>Rain World</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/nidhogg.jpg" alt="Nidhogg running in LSX4"><br><sub><b>Nidhogg</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/nidhogg-2.jpg" alt="Nidhogg 2 running in LSX4"><br><sub><b>Nidhogg 2</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/deltarune.jpg" alt="Deltarune running in LSX4"><br><sub><b>Deltarune Chapters 1 &amp; 2</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/just-shapes-and-beats.jpg" alt="Just Shapes &amp; Beats running in LSX4"><br><sub><b>Just Shapes &amp; Beats</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/undertale.jpg" alt="Undertale running in LSX4"><br><sub><b>Undertale</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/downwell.jpg" alt="Downwell running in LSX4"><br><sub><b>Downwell</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/minit.jpg" alt="Minit running in LSX4"><br><sub><b>Minit</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/the-binding-of-isaac-rebirth.jpg" alt="The Binding of Isaac: Rebirth running in LSX4"><br><sub><b>The Binding of Isaac: Rebirth</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/another-world.jpg" alt="Another World running in LSX4 on Vivo"><br><sub><b>Another World</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/axiom-verge-2.jpg" alt="Axiom Verge 2 running in LSX4 on Vivo"><br><sub><b>Axiom Verge 2</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/cyber-shadow.jpg" alt="Cyber Shadow running in LSX4 on Vivo"><br><sub><b>Cyber Shadow</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/dark-devotion.jpg" alt="Dark Devotion running in LSX4 on Vivo"><br><sub><b>Dark Devotion</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/dead-cells.jpg" alt="Dead Cells"><br><sub><b>Dead Cells</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/dreaming-sarah.jpg" alt="Dreaming Sarah running in LSX4 on Vivo"><br><sub><b>Dreaming Sarah</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/fight-n-rage.jpg" alt="Fight'N Rage running in LSX4 on Vivo"><br><sub><b>Fight'N Rage</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/hillbilly-doomsday.jpg" alt="Hillbilly Doomsday running in LSX4 on Vivo"><br><sub><b>Hillbilly Doomsday</b></sub></td>
-  </tr>
-  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/fear-the-spotlight-poco.png" alt="Fear The Spotlight gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Fear The Spotlight</b> · Poco Snapdragon 8 Gen 3</sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/inside.jpg" alt="INSIDE"><br><sub><b>INSIDE</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/lucy-dreaming.jpg" alt="Lucy Dreaming running in LSX4 on Vivo"><br><sub><b>Lucy Dreaming</b></sub></td>
   </tr>
   <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/wizordum-poco.png" alt="Wizordum gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Wizordum</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/hollow-knight-poco.png" alt="Hollow Knight gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Hollow Knight</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/mortisomem-poco.png" alt="Mortisomem gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Mortisomem</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/cat-from-hell-2-poco.png" alt="Cat From Hell 2 gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Cat From Hell 2</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/megaton-rainfall-poco.png" alt="Megaton Rainfall gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Megaton Rainfall</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/trine.png" alt="Trine running in LSX4 on Vivo"><br><sub><b>Trine</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/risk-of-rain-2.png" alt="Risk of Rain 2 gameplay running in LSX4 on Vivo"><br><sub><b>Risk of Rain 2</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/rollerdrome.png" alt="Rollerdrome training arena running in LSX4 on Vivo"><br><sub><b>Rollerdrome</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/deaths-door.png" alt="Death's Door gameplay running in LSX4 on Vivo"><br><sub><b>Death's Door</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dredge.png" alt="DREDGE running in LSX4 on Vivo"><br><sub><b>DREDGE</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/marble-it-up-ultra-poco.png" alt="Marble It Up! Ultra gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Marble It Up! Ultra</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/the-gardens-between.png" alt="The Gardens Between running in LSX4 on Vivo"><br><sub><b>The Gardens Between</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/the-pedestrian.png" alt="The Pedestrian running in LSX4 on Vivo"><br><sub><b>The Pedestrian</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/going-under.png" alt="Going Under running in LSX4 on Vivo"><br><sub><b>Going Under</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/far-lone-sails.png" alt="FAR: Lone Sails running in LSX4 on Vivo"><br><sub><b>FAR: Lone Sails</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/orc-slayer-poco.png" alt="Orc Slayer gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Orc Slayer</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/jazzpunk-directors-cut.jpg" alt="Jazzpunk: Director's Cut running in LSX4 on Vivo"><br><sub><b>Jazzpunk: Director's Cut</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/medievil.jpg" alt="MediEvil running in LSX4 on Vivo"><br><sub><b>MediEvil</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/not-a-hero.jpg" alt="NOT A HERO running in LSX4 on Vivo"><br><sub><b>NOT A HERO</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/nuclear-throne.jpg" alt="Nuclear Throne running in LSX4 on Vivo"><br><sub><b>Nuclear Throne</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/perfect-universe.jpg" alt="Perfect Universe running in LSX4 on Vivo"><br><sub><b>Perfect Universe</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/fate-reawakened-poco.png" alt="FATE Reawakened gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>FATE Reawakened</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/buildest-poco.png" alt="Buildest gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Buildest</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/besiege-poco.png" alt="Besiege gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Besiege</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/blueys-quest-for-the-gold-pen-poco.png" alt="Bluey&#x27;s Quest for the Gold Pen gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Bluey&#x27;s Quest for the Gold Pen</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/fluster-cluck-poco.png" alt="Fluster Cluck gameplay running in LSX4"><br><sub><b>Fluster Cluck</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/super-monkey-ball-banana-blitz.png" alt="Super Monkey Ball: Banana Blitz gameplay running in LSX4 on Vivo"><br><sub><b>Super Monkey Ball: Banana Blitz</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/cant-drive-this.png" alt="Can&#39;t Drive This gameplay running in LSX4 on Vivo"><br><sub><b>Can&#39;t Drive This</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/a-short-hike.jpg" alt="A Short Hike running in LSX4 on Vivo"><br><sub><b>A Short Hike</b></sub></td>
   </tr>
 </table>
 
@@ -153,148 +153,148 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
 
 <table>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/replay-vhs-is-not-dead.jpg" alt="REPLAY: VHS is not dead running in LSX4 on Vivo"><br><sub><b>REPLAY: VHS is not dead</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/spider-rite-of-the-shrouded-moon.jpg" alt="Spider: Rite of the Shrouded Moon running in LSX4 on Vivo"><br><sub><b>Spider: Rite of the Shrouded Moon</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/toto-temple-deluxe.jpg" alt="Toto Temple Deluxe running in LSX4 on Vivo"><br><sub><b>Toto Temple Deluxe</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/void-terrarium-plus-plus.jpg" alt="void tRrLM();++ //Void Terrarium++ running in LSX4 on Vivo"><br><sub><b>void tRrLM();++ //Void Terrarium++</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/cosmophony.jpg" alt="Cosmophony running in LSX4 on Vivo"><br><sub><b>Cosmophony</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/old-mans-journey.png" alt="Old Man's Journey running in LSX4 on Vivo"><br><sub><b>Old Man's Journey</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/nubla.jpg" alt="Nubla running in LSX4 on Vivo"><br><sub><b>Nubla</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/jazzpunk-directors-cut.jpg" alt="Jazzpunk: Director's Cut running in LSX4 on Vivo"><br><sub><b>Jazzpunk: Director's Cut</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/might-and-magic-clash-of-heroes.jpg" alt="Might &amp; Magic: Clash of Heroes running in LSX4 on Vivo"><br><sub><b>Might &amp; Magic: Clash of Heroes</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/bonfire-peaks.png" alt="Bonfire Peaks running in LSX4 on Vivo"><br><sub><b>Bonfire Peaks</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/a-monsters-expedition-poco.png" alt="A Monster&#x27;s Expedition gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>A Monster&#x27;s Expedition</b> · Poco Snapdragon 8 Gen 3</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/old-mans-journey.png" alt="Old Man's Journey running in LSX4 on Vivo"><br><sub><b>Old Man's Journey</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/a-short-hike.jpg" alt="A Short Hike running in LSX4 on Vivo"><br><sub><b>A Short Hike</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/islets.png" alt="Islets running in LSX4 on Vivo"><br><sub><b>Islets</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/the-messenger.png" alt="The Messenger running in LSX4 on Vivo"><br><sub><b>The Messenger</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/gonner.png" alt="GONNER running in LSX4 on Vivo"><br><sub><b>GONNER</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/megalan-11.png" alt="MEGALAN 11 running in LSX4 on Vivo"><br><sub><b>MEGALAN 11</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/grand-prix-rock-n-racing.png" alt="Grand Prix RockN Racing running in LSX4 on Vivo"><br><sub><b>Grand Prix RockN Racing</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/rock-n-racing-off-road-dx.png" alt="Rock 'N Racing Off Road DX running in LSX4 on Vivo"><br><sub><b>Rock 'N Racing Off Road DX</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/the-pedestrian.png" alt="The Pedestrian running in LSX4 on Vivo"><br><sub><b>The Pedestrian</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/mega-shoot.png" alt="Mega Shoot running in LSX4 on Vivo"><br><sub><b>Mega Shoot</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/retrace-memories-of-death.png" alt="Retrace: Memories of Death running in LSX4 on Vivo"><br><sub><b>Retrace: Memories of Death</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/farlands-journey.png" alt="Farlands Journey running in LSX4 on Vivo"><br><sub><b>Farlands Journey</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/megalan-11.png" alt="MEGALAN 11 running in LSX4 on Vivo"><br><sub><b>MEGALAN 11</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/chained-echoes.png" alt="Chained Echoes running in LSX4 on Vivo"><br><sub><b>Chained Echoes</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/resogun.png" alt="RESOGUN running in LSX4 on Vivo"><br><sub><b>RESOGUN</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/ninja-jajamaru-collection.png" alt="Ninja JaJaMaru Collection running in LSX4 on Vivo"><br><sub><b>Ninja JaJaMaru Collection</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/lethal-league-blaze.png" alt="Lethal League Blaze running in LSX4 on Vivo"><br><sub><b>Lethal League Blaze</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/turnip-boy-commits-tax-evasion.png" alt="Turnip Boy Commits Tax Evasion running in LSX4 on Vivo"><br><sub><b>Turnip Boy Commits Tax Evasion</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/final-fantasy.png" alt="FINAL FANTASY running in LSX4 on Vivo"><br><sub><b>FINAL FANTASY</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/bonfire-peaks.png" alt="Bonfire Peaks running in LSX4 on Vivo"><br><sub><b>Bonfire Peaks</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/dredge.png" alt="DREDGE running in LSX4 on Vivo"><br><sub><b>DREDGE</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/rogue-legacy-2.png" alt="Rogue Legacy 2 running in LSX4 on Vivo"><br><sub><b>Rogue Legacy 2</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/dandara.png" alt="Dandara running in LSX4 on Vivo"><br><sub><b>Dandara</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/trine.png" alt="Trine running in LSX4 on Vivo"><br><sub><b>Trine</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/despots-game.png" alt="Despot's Game running in LSX4 on Vivo"><br><sub><b>Despot's Game</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/the-gardens-between.png" alt="The Gardens Between running in LSX4 on Vivo"><br><sub><b>The Gardens Between</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/carto.png" alt="Carto running in LSX4 on Vivo"><br><sub><b>Carto</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/far-lone-sails.png" alt="FAR: Lone Sails running in LSX4 on Vivo"><br><sub><b>FAR: Lone Sails</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/ultimate-chicken-horse.png" alt="Ultimate Chicken Horse running in LSX4 on Vivo"><br><sub><b>Ultimate Chicken Horse</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/going-under.png" alt="Going Under running in LSX4 on Vivo"><br><sub><b>Going Under</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/risk-of-rain-2.png" alt="Risk of Rain 2 gameplay running in LSX4 on Vivo"><br><sub><b>Risk of Rain 2</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/i-ai.jpg" alt="I, AI gameplay running in LSX4 on Vivo"><br><sub><b>I, AI</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/deaths-door.png" alt="Death's Door gameplay running in LSX4 on Vivo"><br><sub><b>Death's Door</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/thomas-was-alone.png" alt="Thomas Was Alone gameplay running in LSX4 on Vivo"><br><sub><b>Thomas Was Alone</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/rollerdrome.png" alt="Rollerdrome training arena running in LSX4 on Vivo"><br><sub><b>Rollerdrome</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/dont-bite-me-bro.png" alt="Don&#39;t Bite Me Bro! gameplay running in LSX4 on Vivo"><br><sub><b>Don&#39;t Bite Me Bro!</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/broforce.png" alt="Broforce gameplay running in LSX4 on Vivo"><br><sub><b>Broforce</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/cant-drive-this.png" alt="Can&#39;t Drive This gameplay running in LSX4 on Vivo"><br><sub><b>Can&#39;t Drive This</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/super-monkey-ball-banana-blitz.png" alt="Super Monkey Ball: Banana Blitz gameplay running in LSX4 on Vivo"><br><sub><b>Super Monkey Ball: Banana Blitz</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/super-meat-boy-poco.png" alt="Super Meat Boy! gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Super Meat Boy!</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/the-last-of-us-remastered.png" alt="The Last of Us Remastered gameplay running in LSX4, verified by the user"><br><sub><b>The Last of Us Remastered</b></sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/fluster-cluck-poco.png" alt="Fluster Cluck gameplay running in LSX4"><br><sub><b>Fluster Cluck</b></sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/coffee-talk-poco.png" alt="Coffee Talk gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Coffee Talk</b> · Poco Snapdragon 8 Gen 3</sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/marble-it-up-ultra-poco.png" alt="Marble It Up! Ultra gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Marble It Up! Ultra</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/level-22-poco.png" alt="LEVEL 22 gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>LEVEL 22</b> · Poco Snapdragon 8 Gen 3</sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/super-rude-bear-resurrection-poco.png" alt="Super Rude Bear Resurrection gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Super Rude Bear Resurrection</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/orc-slayer-poco.png" alt="Orc Slayer gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Orc Slayer</b> · Poco Snapdragon 8 Gen 3</sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/what-the-golf-poco.png" alt="WHAT THE GOLF? gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>WHAT THE GOLF?</b> · Poco Snapdragon 8 Gen 3</sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/absolute-drift-poco.png" alt="Absolute Drift gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Absolute Drift</b> · Poco Snapdragon 8 Gen 3</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/thornkin-poco.png" alt="Thornkin gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Thornkin</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/hollow-knight-poco.png" alt="Hollow Knight gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Hollow Knight</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/what-the-golf-poco.png" alt="WHAT THE GOLF? gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>WHAT THE GOLF?</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/lethal-league-blaze.png" alt="Lethal League Blaze running in LSX4 on Vivo"><br><sub><b>Lethal League Blaze</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/a-monsters-expedition-poco.png" alt="A Monster&#x27;s Expedition gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>A Monster&#x27;s Expedition</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/final-fantasy-ii-poco.png" alt="FINAL FANTASY II gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>FINAL FANTASY II</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/resogun.png" alt="RESOGUN running in LSX4 on Vivo"><br><sub><b>RESOGUN</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/i-ai.jpg" alt="I, AI gameplay running in LSX4 on Vivo"><br><sub><b>I, AI</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/wizordum-poco.png" alt="Wizordum gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Wizordum</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/needy-girl-overdose-poco.png" alt="NEEDY GIRL OVERDOSE gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>NEEDY GIRL OVERDOSE</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/spider-rite-of-the-shrouded-moon.jpg" alt="Spider: Rite of the Shrouded Moon running in LSX4 on Vivo"><br><sub><b>Spider: Rite of the Shrouded Moon</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dead-cells.jpg" alt="Dead Cells"><br><sub><b>Dead Cells</b></sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/mortisomem-poco.png" alt="Mortisomem gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Mortisomem</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/fate-reawakened-poco.png" alt="FATE Reawakened gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>FATE Reawakened</b> · Poco Snapdragon 8 Gen 3</sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/besiege-poco.png" alt="Besiege gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Besiege</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/cat-from-hell-2-poco.png" alt="Cat From Hell 2 gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Cat From Hell 2</b> · Poco Snapdragon 8 Gen 3</sub></td>
-  </tr>
-  <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/blueys-quest-for-the-gold-pen-poco.png" alt="Bluey&#x27;s Quest for the Gold Pen gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Bluey&#x27;s Quest for the Gold Pen</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/megaton-rainfall-poco.png" alt="Megaton Rainfall gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Megaton Rainfall</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/rogue-legacy-2.png" alt="Rogue Legacy 2 running in LSX4 on Vivo"><br><sub><b>Rogue Legacy 2</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/hyper-light-drifter.jpg" alt="Hyper Light Drifter running in LSX4"><br><sub><b>Hyper Light Drifter</b></sub></td>
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/grim-guardians-demon-purge-poco.png" alt="Grim Guardians: Demon Purge gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Grim Guardians: Demon Purge</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dark-devotion.jpg" alt="Dark Devotion running in LSX4 on Vivo"><br><sub><b>Dark Devotion</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/rain-world.jpg" alt="Rain World running in LSX4"><br><sub><b>Rain World</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/owlboy.jpg" alt="Owlboy running in LSX4"><br><sub><b>Owlboy</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/islets.png" alt="Islets running in LSX4 on Vivo"><br><sub><b>Islets</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/thornkin-poco.png" alt="Thornkin gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Thornkin</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/axiom-verge-2.jpg" alt="Axiom Verge 2 running in LSX4 on Vivo"><br><sub><b>Axiom Verge 2</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/carto.png" alt="Carto running in LSX4 on Vivo"><br><sub><b>Carto</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/dandara.png" alt="Dandara running in LSX4 on Vivo"><br><sub><b>Dandara</b></sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/punch-club-2-fast-forward-poco.png" alt="Punch Club 2: Fast Forward gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Punch Club 2: Fast Forward</b> · Poco Snapdragon 8 Gen 3</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><img src="assets/screenshots/buildest-poco.png" alt="Buildest gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Buildest</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"><img src="assets/screenshots/fear-the-spotlight-poco.png" alt="Fear The Spotlight gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Fear The Spotlight</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/coffee-talk-poco.png" alt="Coffee Talk gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Coffee Talk</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/chained-echoes.png" alt="Chained Echoes running in LSX4 on Vivo"><br><sub><b>Chained Echoes</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/the-messenger.png" alt="The Messenger running in LSX4 on Vivo"><br><sub><b>The Messenger</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/cyber-shadow.jpg" alt="Cyber Shadow running in LSX4 on Vivo"><br><sub><b>Cyber Shadow</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/broforce.png" alt="Broforce gameplay running in LSX4 on Vivo"><br><sub><b>Broforce</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/fight-n-rage.jpg" alt="Fight'N Rage running in LSX4 on Vivo"><br><sub><b>Fight'N Rage</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/farlands-journey.png" alt="Farlands Journey running in LSX4 on Vivo"><br><sub><b>Farlands Journey</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dont-bite-me-bro.png" alt="Don&#39;t Bite Me Bro! gameplay running in LSX4 on Vivo"><br><sub><b>Don&#39;t Bite Me Bro!</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/void-terrarium-plus-plus.jpg" alt="void tRrLM();++ //Void Terrarium++ running in LSX4 on Vivo"><br><sub><b>void tRrLM();++ //Void Terrarium++</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/might-and-magic-clash-of-heroes.jpg" alt="Might &amp; Magic: Clash of Heroes running in LSX4 on Vivo"><br><sub><b>Might &amp; Magic: Clash of Heroes</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/despots-game.png" alt="Despot's Game running in LSX4 on Vivo"><br><sub><b>Despot's Game</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/lucy-dreaming.jpg" alt="Lucy Dreaming running in LSX4 on Vivo"><br><sub><b>Lucy Dreaming</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/turnip-boy-commits-tax-evasion.png" alt="Turnip Boy Commits Tax Evasion running in LSX4 on Vivo"><br><sub><b>Turnip Boy Commits Tax Evasion</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/sonic-mania.jpg" alt="Sonic Mania running in LSX4"><br><sub><b>Sonic Mania</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/shovel-knight.jpg" alt="Shovel Knight running in LSX4"><br><sub><b>Shovel Knight</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/hillbilly-doomsday.jpg" alt="Hillbilly Doomsday running in LSX4 on Vivo"><br><sub><b>Hillbilly Doomsday</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/super-rude-bear-resurrection-poco.png" alt="Super Rude Bear Resurrection gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Super Rude Bear Resurrection</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/super-meat-boy-poco.png" alt="Super Meat Boy! gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Super Meat Boy!</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ultimate-chicken-horse.png" alt="Ultimate Chicken Horse running in LSX4 on Vivo"><br><sub><b>Ultimate Chicken Horse</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/toto-temple-deluxe.jpg" alt="Toto Temple Deluxe running in LSX4 on Vivo"><br><sub><b>Toto Temple Deluxe</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/perfect-universe.jpg" alt="Perfect Universe running in LSX4 on Vivo"><br><sub><b>Perfect Universe</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/limbo.jpg" alt="Limbo running in LSX4"><br><sub><b>Limbo</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/thomas-was-alone.png" alt="Thomas Was Alone gameplay running in LSX4 on Vivo"><br><sub><b>Thomas Was Alone</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/gonner.png" alt="GONNER running in LSX4 on Vivo"><br><sub><b>GONNER</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/cosmophony.jpg" alt="Cosmophony running in LSX4 on Vivo"><br><sub><b>Cosmophony</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/just-shapes-and-beats.jpg" alt="Just Shapes &amp; Beats running in LSX4"><br><sub><b>Just Shapes &amp; Beats</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/the-binding-of-isaac-rebirth.jpg" alt="The Binding of Isaac: Rebirth running in LSX4"><br><sub><b>The Binding of Isaac: Rebirth</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/hotline-miami-2.jpg" alt="Hotline Miami 2: Wrong Number running in LSX4"><br><sub><b>Hotline Miami 2: Wrong Number</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/not-a-hero.jpg" alt="NOT A HERO running in LSX4 on Vivo"><br><sub><b>NOT A HERO</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/nuclear-throne.jpg" alt="Nuclear Throne running in LSX4 on Vivo"><br><sub><b>Nuclear Throne</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/level-22-poco.png" alt="LEVEL 22 gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>LEVEL 22</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/nidhogg-2.jpg" alt="Nidhogg 2 running in LSX4"><br><sub><b>Nidhogg 2</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/mega-shoot.png" alt="Mega Shoot running in LSX4 on Vivo"><br><sub><b>Mega Shoot</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/replay-vhs-is-not-dead.jpg" alt="REPLAY: VHS is not dead running in LSX4 on Vivo"><br><sub><b>REPLAY: VHS is not dead</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/retrace-memories-of-death.png" alt="Retrace: Memories of Death running in LSX4 on Vivo"><br><sub><b>Retrace: Memories of Death</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/dreaming-sarah.jpg" alt="Dreaming Sarah running in LSX4 on Vivo"><br><sub><b>Dreaming Sarah</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/needy-girl-overdose-poco.png" alt="NEEDY GIRL OVERDOSE gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>NEEDY GIRL OVERDOSE</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/deltarune.jpg" alt="Deltarune running in LSX4"><br><sub><b>Deltarune Chapters 1 &amp; 2</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/undertale.jpg" alt="Undertale running in LSX4"><br><sub><b>Undertale</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/final-fantasy-ii-poco.png" alt="FINAL FANTASY II gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>FINAL FANTASY II</b> · Poco Snapdragon 8 Gen 3</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/final-fantasy.png" alt="FINAL FANTASY running in LSX4 on Vivo"><br><sub><b>FINAL FANTASY</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/another-world.jpg" alt="Another World running in LSX4 on Vivo"><br><sub><b>Another World</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/ninja-jajamaru-collection.png" alt="Ninja JaJaMaru Collection running in LSX4 on Vivo"><br><sub><b>Ninja JaJaMaru Collection</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/downwell.jpg" alt="Downwell running in LSX4"><br><sub><b>Downwell</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/nidhogg.jpg" alt="Nidhogg running in LSX4"><br><sub><b>Nidhogg</b></sub></td>
+    <td align="center" width="50%"><img src="assets/screenshots/minit.jpg" alt="Minit running in LSX4"><br><sub><b>Minit</b></sub></td>
   </tr>
 </table>
 
@@ -311,108 +311,108 @@ This list includes only games that have been tested. The broader set of supporte
 
 | Game | Playable | Notes |
 | --- | :---: | --- |
-| A Monster's Expedition | ✅ | |
-| A Short Hike | ✅ | |
-| Absolute Drift | ✅ | |
-| Another World | ✅ | |
-| Axiom Verge 2 | ✅ | |
+| Bloodborne | ✅ | |
+| The Last of Us Remastered | ✅ | |
+| Fear The Spotlight | ✅ | |
+| INSIDE | ✅ | |
+| Wizordum | ✅ | |
+| Hollow Knight | ✅ | |
+| Mortisomem | ✅ | |
+| Cat From Hell 2 | ✅ | |
+| Megaton Rainfall | ✅ | |
+| Trine | ✅ | |
+| Risk of Rain 2 | ✅ | |
+| Rollerdrome | ✅ | |
+| Death's Door | ✅ | |
+| DREDGE | ✅ | |
+| Marble It Up! Ultra | ✅ | |
+| The Gardens Between | ✅ | |
+| The Pedestrian | ✅ | |
+| Going Under | ✅ | |
+| FAR: Lone Sails | ✅ | |
+| Orc Slayer | ✅ | |
+| Jazzpunk: Director's Cut | ✅ | |
+| MediEvil | ✅ | |
+| FATE Reawakened | ✅ | |
+| Buildest | ✅ | |
 | Besiege | ✅ | |
 | Bluey's Quest for the Gold Pen | ✅ | |
-| Bonfire Peaks | ✅ | |
-| Bloodborne | ✅ | |
-| Broforce | ✅ | |
-| Buildest | ✅ | |
-| Can't Drive This | ✅ | |
-| Carto | ✅ | |
-| Cat From Hell 2 | ✅ | |
-| Chained Echoes | ✅ | |
-| Coffee Talk | ✅ | |
-| Cosmophony | ✅ | |
-| Cyber Shadow | ✅ | |
-| Dandara | ✅ | |
-| Dark Devotion | ✅ | |
-| Dead Cells | ✅ | |
-| Death's Door | ✅ | |
-| Despot's Game | ✅ | |
-| Deltarune Chapters 1 & 2 | ✅ | |
-| Don't Bite Me Bro! | ✅ | |
-| Downwell | ✅ | |
-| Dreaming Sarah | ✅ | |
-| DREDGE | ✅ | |
-| FAR: Lone Sails | ✅ | |
-| Farlands Journey | ✅ | |
-| FATE Reawakened | ✅ | |
-| Fear The Spotlight | ✅ | |
-| Fight'N Rage | ✅ | |
-| FINAL FANTASY | ✅ | |
-| FINAL FANTASY II | ✅ |  |
 | Fluster Cluck | ✅ | |
-| GONNER | ✅ | |
-| Going Under | ✅ | |
-| Grand Prix RockN Racing | ✅ | |
-| Grim Guardians: Demon Purge | ✅ | |
-| Hillbilly Doomsday | ✅ | |
-| Hollow Knight | ✅ | |
-| Hotline Miami 2: Wrong Number | ✅ | |
-| Hyper Light Drifter | ✅ | |
-| I, AI | ✅ | |
-| INSIDE | ✅ | |
-| Islets | ✅ | |
-| Jazzpunk: Director's Cut | ✅ | |
-| Just Shapes & Beats | ✅ | |
-| Lethal League Blaze | ✅ | |
-| LEVEL 22 | ✅ | |
-| Limbo | ✅ | |
-| Lucy Dreaming | ✅ | |
-| Marble It Up! Ultra | ✅ | |
-| Mega Shoot | ✅ | |
-| MEGALAN 11 | ✅ | |
-| MediEvil | ✅ | |
-| Megaton Rainfall | ✅ | |
-| Might & Magic: Clash of Heroes | ✅ | |
-| Minit | ✅ | |
-| Mortisomem | ✅ | |
-| NEEDY GIRL OVERDOSE | ✅ | |
-| Nidhogg | ✅ | |
-| Nidhogg 2 | ✅ | |
-| Ninja JaJaMaru Collection | ✅ | |
-| NOT A HERO | ✅ | |
-| Nubla | ✅ | |
-| Nuclear Throne | ✅ | |
-| Old Man's Journey | ✅ | |
-| Orc Slayer | ✅ | |
-| Owlboy | ✅ | |
-| Perfect Universe | ✅ | |
-| Punch Club 2: Fast Forward | ✅ | |
-| Rain World | ✅ | |
-| REPLAY: VHS is not dead | ✅ | |
-| RESOGUN | ✅ | |
-| Retrace: Memories of Death | ✅ | |
-| Risk of Rain 2 | ✅ | |
-| Rock 'N Racing Off Road DX | ✅ | |
-| Rogue Legacy 2 | ✅ | |
-| Rollerdrome | ✅ | |
-| Shovel Knight | ✅ | |
-| Sonic Mania | ✅ | |
-| Spider: Rite of the Shrouded Moon | ✅ | |
-| Super Meat Boy! | ✅ | |
 | Super Monkey Ball: Banana Blitz | ✅ | |
-| Super Rude Bear Resurrection | ✅ | |
-| The Binding of Isaac: Rebirth | ✅ | |
-| The Gardens Between | ✅ | |
-| The Last of Us Remastered | ✅ | |
-| The Messenger | ✅ | |
-| The Pedestrian | ✅ | |
-| Thomas Was Alone | ✅ | |
-| Thornkin | ✅ | |
-| Toto Temple Deluxe | ✅ | |
-| Trine | ✅ | |
-| Turnip Boy Commits Tax Evasion | ✅ | |
-| Ultimate Chicken Horse | ✅ | |
-| Undertale | ✅ | |
-| void tRrLM();++ //Void Terrarium++ | ✅ | |
+| Can't Drive This | ✅ | |
+| A Short Hike | ✅ | |
+| Old Man's Journey | ✅ | |
+| Nubla | ✅ | |
+| Bonfire Peaks | ✅ | |
+| A Monster's Expedition | ✅ | |
+| MEGALAN 11 | ✅ | |
+| Grand Prix RockN Racing | ✅ | |
+| Rock 'N Racing Off Road DX | ✅ | |
+| Absolute Drift | ✅ | |
 | WHAT THE GOLF? | ✅ | |
-| Wizordum | ✅ | |
+| Lethal League Blaze | ✅ | |
+| RESOGUN | ✅ | |
+| I, AI | ✅ | |
+| Spider: Rite of the Shrouded Moon | ✅ | |
+| Dead Cells | ✅ | |
+| Rogue Legacy 2 | ✅ | |
+| Hyper Light Drifter | ✅ | |
+| Grim Guardians: Demon Purge | ✅ | |
+| Dark Devotion | ✅ | |
+| Rain World | ✅ | |
+| Owlboy | ✅ | |
+| Islets | ✅ | |
+| Thornkin | ✅ | |
+| Axiom Verge 2 | ✅ | |
+| Carto | ✅ | |
+| Dandara | ✅ | |
+| Punch Club 2: Fast Forward | ✅ | |
+| Coffee Talk | ✅ | |
+| Chained Echoes | ✅ | |
+| The Messenger | ✅ | |
+| Cyber Shadow | ✅ | |
+| Broforce | ✅ | |
+| Fight'N Rage | ✅ | |
+| Farlands Journey | ✅ | |
+| Don't Bite Me Bro! | ✅ | |
+| void tRrLM();++ //Void Terrarium++ | ✅ | |
+| Might & Magic: Clash of Heroes | ✅ | |
+| Despot's Game | ✅ | |
+| Lucy Dreaming | ✅ | |
+| Turnip Boy Commits Tax Evasion | ✅ | |
+| Sonic Mania | ✅ | |
+| Shovel Knight | ✅ | |
+| Hillbilly Doomsday | ✅ | |
+| Super Rude Bear Resurrection | ✅ | |
+| Super Meat Boy! | ✅ | |
+| Ultimate Chicken Horse | ✅ | |
+| Toto Temple Deluxe | ✅ | |
+| Perfect Universe | ✅ | |
+| Limbo | ✅ | |
+| Thomas Was Alone | ✅ | |
+| GONNER | ✅ | |
+| Cosmophony | ✅ | |
+| Just Shapes & Beats | ✅ | |
+| The Binding of Isaac: Rebirth | ✅ | |
+| Hotline Miami 2: Wrong Number | ✅ | |
+| NOT A HERO | ✅ | |
+| Nuclear Throne | ✅ | |
+| LEVEL 22 | ✅ | |
+| Nidhogg 2 | ✅ | |
+| Mega Shoot | ✅ | |
+| REPLAY: VHS is not dead | ✅ | |
+| Retrace: Memories of Death | ✅ | |
+| Dreaming Sarah | ✅ | |
+| NEEDY GIRL OVERDOSE | ✅ | |
+| Deltarune Chapters 1 & 2 | ✅ | |
+| Undertale | ✅ | |
+| FINAL FANTASY II | ✅ |  |
+| FINAL FANTASY | ✅ | |
+| Another World | ✅ | |
+| Ninja JaJaMaru Collection | ✅ | |
+| Downwell | ✅ | |
+| Nidhogg | ✅ | |
+| Minit | ✅ | |
 
 </details>
 
