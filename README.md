@@ -83,7 +83,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
 </p>
 
-### Device previews (93 playable games)
+### Device previews (94 playable games)
 
 <table>
   <tr>
@@ -272,13 +272,13 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/mortisomem-poco.png" alt="Mortisomem gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Mortisomem</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"></td>
+    <td align="center" width="50%"><img src="assets/screenshots/fate-reawakened-poco.png" alt="FATE Reawakened gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>FATE Reawakened</b> · Poco Snapdragon 8 Gen 3</sub></td>
   </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
-### Playable compatibility list (93 games)
+### Playable compatibility list (94 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -310,6 +310,7 @@ This list includes only games that have been tested. The broader set of supporte
 | DREDGE | ✅ | |
 | FAR: Lone Sails | ✅ | |
 | Farlands Journey | ✅ | |
+| FATE Reawakened | ✅ | |
 | Fight'N Rage | ✅ | |
 | FINAL FANTASY | ✅ | |
 | FINAL FANTASY II | ✅ |  |
