@@ -83,7 +83,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
 </p>
 
-### Device previews (95 playable games)
+### Device previews (96 playable games)
 
 <table>
   <tr>
@@ -276,13 +276,13 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   </tr>
   <tr>
     <td align="center" width="50%"><img src="assets/screenshots/besiege-poco.png" alt="Besiege gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Besiege</b> · Poco Snapdragon 8 Gen 3</sub></td>
-    <td align="center" width="50%"></td>
+    <td align="center" width="50%"><img src="assets/screenshots/cat-from-hell-2-poco.png" alt="Cat From Hell 2 gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Cat From Hell 2</b> · Poco Snapdragon 8 Gen 3</sub></td>
   </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
-### Playable compatibility list (95 games)
+### Playable compatibility list (96 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -299,6 +299,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Broforce | ✅ | |
 | Can't Drive This | ✅ | |
 | Carto | ✅ | |
+| Cat From Hell 2 | ✅ | |
 | Chained Echoes | ✅ | |
 | Coffee Talk | ✅ | |
 | Cosmophony | ✅ | |
