@@ -83,7 +83,7 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
   <a href="https://www.youtube.com/watch?v=4UmC0u8DJmY"><img src="https://img.youtube.com/vi/4UmC0u8DJmY/hqdefault.jpg" width="49%" alt="Watch LSX4 video demonstration 2 on YouTube"></a>
 </p>
 
-### Device previews (100 playable games)
+### Device previews (101 playable games)
 
 <table>
   <tr>
@@ -286,11 +286,15 @@ Tested on devices powered by Snapdragon 8 Gen 3 and Snapdragon 8 Gen 5.
     <td align="center" width="50%"><img src="assets/screenshots/grim-guardians-demon-purge-poco.png" alt="Grim Guardians: Demon Purge gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Grim Guardians: Demon Purge</b> · Poco Snapdragon 8 Gen 3</sub></td>
     <td align="center" width="50%"><img src="assets/screenshots/punch-club-2-fast-forward-poco.png" alt="Punch Club 2: Fast Forward gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Punch Club 2: Fast Forward</b> · Poco Snapdragon 8 Gen 3</sub></td>
   </tr>
+  <tr>
+    <td align="center" width="50%"><img src="assets/screenshots/buildest-poco.png" alt="Buildest gameplay running in LSX4 on Poco Snapdragon 8 Gen 3"><br><sub><b>Buildest</b> · Poco Snapdragon 8 Gen 3</sub></td>
+    <td align="center" width="50%"></td>
+  </tr>
 </table>
 
 The table mirrors the games marked **Playable** in the Vivo test-device library through September 5, 2026.
 
-### Playable compatibility list (100 games)
+### Playable compatibility list (101 games)
 
 This list includes only games that have been tested. The broader set of supported games is larger and still requires testing.
 
@@ -306,6 +310,7 @@ This list includes only games that have been tested. The broader set of supporte
 | Bonfire Peaks | ✅ | |
 | Bloodborne | ✅ | |
 | Broforce | ✅ | |
+| Buildest | ✅ | |
 | Can't Drive This | ✅ | |
 | Carto | ✅ | |
 | Cat From Hell 2 | ✅ | |
